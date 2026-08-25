@@ -11,6 +11,7 @@ py_library(
 filegroup(
     name = "package_metadata",
     srcs = [
+        "LICENSE",
         "README.md",
         "pyproject.toml",
     ],

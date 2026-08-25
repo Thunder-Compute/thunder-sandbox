@@ -15,7 +15,7 @@ from .exceptions import AuthenticationError, ConflictError, ConnectionError, Inv
 if TYPE_CHECKING:
     from .sandbox import Sandbox
 
-USER_AGENT = "thunder-python-sdk/0.0.0"
+USER_AGENT = "thunder-python-sdk/0.1.0"
 
 
 class Client:
