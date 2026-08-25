@@ -35,7 +35,7 @@ Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
 ## Quick start
 
 ```python
-import thunder
+import thunder_sandbox as thunder
 
 sandbox = thunder.Sandbox.create(
     cpu=4,
@@ -149,7 +149,7 @@ async applications:
 
 ```python
 import asyncio
-import thunder
+import thunder_sandbox as thunder
 
 
 async def main() -> None:

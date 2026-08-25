@@ -27,6 +27,7 @@ from thunder.exceptions import (
 from thunder.process import ContainerProcess
 from thunder.sandbox import AsyncSandbox, Sandbox
 from thunder.types import SandboxStatus
+import thunder_sandbox
 
 
 SANDBOX_RESPONSE = {
@@ -90,6 +91,11 @@ def write_generated_key(path: Path) -> None:
 
 
 class ConfigTest(unittest.TestCase):
+    def test_distribution_import_name_exposes_public_api(self) -> None:
+        self.assertIs(thunder_sandbox.Sandbox, Sandbox)
+        self.assertIs(thunder_sandbox.Client, Client)
+        self.assertIn("Sandbox", thunder_sandbox.__all__)
+
     def test_configuration_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -34,7 +34,8 @@ Repository = "https://github.com/Thunder-Compute/thunder-sandbox"
 Issues = "https://github.com/Thunder-Compute/thunder-sandbox/issues"
 
 [tool.setuptools]
-packages = ["thunder"]
+packages = ["thunder", "thunder_sandbox"]
 
 [tool.setuptools.package-data]
 thunder = ["py.typed"]
+thunder_sandbox = ["py.typed"]
