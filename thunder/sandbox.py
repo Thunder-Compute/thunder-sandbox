@@ -56,6 +56,8 @@ class Sandbox:
             raise InvalidRequestError("ssh_public_key and ssh_private_key must be provided together")
         if timeout is not None and timeout < 0:
             raise InvalidRequestError("timeout cannot be negative")
+        if block_network and (outbound_cidr_allowlist or outbound_domain_allowlist):
+            raise InvalidRequestError("network allowlists cannot be combined with block_network")
 
         resolved_client = client or Client.from_cli()
         paths = resolved_client.config.paths
@@ -74,8 +76,6 @@ class Sandbox:
                 raise InvalidRequestError("ssh_public_key cannot be empty")
             private_key_source = public_key_source = None
 
-        if block_network and (outbound_cidr_allowlist or outbound_domain_allowlist):
-            raise InvalidRequestError("network allowlists cannot be combined with block_network")
         if block_network:
             internet_access, cidrs, domains = "closed", [], []
         else:

@@ -433,12 +433,14 @@ class SandboxCreationTest(unittest.TestCase):
         ]
         for options in cases:
             with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
-                client = FakeClient(ThunderPaths(Path(directory)))
+                paths = ThunderPaths(Path(directory))
+                client = FakeClient(paths)
                 with self.assertRaises(
                     (InvalidRequestError, UnsupportedFeatureError)
                 ):
                     Sandbox.create(client=client, **options)  # type: ignore[arg-type]
                 self.assertEqual(client.requests, [])
+                self.assertFalse(paths.sandbox_keys.exists())
 
     def test_missing_name_in_start_response_is_a_lifecycle_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
