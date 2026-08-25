@@ -181,4 +181,4 @@ Set `TNR_HOME` to use a different directory for CLI state and sandbox SSH keys.
 
 ## License
 
-Thunder Sandbox is available under the [MIT License](LICENSE).
+Thunder Sandbox is available under the [Apache License 2.0](LICENSE).

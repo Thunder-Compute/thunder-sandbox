@@ -7,8 +7,8 @@ name = "thunder-sandbox"
 version = "0.1.0"
 description = "Create and control Thunder GPU sandboxes from Python"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Thunder GPU, Inc.", email = "support@thundercompute.com" },
 ]
