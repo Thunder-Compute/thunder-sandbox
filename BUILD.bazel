@@ -1,0 +1,24 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "thunder_client",
+    srcs = glob(["thunder/*.py"]),
+    data = ["thunder/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "package_metadata",
+    srcs = [
+        "README.md",
+        "pyproject.toml",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "thunder_test",
+    srcs = ["thunder_test.py"],
+    deps = [":thunder_client"],
+)
