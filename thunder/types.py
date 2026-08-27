@@ -13,12 +13,39 @@ class SandboxStatus(str, Enum):
     READY = "ready"
     FINISHED = "finished"
     FAILED = "failed"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SandboxStatus":
+        # A status this client does not know is reported as UNKNOWN rather than
+        # raising: a newer API must not break an older client mid-call.
+        return cls.UNKNOWN
+
+    @property
+    def live(self) -> bool:
+        """Whether the sandbox still exists and holds its name."""
+        return self in (SandboxStatus.CREATED, SandboxStatus.READY)
+
+    @property
+    def terminal(self) -> bool:
+        return self in (SandboxStatus.FINISHED, SandboxStatus.FAILED)
 
 
 class GPUType(str, Enum):
     A6000 = "A6000"
     A100 = "A100"
     H100 = "H100"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "GPUType | None":
+        if not isinstance(value, str):
+            return None
+        wanted = value.strip().upper()
+        for member in cls:
+            if member.value.upper() == wanted:
+                return member
+        return cls.UNKNOWN
 
 
 @dataclass(frozen=True)

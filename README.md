@@ -59,10 +59,39 @@ finally:
     sandbox.terminate()
 ```
 
-Sandboxes receive an internal name from Thunder. `Sandbox.create()` generates
-an Ed25519 key pair and stores it under
-`~/.thunder/sandbox_keys/<sandbox-id>`. The public key is immutable for the
-lifetime of the sandbox.
+Sandboxes are addressed by `id`. `Sandbox.create()` generates an Ed25519 key
+pair and stores it under `~/.thunder/sandbox_keys/<sandbox-id>`. The public key
+is immutable for the lifetime of the sandbox.
+
+A `name` is an optional label. It must be free of any other *live* sandbox in
+the organization, and it is released once a sandbox finishes, so the same label
+can be reused later. A name never addresses a sandbox:
+
+```python
+sandbox = thunder.Sandbox.create(name="training-run", gpu_type=thunder.GPUType.H100)
+print(sandbox.id, sandbox.name)
+
+# Claiming a name a live sandbox already holds raises ConflictError.
+# Looking one up searches live sandboxes; prefer Sandbox.from_id.
+same = thunder.Sandbox.from_name("training-run")
+```
+
+## Handling errors
+
+Conditions worth retrying are typed, so they can be caught without matching on
+message text. Each carries the API's `code`, the HTTP `status`, and the
+server's `retry_after` hint when one was sent:
+
+```python
+try:
+    sandbox = thunder.Sandbox.create(gpu_type=thunder.GPUType.H100)
+except thunder.CapacityError as exc:
+    # No free GPU of that type right now; the request was fine.
+    time.sleep(exc.retry_after or 30)
+except thunder.RetryableError:
+    # Rate limited, or Thunder could not service the request.
+    ...
+```
 
 ## Run commands
 

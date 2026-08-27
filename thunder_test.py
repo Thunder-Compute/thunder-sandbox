@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import json
 import os
 import subprocess
@@ -27,6 +28,10 @@ from thunder.exceptions import (
 )
 from thunder.process import ContainerProcess
 from thunder.sandbox import AsyncSandbox, Sandbox
+from thunder.exceptions import CapacityError
+from thunder.exceptions import RateLimitError
+from thunder.exceptions import RetryableError
+from thunder.exceptions import ServiceUnavailableError
 from thunder.types import GPUType, SandboxStatus
 import thunder_sandbox
 
@@ -446,7 +451,6 @@ class SandboxCreationTest(unittest.TestCase):
 
     def test_invalid_creation_options_fail_before_request(self) -> None:
         cases = [
-            {"name": "customer-name"},
             {"timeout": -1},
             {"ssh_public_key": "public"},
             {
@@ -798,3 +802,161 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GPUTypeTest(unittest.TestCase):
+    """A GPU type reported by the API must never break decoding a sandbox."""
+
+    def test_gpu_type_is_case_insensitive(self) -> None:
+        # Thunder stores the type in the case it was requested, so one
+        # organization's history contains both "H100" and "h100".
+        for value in ("H100", "h100", " h100 ", "A6000", "a6000"):
+            with self.subTest(value=value):
+                self.assertEqual(GPUType(value).value.upper(), value.strip().upper())
+
+    def test_an_unenumerated_gpu_type_does_not_raise(self) -> None:
+        # The catalog carries far more types than this client lists; meeting a
+        # new one must not fail the call that decoded it.
+        self.assertEqual(GPUType("L40S"), GPUType.UNKNOWN)
+        self.assertEqual(GPUType("rtx6000pro"), GPUType.UNKNOWN)
+
+    def test_listing_survives_a_differently_cased_gpu_type(self) -> None:
+        # The regression this guards: one lowercase record used to raise
+        # ValueError and abort list_sandboxes() for the whole organization.
+        listing = {
+            "sandboxes": [
+                dict(SANDBOX_RESPONSE, id="sbx-upper",
+                     spec={**SANDBOX_RESPONSE["spec"], "gpu_type": "H100", "gpu_count": 1}),
+                dict(SANDBOX_RESPONSE, id="sbx-lower",
+                     spec={**SANDBOX_RESPONSE["spec"], "gpu_type": "h100", "gpu_count": 1}),
+            ],
+            "next_page_token": "",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(ThunderPaths(Path(directory)))
+            client._request = lambda *a, **k: listing  # type: ignore[method-assign]
+            sandboxes = list(client.list_sandboxes())
+        self.assertEqual([s.id for s in sandboxes], ["sbx-upper", "sbx-lower"])
+        self.assertEqual([s.info.resources.gpu_type for s in sandboxes],
+                         [GPUType.H100, GPUType.H100])
+
+
+class SandboxNameTest(unittest.TestCase):
+    """A name is a caller-supplied label; the ID addresses the sandbox."""
+
+    def test_a_supplied_name_is_sent_and_an_omitted_one_is_left_to_thunder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(ThunderPaths(Path(directory)))
+            Sandbox.create(name="training-run", client=client)
+            body = client.requests[0][2]
+            assert isinstance(body, dict)
+            self.assertEqual(body["name"], "training-run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(ThunderPaths(Path(directory)))
+            Sandbox.create(client=client)
+            body = client.requests[0][2]
+            assert isinstance(body, dict)
+            # Omitted rather than sent empty, so Thunder assigns it.
+            self.assertNotIn("name", body)
+
+    def _listing_client(self, directory, sandboxes):
+        client = FakeClient(ThunderPaths(Path(directory)))
+        client._request = lambda *a, **k: {"sandboxes": sandboxes, "next_page_token": ""}  # type: ignore[method-assign]
+        return client
+
+    def test_every_name_lookup_searches_rather_than_addressing_by_key(self) -> None:
+        # A name is not a document key, so resolving one by calling the
+        # ID-addressed GET path returns the wrong sandbox or none at all.
+        listing = [
+            dict(SANDBOX_RESPONSE, id="sbx-old", name="worker", status="finished"),
+            dict(SANDBOX_RESPONSE, id="sbx-live", name="worker", status="ready"),
+        ]
+        for label, lookup in (
+            ("Sandbox.from_name", lambda c: Sandbox.from_name("worker", client=c)),
+            ("Client.get_sandbox_by_name", lambda c: c.get_sandbox_by_name("worker")),
+            ("AsyncSandbox.from_name",
+             lambda c: asyncio.run(AsyncSandbox.from_name("worker", client=c))),
+        ):
+            with self.subTest(lookup=label), tempfile.TemporaryDirectory() as directory:
+                client = self._listing_client(directory, listing)
+                seen: list[str] = []
+                original = client._request
+
+                def request(method, path, body=None, query=None):
+                    seen.append(path)
+                    return original(method, path, body, query)
+
+                client._request = request  # type: ignore[method-assign]
+                self.assertEqual(lookup(client).id, "sbx-live")
+                self.assertNotIn("/sandboxes/worker", seen)
+
+    def test_from_name_reports_a_name_no_live_sandbox_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._listing_client(directory, [
+                dict(SANDBOX_RESPONSE, id="sbx-old", name="worker", status="finished")])
+            with self.assertRaises(NotFoundError):
+                Sandbox.from_name("worker", client=client)
+
+    def test_from_name_refuses_to_guess_between_live_namesakes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._listing_client(directory, [
+                dict(SANDBOX_RESPONSE, id="sbx-a", name="worker", status="ready"),
+                dict(SANDBOX_RESPONSE, id="sbx-b", name="worker", status="ready")])
+            with self.assertRaises(ConflictError):
+                Sandbox.from_name("worker", client=client)
+
+
+class APIErrorMappingTest(unittest.TestCase):
+    """The API's machine-readable error code must survive into the exception."""
+
+    def _raise(self, status, code, message, retry_after=None):
+        import email.message
+        import io
+        import urllib.error
+
+        headers = email.message.Message()
+        if retry_after is not None:
+            headers["Retry-After"] = retry_after
+        payload = json.dumps({"error": code, "message": message, "code": status}).encode()
+
+        def urlopen(request, timeout=None):
+            raise urllib.error.HTTPError("https://api.example/v1/sandboxes/start",
+                                         status, message, headers, io.BytesIO(payload))
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client(ClientConfig(api_url="https://api.example", api_token="token",
+                                         paths=ThunderPaths(Path(directory))))
+            with mock.patch("thunder.client.urllib.request.urlopen", urlopen):
+                with self.assertRaises(ThunderError) as caught:
+                    client._request("POST", "/sandboxes/start", {})
+        return caught.exception
+
+    def test_capacity_exhaustion_is_a_distinct_retryable_error(self) -> None:
+        # Out of GPUs is an ordinary scheduling outcome, so a caller must be
+        # able to catch it specifically rather than matching on message text.
+        exc = self._raise(503, "sandbox_capacity_unavailable", "No capacity", retry_after="20")
+        self.assertIsInstance(exc, CapacityError)
+        self.assertIsInstance(exc, RetryableError)
+        self.assertEqual(exc.code, "sandbox_capacity_unavailable")
+        self.assertEqual(exc.status, 503)
+        self.assertEqual(exc.retry_after, 20.0)
+
+    def test_a_scheduler_outage_is_not_mistaken_for_capacity(self) -> None:
+        # Same status as capacity exhaustion; only the code separates them.
+        exc = self._raise(503, "sandbox_scheduler_unavailable", "Scheduler down")
+        self.assertIsInstance(exc, ServiceUnavailableError)
+        self.assertNotIsInstance(exc, CapacityError)
+
+    def test_a_name_conflict_is_a_conflict(self) -> None:
+        exc = self._raise(409, "sandbox_name_in_use", "Another running sandbox uses that name")
+        self.assertIsInstance(exc, ConflictError)
+
+    def test_rate_limiting_is_typed_and_carries_retry_after(self) -> None:
+        exc = self._raise(429, "rate_limit_exceeded", "Too many requests", retry_after="7")
+        self.assertIsInstance(exc, RateLimitError)
+        self.assertEqual(exc.retry_after, 7.0)
+
+    def test_an_unknown_status_does_not_break_decoding(self) -> None:
+        self.assertEqual(SandboxStatus("something-new"), SandboxStatus.UNKNOWN)
+

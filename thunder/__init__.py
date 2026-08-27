@@ -4,13 +4,17 @@ from .client import Client
 from .config import ClientConfig, ThunderPaths
 from .exceptions import (
     AuthenticationError,
+    CapacityError,
     ConflictError,
     ConnectionError,
     InvalidRequestError,
     NotFoundError,
+    RateLimitError,
+    RetryableError,
     SandboxError,
     SandboxFailedError,
     SandboxTimeoutError,
+    ServiceUnavailableError,
     ThunderError,
     UnsupportedFeatureError,
 )
@@ -21,6 +25,7 @@ from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus
 __all__ = [
     "AsyncSandbox",
     "AuthenticationError",
+    "CapacityError",
     "Client",
     "ClientConfig",
     "ConflictError",
@@ -30,7 +35,9 @@ __all__ = [
     "InvalidRequestError",
     "NetworkPolicy",
     "NotFoundError",
+    "RateLimitError",
     "Resources",
+    "RetryableError",
     "SSHConnection",
     "Sandbox",
     "SandboxError",
@@ -38,6 +45,7 @@ __all__ = [
     "SandboxInfo",
     "SandboxStatus",
     "SandboxTimeoutError",
+    "ServiceUnavailableError",
     "StreamReader",
     "StreamWriter",
     "ThunderError",

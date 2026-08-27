@@ -10,12 +10,62 @@ from collections.abc import Iterator
 from typing import Any, TYPE_CHECKING
 
 from .config import ClientConfig
-from .exceptions import AuthenticationError, ConflictError, ConnectionError, InvalidRequestError, NotFoundError, ThunderError
+from .exceptions import (
+    AuthenticationError,
+    CapacityError,
+    ConflictError,
+    ConnectionError,
+    InvalidRequestError,
+    NotFoundError,
+    RateLimitError,
+    ServiceUnavailableError,
+    ThunderError,
+)
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
 
 USER_AGENT = "thunder-python-sdk/0.1.0"
+
+
+# Conditions a caller acts on differently, keyed by the API's machine-readable
+# error identifier. Selecting on the identifier rather than the HTTP status
+# keeps distinct conditions that share a status apart: a sandbox request can be
+# refused for want of capacity or because the scheduler itself is down, and both
+# are 503, but only the first is worth retrying unchanged.
+_ERROR_CODES: dict[str, type[ThunderError]] = {
+    "sandbox_capacity_unavailable": CapacityError,
+    "sandbox_scheduler_unavailable": ServiceUnavailableError,
+    "sandbox_scheduler_timeout": ServiceUnavailableError,
+    "sandbox_already_exists": ConflictError,
+    "sandbox_name_in_use": ConflictError,
+    "sandbox_scheduler_rejected_request": InvalidRequestError,
+    "rate_limit_exceeded": RateLimitError,
+}
+
+_ERROR_STATUSES: dict[int, type[ThunderError]] = {
+    400: InvalidRequestError,
+    401: AuthenticationError,
+    403: AuthenticationError,
+    404: NotFoundError,
+    409: ConflictError,
+    429: RateLimitError,
+    502: ServiceUnavailableError,
+    503: ServiceUnavailableError,
+    504: ServiceUnavailableError,
+}
+
+
+def _api_error(status: int, code: str | None, message: str, headers: object) -> ThunderError:
+    error_type = _ERROR_CODES.get(code or "") or _ERROR_STATUSES.get(status, ThunderError)
+    retry_after = None
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        try:
+            retry_after = float(getter("Retry-After"))
+        except (TypeError, ValueError):
+            retry_after = None
+    return error_type(message, code=code, status=status, retry_after=retry_after)
 
 
 class Client:
@@ -48,13 +98,14 @@ class Client:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
             payload = exc.read()
+            code = None
             try:
                 parsed = json.loads(payload)
                 message = parsed.get("message") or f"Thunder API returned HTTP {exc.code}"
+                code = parsed.get("error")
             except (json.JSONDecodeError, AttributeError):
                 message = f"Thunder API returned HTTP {exc.code}"
-            error_type = {400: InvalidRequestError, 401: AuthenticationError, 403: AuthenticationError, 404: NotFoundError, 409: ConflictError}.get(exc.code, ThunderError)
-            raise error_type(message) from exc
+            raise _api_error(exc.code, code, message, exc.headers) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ConnectionError(f"could not communicate with Thunder: {exc}") from exc
         if not payload:
@@ -76,7 +127,13 @@ class Client:
         return Sandbox.from_id(sandbox_id, client=self)
 
     def get_sandbox_by_name(self, name: str) -> "Sandbox":
-        return self.get_sandbox(name)
+        """Find the live sandbox holding this name.
+
+        Names are labels rather than addresses, so this searches instead of
+        fetching by key. Prefer get_sandbox with an ID.
+        """
+        from .sandbox import Sandbox
+        return Sandbox.from_name(name, client=self)
 
     def list_sandboxes(self) -> Iterator["Sandbox"]:
         from .sandbox import Sandbox

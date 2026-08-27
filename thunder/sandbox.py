@@ -15,7 +15,15 @@ from pathlib import Path
 from typing import Literal, overload
 
 from .client import Client
-from .exceptions import InvalidRequestError, SandboxFailedError, SandboxTimeoutError, UnsupportedFeatureError, ConnectionError
+from .exceptions import (
+    ConflictError,
+    ConnectionError,
+    InvalidRequestError,
+    NotFoundError,
+    SandboxFailedError,
+    SandboxTimeoutError,
+    UnsupportedFeatureError,
+)
 from .process import AsyncContainerProcess, ContainerProcess
 from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
 
@@ -51,8 +59,6 @@ class Sandbox:
         ssh_private_key: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
-        if name is not None:
-            raise UnsupportedFeatureError("sandbox names are assigned by Thunder")
         if (ssh_public_key is None) != (ssh_private_key is None):
             raise InvalidRequestError("ssh_public_key and ssh_private_key must be provided together")
         if timeout is not None and timeout < 0:
@@ -106,6 +112,7 @@ class Sandbox:
             "lifetime": {"enforce_ttl": timeout is not None, **({"max_ttl_seconds": timeout} if timeout is not None else {})},
             "network_policy": {"internet_access": internet_access, "cidr_allowlist": cidrs, "domain_allowlist": domains},
             "ssh_public_key": public_key,
+            **({"name": name} if name is not None else {}),
         }
         try:
             response = resolved_client._request("POST", "/sandboxes/start", request)
@@ -140,7 +147,24 @@ class Sandbox:
 
     @staticmethod
     def from_name(name: str, *, client: Client | None = None) -> "Sandbox":
-        return Sandbox.from_id(name, client=client)
+        """Find the live sandbox holding this name.
+
+        A name identifies at most one live sandbox but may have belonged to any
+        number of finished ones, so this searches rather than addressing the API
+        directly, and only live sandboxes are considered. Prefer from_id.
+        """
+        resolved_client = client or Client.from_cli()
+        matches = [
+            sandbox for sandbox in resolved_client.list_sandboxes()
+            if sandbox.name == name and sandbox.status.live
+        ]
+        if not matches:
+            raise NotFoundError(f"no live sandbox is named {name!r}")
+        if len(matches) > 1:
+            raise ConflictError(
+                f"{len(matches)} live sandboxes are named {name!r}; address one by ID"
+            )
+        return matches[0]
 
     @staticmethod
     def _from_response(client: Client, response: dict[str, object]) -> "Sandbox":
@@ -310,7 +334,10 @@ class AsyncSandbox:
     @staticmethod
     async def from_id(sandbox_id: str, *, client: Client | None = None) -> "AsyncSandbox": return AsyncSandbox(await asyncio.to_thread(Sandbox.from_id, sandbox_id, client=client))
     @staticmethod
-    async def from_name(name: str, *, client: Client | None = None) -> "AsyncSandbox": return await AsyncSandbox.from_id(name, client=client)
+    async def from_name(name: str, *, client: Client | None = None) -> "AsyncSandbox":
+        # Must go through Sandbox.from_name, not from_id: a name is a label, not
+        # the sandbox's address, so the API cannot resolve one directly.
+        return AsyncSandbox(await asyncio.to_thread(Sandbox.from_name, name, client=client))
     @property
     def id(self) -> str: return self._sandbox.id
     @property
