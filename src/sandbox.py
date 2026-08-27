@@ -149,14 +149,13 @@ class Sandbox:
     def from_name(name: str, *, client: Client | None = None) -> "Sandbox":
         """Find the live sandbox holding this name.
 
-        A name identifies at most one live sandbox but may have belonged to any
-        number of finished ones, so this searches rather than addressing the API
-        directly, and only live sandboxes are considered. Prefer from_id.
+        A name is not an address: it identifies at most one live sandbox but may
+        have belonged to any number of finished ones. Prefer from_id.
         """
         resolved_client = client or Client.from_cli()
         matches = [
-            sandbox for sandbox in resolved_client.list_sandboxes()
-            if sandbox.name == name and sandbox.status.live
+            sandbox for sandbox in resolved_client.list_sandboxes(status="active")
+            if sandbox.name == name
         ]
         if not matches:
             raise NotFoundError(f"no live sandbox is named {name!r}")

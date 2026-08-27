@@ -304,12 +304,12 @@ class ClientRequestTest(unittest.TestCase):
                     mock.call(
                         "GET",
                         "/sandboxes",
-                        query={"limit": 100, "page_token": ""},
+                        query={"limit": 100, "status": "active", "page_token": ""},
                     ),
                     mock.call(
                         "GET",
                         "/sandboxes",
-                        query={"limit": 100, "page_token": "page-2"},
+                        query={"limit": 100, "status": "active", "page_token": "page-2"},
                     ),
                 ],
             )
@@ -860,9 +860,23 @@ class SandboxNameTest(unittest.TestCase):
             # Omitted rather than sent empty, so Thunder assigns it.
             self.assertNotIn("name", body)
 
+    ACTIVE = ("created", "ready")
+
     def _listing_client(self, directory, sandboxes):
+        """A fake that filters by status the way the API does."""
         client = FakeClient(ThunderPaths(Path(directory)))
-        client._request = lambda *a, **k: {"sandboxes": sandboxes, "next_page_token": ""}  # type: ignore[method-assign]
+
+        def request(method, path, body=None, query=None):
+            wanted = (query or {}).get("status", "active")
+            if wanted == "all":
+                matched = sandboxes
+            elif wanted == "active":
+                matched = [s for s in sandboxes if s["status"] in self.ACTIVE]
+            else:
+                matched = [s for s in sandboxes if s["status"] == wanted]
+            return {"sandboxes": matched, "next_page_token": ""}
+
+        client._request = request  # type: ignore[method-assign]
         return client
 
     def test_every_name_lookup_searches_rather_than_addressing_by_key(self) -> None:
@@ -959,4 +973,26 @@ class APIErrorMappingTest(unittest.TestCase):
 
     def test_an_unknown_status_does_not_break_decoding(self) -> None:
         self.assertEqual(SandboxStatus("something-new"), SandboxStatus.UNKNOWN)
+
+
+class ListStatusTest(unittest.TestCase):
+    """Listing defaults to sandboxes that still exist; history is opt-in."""
+
+    def _client(self, directory, request):
+        client = Client(ClientConfig(api_url="https://api.example", api_token="token",
+                                     paths=ThunderPaths(Path(directory))))
+        client._request = request  # type: ignore[method-assign]
+        return client
+
+    def test_status_is_sent_and_defaults_to_active(self) -> None:
+        for expected, kwargs in (
+            ("active", {}),
+            ("all", {"status": "all"}),
+            ("finished", {"status": SandboxStatus.FINISHED}),
+        ):
+            with self.subTest(status=expected), tempfile.TemporaryDirectory() as directory:
+                request = mock.Mock(return_value={"sandboxes": [], "next_page_token": ""})
+                client = self._client(directory, request)
+                list(client.list_sandboxes(**kwargs))
+                self.assertEqual(request.call_args.kwargs["query"]["status"], expected)
 

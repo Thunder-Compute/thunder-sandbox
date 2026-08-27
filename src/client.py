@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from typing import Any, TYPE_CHECKING
 
 from .config import ClientConfig
+from .types import SandboxStatus
 from .exceptions import (
     AuthenticationError,
     CapacityError,
@@ -135,11 +136,18 @@ class Client:
         from .sandbox import Sandbox
         return Sandbox.from_name(name, client=self)
 
-    def list_sandboxes(self) -> Iterator["Sandbox"]:
+    def list_sandboxes(self, *, status: str | SandboxStatus = "active") -> Iterator["Sandbox"]:
+        """Iterate sandboxes, newest first.
+
+        Defaults to the sandboxes that still exist. Pass "all" for the
+        organization's history, or a single status to narrow further.
+        """
         from .sandbox import Sandbox
+        wanted = status.value if isinstance(status, SandboxStatus) else str(status)
         page_token = ""
         while True:
-            response = self._request("GET", "/sandboxes", query={"limit": 100, "page_token": page_token})
+            response = self._request("GET", "/sandboxes",
+                                     query={"limit": 100, "status": wanted, "page_token": page_token})
             for item in response.get("sandboxes", []):
                 if isinstance(item, dict):
                     yield Sandbox._from_response(self, item)
