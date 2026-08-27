@@ -28,5 +28,6 @@ filegroup(
 py_test(
     name = "thunder_test",
     srcs = ["test/test_thunder.py"],
+    main = "test/test_thunder.py",
     deps = [":thunder_client"],
 )
