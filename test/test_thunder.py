@@ -959,4 +959,3 @@ class APIErrorMappingTest(unittest.TestCase):
 
     def test_an_unknown_status_does_not_break_decoding(self) -> None:
         self.assertEqual(SandboxStatus("something-new"), SandboxStatus.UNKNOWN)
-

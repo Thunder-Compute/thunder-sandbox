@@ -3,14 +3,14 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 py_library(
     name = "thunder_client",
     srcs = glob([
-        "thunder/*.py",
-        "thunder_sandbox/*.py",
+        "src/thunder/*.py",
+        "src/thunder_sandbox/*.py",
     ]),
     data = [
-        "thunder/py.typed",
-        "thunder_sandbox/py.typed",
+        "src/thunder/py.typed",
+        "src/thunder_sandbox/py.typed",
     ],
-    imports = ["."],
+    imports = ["src"],
     visibility = ["//visibility:public"],
 )
 
@@ -27,6 +27,6 @@ filegroup(
 
 py_test(
     name = "thunder_test",
-    srcs = ["thunder_test.py"],
+    srcs = ["test/test_thunder.py"],
     deps = [":thunder_client"],
 )

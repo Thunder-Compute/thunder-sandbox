@@ -46,7 +46,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Run unit tests
-        run: python -m unittest -v thunder_test.py
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover --start-directory test --verbose
 
   package:
     name: Build and validate distributions

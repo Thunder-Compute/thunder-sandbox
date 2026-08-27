@@ -26,7 +26,9 @@ jobs:
         run: python -c "import os, tomllib; version = tomllib.load(open('pyproject.toml', 'rb'))['project']['version']; tag = os.environ['GITHUB_REF_NAME']; assert tag == f'v{version}', f'tag {tag!r} does not match package version {version!r}'"
 
       - name: Run unit tests
-        run: python -m unittest -v thunder_test.py
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover --start-directory test --verbose
 
       - name: Install packaging tools
         run: python -m pip install --upgrade build twine
