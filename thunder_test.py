@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+from dataclasses import replace
 from datetime import timezone
 from pathlib import Path
 from unittest import mock
@@ -661,6 +662,34 @@ class SandboxWaitTest(unittest.TestCase):
             )
             with mock.patch("thunder.sandbox.time.sleep"):
                 self.assertIs(sandbox.wait_until_ready(timeout=30), sandbox)
+
+    def test_terminate_waits_for_ready_before_sending_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = self._sandbox(directory, ["created", "ready"])
+            sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
+            with mock.patch("thunder.sandbox.time.sleep"):
+                sandbox.terminate(timeout=30)
+            stop_requests = [request for request in sandbox._client.requests if request[:2] == ("POST", "/sandboxes/sbx-test/stop")]
+            self.assertEqual(len(stop_requests), 1)
+
+    def test_terminate_skips_stop_for_terminal_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = self._sandbox(directory, [])
+            sandbox._info = replace(sandbox.info, status=SandboxStatus.FAILED)
+            request_count = len(sandbox._client.requests)
+            sandbox.terminate(timeout=30)
+            self.assertEqual(len(sandbox._client.requests), request_count)
+
+    def test_terminate_times_out_without_sending_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = self._sandbox(directory, ["created"] * 10)
+            sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
+            clock = iter([0.0, 1.0, 6.0])
+            with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
+                "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
+            ), self.assertRaises(SandboxTimeoutError):
+                sandbox.terminate(timeout=5)
+            self.assertFalse(any(request[:2] == ("POST", "/sandboxes/sbx-test/stop") for request in sandbox._client.requests))
 
     def test_wait_until_ready_surfaces_a_sustained_outage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

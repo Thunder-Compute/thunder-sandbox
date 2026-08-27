@@ -17,7 +17,7 @@ Thunder Sandbox requires Python 3.10 or newer and the system `ssh`, `scp`, and
 pip install thunder-sandbox
 ```
 
-Until a release is available on PyPI, install the current repository directly:
+To install the current development branch directly from GitHub:
 
 ```bash
 pip install git+https://github.com/Thunder-Compute/thunder-sandbox.git

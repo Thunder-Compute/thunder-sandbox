@@ -286,7 +286,19 @@ class Sandbox:
                 raise SandboxTimeoutError(f"sandbox {self.id} did not become ready within {timeout} seconds")
             time.sleep(1)
 
-    def terminate(self) -> None:
+    def terminate(self, *, timeout: float | None = 300) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        failing_since: float | None = None
+        while self.status == SandboxStatus.CREATED:
+            ok, failing_since = self._refresh_while_waiting(deadline, failing_since)
+            if ok and self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SandboxTimeoutError(f"sandbox {self.id} did not become ready to stop within {timeout} seconds")
+            if self.status == SandboxStatus.CREATED:
+                time.sleep(1)
+        if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
+            return
         self._client._request("POST", f"/sandboxes/{_path_segment(self.id)}/stop")
         self.refresh()
 
@@ -320,7 +332,7 @@ class AsyncSandbox:
     async def wait_until_ready(self, *, timeout: float | None = 300) -> "AsyncSandbox":
         await asyncio.to_thread(self._sandbox.wait_until_ready, timeout=timeout)
         return self
-    async def terminate(self) -> None: await asyncio.to_thread(self._sandbox.terminate)
+    async def terminate(self, *, timeout: float | None = 300) -> None: await asyncio.to_thread(self._sandbox.terminate, timeout=timeout)
 
 
 def _generate_key_pair(path: Path) -> None:
