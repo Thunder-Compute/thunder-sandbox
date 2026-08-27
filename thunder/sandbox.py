@@ -109,13 +109,13 @@ class Sandbox:
         }
         try:
             response = resolved_client._request("POST", "/sandboxes/start", request)
-            sandbox_name = str(response.get("name", ""))
-            if not sandbox_name:
-                raise SandboxFailedError("Thunder did not return a sandbox name")
-            private_destination = paths.sandbox_private_key(sandbox_name)
-            public_destination = paths.sandbox_public_key(sandbox_name)
+            sandbox_id = str(response.get("id", ""))
+            if not sandbox_id:
+                raise SandboxFailedError("Thunder did not return a sandbox ID")
+            private_destination = paths.sandbox_private_key(sandbox_id)
+            public_destination = paths.sandbox_public_key(sandbox_id)
             if private_destination.exists() or public_destination.exists():
-                raise InvalidRequestError(f"SSH key already exists for sandbox {sandbox_name}")
+                raise InvalidRequestError(f"SSH key already exists for sandbox {sandbox_id}")
             if private_key_source is not None and public_key_source is not None:
                 os.replace(private_key_source, private_destination)
                 os.replace(public_key_source, public_destination)
@@ -126,9 +126,9 @@ class Sandbox:
             if temporary_directory is not None:
                 temporary_directory.cleanup()
 
-        sandbox = Sandbox.from_id(sandbox_name, client=resolved_client)
+        sandbox = Sandbox.from_id(sandbox_id, client=resolved_client)
         if args:
-            sandbox.wait_until_running(timeout=timeout)
+            sandbox.wait_until_ready(timeout=timeout)
             sandbox._main_process = sandbox.exec(*args)
         return sandbox
 
@@ -144,7 +144,10 @@ class Sandbox:
 
     @staticmethod
     def _from_response(client: Client, response: dict[str, object]) -> "Sandbox":
+        sandbox_id = str(response.get("id", ""))
         name = str(response.get("name", ""))
+        if not sandbox_id:
+            raise SandboxFailedError("Thunder did not return a sandbox ID")
         spec = response.get("spec") if isinstance(response.get("spec"), dict) else {}
         policy = response.get("network_policy") if isinstance(response.get("network_policy"), dict) else {}
         gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
@@ -152,12 +155,14 @@ class Sandbox:
         ssh_value = response.get("ssh")
         ssh = None
         if isinstance(ssh_value, dict) and ssh_value.get("host"):
-            ssh = SSHConnection(host=str(ssh_value["host"]), port=int(ssh_value.get("port", 22)), user=str(ssh_value.get("user", "ubuntu")), private_key_path=client.config.paths.sandbox_private_key(name))
+            ssh = SSHConnection(host=str(ssh_value["host"]), port=int(ssh_value.get("port", 22)), user=str(ssh_value.get("user", "ubuntu")), private_key_path=client.config.paths.sandbox_private_key(sandbox_id))
         info = SandboxInfo(
-            id=name, name=name, status=SandboxStatus(str(response.get("status", "pending"))),
+            id=sandbox_id, name=name, status=SandboxStatus(str(response.get("status", "created"))),
             resources=Resources(cpu=int(spec.get("cpu_count", 0)), memory=int(spec.get("memory_gib", 0)), storage=int(spec.get("storage_gib", 0)), gpu_type=gpu_type, gpu_count=gpu_count),
             network_policy=NetworkPolicy(internet_access=str(policy.get("internet_access", "closed")), outbound_cidr_allowlist=tuple(policy.get("cidr_allowlist", ()) or ()), outbound_domain_allowlist=tuple(policy.get("domain_allowlist", ()) or ())),
             created_at=_datetime(response.get("created_at")), expires_at=_datetime(response.get("expires_at"), optional=True), ssh=ssh,
+            failure_code=str(response["failure_code"]) if response.get("failure_code") else None,
+            failure=str(response["failure"]) if response.get("failure") else None,
         )
         return Sandbox(client, info)
 
@@ -222,7 +227,7 @@ class Sandbox:
         if self._main_process is not None:
             return self._main_process.poll()
         self.refresh()
-        return 0 if self.status == SandboxStatus.STOPPED else (1 if self.status == SandboxStatus.FAILED else None)
+        return 0 if self.status == SandboxStatus.FINISHED else (1 if self.status == SandboxStatus.FAILED else None)
 
     def _refresh_while_waiting(
         self, deadline: float | None, failing_since: float | None
@@ -259,7 +264,7 @@ class Sandbox:
         while True:
             ok, failing_since = self._refresh_while_waiting(deadline, failing_since)
             if ok:
-                if self.status == SandboxStatus.STOPPED:
+                if self.status == SandboxStatus.FINISHED:
                     return 0
                 if self.status == SandboxStatus.FAILED:
                     return 1
@@ -267,15 +272,15 @@ class Sandbox:
                 raise SandboxTimeoutError(f"sandbox {self.id} did not stop within {timeout} seconds")
             time.sleep(1)
 
-    def wait_until_running(self, *, timeout: float | None = 300) -> "Sandbox":
+    def wait_until_ready(self, *, timeout: float | None = 300) -> "Sandbox":
         deadline = None if timeout is None else time.monotonic() + timeout
         failing_since: float | None = None
         while True:
             ok, failing_since = self._refresh_while_waiting(deadline, failing_since)
             if ok:
-                if self.status == SandboxStatus.RUNNING:
+                if self.status == SandboxStatus.READY:
                     return self
-                if self.status in {SandboxStatus.FAILED, SandboxStatus.STOPPED}:
+                if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
                     raise SandboxFailedError(f"sandbox {self.id} did not become ready (status: {self.status.value})")
             if deadline is not None and time.monotonic() >= deadline:
                 raise SandboxTimeoutError(f"sandbox {self.id} did not become ready within {timeout} seconds")
@@ -312,8 +317,8 @@ class AsyncSandbox:
         return self
     async def poll(self) -> int | None: return await asyncio.to_thread(self._sandbox.poll)
     async def wait(self, *, timeout: float | None = None) -> int | None: return await asyncio.to_thread(self._sandbox.wait, timeout=timeout)
-    async def wait_until_running(self, *, timeout: float | None = 300) -> "AsyncSandbox":
-        await asyncio.to_thread(self._sandbox.wait_until_running, timeout=timeout)
+    async def wait_until_ready(self, *, timeout: float | None = 300) -> "AsyncSandbox":
+        await asyncio.to_thread(self._sandbox.wait_until_ready, timeout=timeout)
         return self
     async def terminate(self) -> None: await asyncio.to_thread(self._sandbox.terminate)
 

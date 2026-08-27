@@ -9,11 +9,9 @@ from pathlib import Path
 
 
 class SandboxStatus(str, Enum):
-    PENDING = "pending"
-    STARTING = "starting"
-    RUNNING = "running"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
+    CREATED = "created"
+    READY = "ready"
+    FINISHED = "finished"
     FAILED = "failed"
 
 
@@ -75,3 +73,5 @@ class SandboxInfo:
     created_at: datetime
     expires_at: datetime | None = None
     ssh: SSHConnection | None = None
+    failure_code: str | None = None
+    failure: str | None = None

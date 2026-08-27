@@ -47,7 +47,7 @@ sandbox = thunder.Sandbox.create(
 )
 
 try:
-    sandbox.wait_until_running()
+    sandbox.wait_until_ready()
 
     process = sandbox.exec("nvidia-smi")
     stdout = process.stdout.read()
@@ -61,7 +61,7 @@ finally:
 
 Sandboxes receive an internal name from Thunder. `Sandbox.create()` generates
 an Ed25519 key pair and stores it under
-`~/.thunder/sandbox_keys/<sandbox-name>`. The public key is immutable for the
+`~/.thunder/sandbox_keys/<sandbox-id>`. The public key is immutable for the
 lifetime of the sandbox.
 
 ## Run commands
@@ -136,7 +136,7 @@ with thunder.Client.from_cli() as client:
         print(sandbox.id, sandbox.status.value)
 
     sandbox = client.get_sandbox("sbx-0123456789abcdef")
-    sandbox.wait_until_running(timeout=300)
+    sandbox.wait_until_ready(timeout=300)
     print(" ".join(sandbox.ssh_command))
 ```
 
@@ -159,7 +159,7 @@ async def main() -> None:
         gpu_count=1,
     )
     try:
-        await sandbox.wait_until_running()
+        await sandbox.wait_until_ready()
         process = await sandbox.exec("nvidia-smi")
         exit_code = await process.wait()
         if exit_code != 0:

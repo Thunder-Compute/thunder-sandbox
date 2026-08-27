@@ -31,8 +31,9 @@ import thunder_sandbox
 
 
 SANDBOX_RESPONSE = {
+    "id": "sbx-test",
     "name": "sbx-test",
-    "status": "running",
+    "status": "ready",
     "spec": {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50},
     "network_policy": {
         "internet_access": "restricted",
@@ -67,7 +68,7 @@ class FakeClient(Client):
     ) -> dict[str, object]:
         self.requests.append((method, path, body, query))
         if path == "/sandboxes/start":
-            return {"name": "sbx-test"}
+            return {"id": "sbx-test", "name": "sbx-test"}
         return dict(SANDBOX_RESPONSE)
 
 
@@ -277,8 +278,8 @@ class ClientRequestTest(unittest.TestCase):
     def test_list_sandboxes_consumes_every_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = self._client(directory)
-            first = {**SANDBOX_RESPONSE, "name": "sbx-one"}
-            second = {**SANDBOX_RESPONSE, "name": "sbx-two"}
+            first = {**SANDBOX_RESPONSE, "id": "sbx-one", "name": "first"}
+            second = {**SANDBOX_RESPONSE, "id": "sbx-two", "name": "second"}
             request = mock.Mock(
                 side_effect=[
                     {"sandboxes": [first], "next_page_token": "page-2"},
@@ -463,13 +464,13 @@ class SandboxCreationTest(unittest.TestCase):
                 self.assertEqual(client.requests, [])
                 self.assertFalse(paths.sandbox_keys.exists())
 
-    def test_missing_name_in_start_response_is_a_lifecycle_error(self) -> None:
+    def test_missing_id_in_start_response_is_a_lifecycle_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(ThunderPaths(Path(directory)))
             client._request = mock.Mock(return_value={})  # type: ignore[method-assign]
             with mock.patch(
                 "thunder.sandbox._generate_key_pair", side_effect=write_generated_key
-            ), self.assertRaisesRegex(SandboxFailedError, "sandbox name"):
+            ), self.assertRaisesRegex(SandboxFailedError, "sandbox ID"):
                 Sandbox.create(client=client)
 
     def test_existing_key_is_never_overwritten(self) -> None:
@@ -507,13 +508,27 @@ class SandboxOperationTest(unittest.TestCase):
                 },
             }
             sandbox = self._sandbox(directory, response)
-            self.assertEqual(sandbox.status, SandboxStatus.RUNNING)
+            self.assertEqual(sandbox.status, SandboxStatus.READY)
+            self.assertEqual(sandbox.id, "sbx-test")
+            self.assertEqual(sandbox.name, "sbx-test")
             self.assertEqual(sandbox.info.resources.cpu, 8)
             self.assertEqual(sandbox.info.resources.gpu_type, GPUType.H100)
             self.assertEqual(sandbox.info.resources.gpu_count, 2)
             self.assertEqual(sandbox.info.created_at.tzinfo, timezone.utc)
             self.assertEqual(sandbox.ssh.host, "sandbox.example")
             self.assertEqual(sandbox.ssh.port, 2222)
+
+    def test_failed_response_preserves_public_failure_details(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = self._sandbox(directory, {
+                **SANDBOX_RESPONSE,
+                "status": "failed",
+                "failure_code": "boot_failed",
+                "failure": "Guest initialization failed",
+            })
+
+            self.assertEqual(sandbox.info.failure_code, "boot_failed")
+            self.assertEqual(sandbox.info.failure, "Guest initialization failed")
 
     def test_missing_immutable_key_prevents_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -626,7 +641,7 @@ class SandboxWaitTest(unittest.TestCase):
             query: dict[str, object] | None = None,
         ) -> dict[str, object]:
             client.requests.append((method, path, body, query))
-            next_value = responses.pop(0) if responses else "running"
+            next_value = responses.pop(0) if responses else "ready"
             if isinstance(next_value, Exception):
                 raise next_value
             return {**SANDBOX_RESPONSE, "status": next_value}
@@ -634,20 +649,20 @@ class SandboxWaitTest(unittest.TestCase):
         client._request = fake_request  # type: ignore[method-assign]
         return sandbox
 
-    def test_wait_until_running_retries_transient_connection_errors(self) -> None:
+    def test_wait_until_ready_retries_transient_connection_errors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(
                 directory,
                 [
                     ThunderConnectionError("read timed out"),
                     ThunderConnectionError("read timed out"),
-                    "running",
+                    "ready",
                 ],
             )
             with mock.patch("thunder.sandbox.time.sleep"):
-                self.assertIs(sandbox.wait_until_running(timeout=30), sandbox)
+                self.assertIs(sandbox.wait_until_ready(timeout=30), sandbox)
 
-    def test_wait_until_running_surfaces_a_sustained_outage(self) -> None:
+    def test_wait_until_ready_surfaces_a_sustained_outage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(
                 directory, [ThunderConnectionError("down")] * 100
@@ -656,7 +671,7 @@ class SandboxWaitTest(unittest.TestCase):
             with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
                 "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ), self.assertRaises(ThunderConnectionError):
-                sandbox.wait_until_running(timeout=3600)
+                sandbox.wait_until_ready(timeout=3600)
 
     def test_successful_refresh_resets_the_outage_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -664,28 +679,28 @@ class SandboxWaitTest(unittest.TestCase):
                 directory,
                 [
                     ThunderConnectionError("blip"),
-                    "pending",
+                    "created",
                     ThunderConnectionError("blip"),
-                    "pending",
+                    "created",
                     ThunderConnectionError("blip"),
-                    "running",
+                    "ready",
                 ],
             )
             clock = iter(float(value) for value in range(0, 1000, 20))
             with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
                 "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ):
-                self.assertIs(sandbox.wait_until_running(timeout=3600), sandbox)
+                self.assertIs(sandbox.wait_until_ready(timeout=3600), sandbox)
 
     def test_terminal_states_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             failed = self._sandbox(directory, ["failed"])
             with self.assertRaises(SandboxFailedError):
-                failed.wait_until_running(timeout=30)
+                failed.wait_until_ready(timeout=30)
 
         with tempfile.TemporaryDirectory() as directory:
-            stopped = self._sandbox(directory, ["stopped"])
-            self.assertEqual(stopped.wait(timeout=30), 0)
+            finished = self._sandbox(directory, ["finished"])
+            self.assertEqual(finished.wait(timeout=30), 0)
 
         with tempfile.TemporaryDirectory() as directory:
             failed = self._sandbox(directory, ["failed"])
@@ -693,12 +708,12 @@ class SandboxWaitTest(unittest.TestCase):
 
     def test_wait_timeout_is_stable_and_specific(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, ["pending"] * 10)
+            sandbox = self._sandbox(directory, ["created"] * 10)
             clock = iter([0.0, 1.0, 6.0])
             with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
                 "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ), self.assertRaises(SandboxTimeoutError):
-                sandbox.wait_until_running(timeout=5)
+                sandbox.wait_until_ready(timeout=5)
 
     def test_command_timeout_uses_sandbox_timeout_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
