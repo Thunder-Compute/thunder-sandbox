@@ -17,7 +17,7 @@ from typing import Literal, overload
 from .client import Client
 from .exceptions import InvalidRequestError, SandboxFailedError, SandboxTimeoutError, UnsupportedFeatureError, ConnectionError
 from .process import AsyncContainerProcess, ContainerProcess
-from .types import GPU, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
+from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
 
 # How long a wait tolerates uninterrupted connection failures before surfacing
 # the error. Long enough to absorb a blip, short enough that a real outage does
@@ -42,7 +42,8 @@ class Sandbox:
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
-        gpu: str | None = None,
+        gpu_type: GPUType | None = None,
+        gpu_count: int | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -56,6 +57,12 @@ class Sandbox:
             raise InvalidRequestError("ssh_public_key and ssh_private_key must be provided together")
         if timeout is not None and timeout < 0:
             raise InvalidRequestError("timeout cannot be negative")
+        if gpu_type is not None and not isinstance(gpu_type, GPUType):
+            raise InvalidRequestError("gpu_type must be a GPUType")
+        if (gpu_type is None) != (gpu_count is None):
+            raise InvalidRequestError("gpu_type and gpu_count must be provided together")
+        if gpu_count is not None and gpu_count not in (1, 2, 4, 8):
+            raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
         if block_network and (outbound_cidr_allowlist or outbound_domain_allowlist):
             raise InvalidRequestError("network allowlists cannot be combined with block_network")
 
@@ -93,7 +100,7 @@ class Sandbox:
                 "cpu_count": cpu if cpu is not None else 4,
                 "memory_gib": memory if memory is not None else 32,
                 "storage_gib": storage if storage is not None else 50,
-                **({"gpu_type": gpu, "gpu_count": 1} if gpu else {}),
+                **({"gpu_type": gpu_type.value, "gpu_count": gpu_count} if gpu_type is not None else {}),
             },
             "env": {key: value for key, value in (env or {}).items() if value is not None},
             "lifetime": {"enforce_ttl": timeout is not None, **({"max_ttl_seconds": timeout} if timeout is not None else {})},
@@ -140,14 +147,15 @@ class Sandbox:
         name = str(response.get("name", ""))
         spec = response.get("spec") if isinstance(response.get("spec"), dict) else {}
         policy = response.get("network_policy") if isinstance(response.get("network_policy"), dict) else {}
-        gpu = GPU(str(spec["gpu_type"]), int(spec.get("gpu_count", 1))) if spec.get("gpu_type") else None
+        gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
+        gpu_count = int(spec.get("gpu_count", 0))
         ssh_value = response.get("ssh")
         ssh = None
         if isinstance(ssh_value, dict) and ssh_value.get("host"):
             ssh = SSHConnection(host=str(ssh_value["host"]), port=int(ssh_value.get("port", 22)), user=str(ssh_value.get("user", "ubuntu")), private_key_path=client.config.paths.sandbox_private_key(name))
         info = SandboxInfo(
             id=name, name=name, status=SandboxStatus(str(response.get("status", "pending"))),
-            resources=Resources(cpu=int(spec.get("cpu_count", 0)), memory=int(spec.get("memory_gib", 0)), storage=int(spec.get("storage_gib", 0)), gpu=gpu),
+            resources=Resources(cpu=int(spec.get("cpu_count", 0)), memory=int(spec.get("memory_gib", 0)), storage=int(spec.get("storage_gib", 0)), gpu_type=gpu_type, gpu_count=gpu_count),
             network_policy=NetworkPolicy(internet_access=str(policy.get("internet_access", "closed")), outbound_cidr_allowlist=tuple(policy.get("cidr_allowlist", ()) or ()), outbound_domain_allowlist=tuple(policy.get("domain_allowlist", ()) or ())),
             created_at=_datetime(response.get("created_at")), expires_at=_datetime(response.get("expires_at"), optional=True), ssh=ssh,
         )
@@ -273,8 +281,8 @@ class Sandbox:
                 raise SandboxTimeoutError(f"sandbox {self.id} did not become ready within {timeout} seconds")
             time.sleep(1)
 
-    def terminate(self, *, graceful: bool = True) -> None:
-        self._client._request("POST", f"/sandboxes/{_path_segment(self.id)}/stop", {"graceful": graceful})
+    def terminate(self) -> None:
+        self._client._request("POST", f"/sandboxes/{_path_segment(self.id)}/stop")
         self.refresh()
 
 
@@ -307,7 +315,7 @@ class AsyncSandbox:
     async def wait_until_running(self, *, timeout: float | None = 300) -> "AsyncSandbox":
         await asyncio.to_thread(self._sandbox.wait_until_running, timeout=timeout)
         return self
-    async def terminate(self, *, graceful: bool = True) -> None: await asyncio.to_thread(self._sandbox.terminate, graceful=graceful)
+    async def terminate(self) -> None: await asyncio.to_thread(self._sandbox.terminate)
 
 
 def _generate_key_pair(path: Path) -> None:

@@ -41,7 +41,8 @@ sandbox = thunder.Sandbox.create(
     cpu=4,
     memory=32,
     storage=50,
-    gpu="A6000",
+    gpu_type=thunder.GPUType.A6000,
+    gpu_count=1,
     timeout=900,
 )
 
@@ -153,7 +154,10 @@ import thunder_sandbox as thunder
 
 
 async def main() -> None:
-    sandbox = await thunder.AsyncSandbox.create(gpu="A6000")
+    sandbox = await thunder.AsyncSandbox.create(
+        gpu_type=thunder.GPUType.A6000,
+        gpu_count=1,
+    )
     try:
         await sandbox.wait_until_running()
         process = await sandbox.exec("nvidia-smi")

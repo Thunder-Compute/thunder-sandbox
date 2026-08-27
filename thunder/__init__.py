@@ -16,7 +16,7 @@ from .exceptions import (
 )
 from .process import ContainerProcess, StreamReader, StreamWriter
 from .sandbox import AsyncSandbox, Sandbox
-from .types import GPU, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
+from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
 
 __all__ = [
     "AsyncSandbox",
@@ -26,7 +26,7 @@ __all__ = [
     "ConflictError",
     "ConnectionError",
     "ContainerProcess",
-    "GPU",
+    "GPUType",
     "InvalidRequestError",
     "NetworkPolicy",
     "NotFoundError",

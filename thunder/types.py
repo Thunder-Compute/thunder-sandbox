@@ -17,10 +17,10 @@ class SandboxStatus(str, Enum):
     FAILED = "failed"
 
 
-@dataclass(frozen=True)
-class GPU:
-    type: str
-    count: int = 1
+class GPUType(str, Enum):
+    A6000 = "A6000"
+    A100 = "A100"
+    H100 = "H100"
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,8 @@ class Resources:
     cpu: int
     memory: int
     storage: int
-    gpu: GPU | None = None
+    gpu_type: GPUType | None = None
+    gpu_count: int = 0
 
 
 @dataclass(frozen=True)

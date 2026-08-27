@@ -26,7 +26,7 @@ from thunder.exceptions import (
 )
 from thunder.process import ContainerProcess
 from thunder.sandbox import AsyncSandbox, Sandbox
-from thunder.types import SandboxStatus
+from thunder.types import GPUType, SandboxStatus
 import thunder_sandbox
 
 
@@ -309,6 +309,20 @@ class ClientRequestTest(unittest.TestCase):
 
 
 class SandboxCreationTest(unittest.TestCase):
+    def test_gpu_type_and_count_must_follow_the_public_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(ThunderPaths(Path(directory)))
+            invalid_options = (
+                {"gpu_type": GPUType.H100},
+                {"gpu_count": 1},
+                {"gpu_type": GPUType.A100, "gpu_count": 0},
+                {"gpu_type": GPUType.A6000, "gpu_count": 3},
+                {"gpu_type": "h100", "gpu_count": 1},
+            )
+            for options in invalid_options:
+                with self.subTest(options=options), self.assertRaises(InvalidRequestError):
+                    Sandbox.create(client=client, **options)  # type: ignore[arg-type]
+
     def test_generated_key_exists_before_start_and_moves_to_sandbox_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = ThunderPaths(Path(directory))
@@ -339,7 +353,8 @@ class SandboxCreationTest(unittest.TestCase):
                 cpu=8,
                 memory=64,
                 storage=200,
-                gpu="H100",
+                gpu_type=GPUType.H100,
+                gpu_count=2,
                 env={"KEEP": "value", "DROP": None},
                 timeout=None,
                 outbound_cidr_allowlist=["203.0.113.0/24"],
@@ -358,7 +373,7 @@ class SandboxCreationTest(unittest.TestCase):
                     "memory_gib": 64,
                     "storage_gib": 200,
                     "gpu_type": "H100",
-                    "gpu_count": 1,
+                    "gpu_count": 2,
                 },
             )
             self.assertEqual(request["env"], {"KEEP": "value"})
@@ -494,8 +509,8 @@ class SandboxOperationTest(unittest.TestCase):
             sandbox = self._sandbox(directory, response)
             self.assertEqual(sandbox.status, SandboxStatus.RUNNING)
             self.assertEqual(sandbox.info.resources.cpu, 8)
-            self.assertEqual(sandbox.info.resources.gpu.type, "H100")  # type: ignore[union-attr]
-            self.assertEqual(sandbox.info.resources.gpu.count, 2)  # type: ignore[union-attr]
+            self.assertEqual(sandbox.info.resources.gpu_type, GPUType.H100)
+            self.assertEqual(sandbox.info.resources.gpu_count, 2)
             self.assertEqual(sandbox.info.created_at.tzinfo, timezone.utc)
             self.assertEqual(sandbox.ssh.host, "sandbox.example")
             self.assertEqual(sandbox.ssh.port, 2222)
@@ -581,10 +596,10 @@ class SandboxOperationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(directory)
             client = sandbox._client
-            sandbox.terminate(graceful=False)
+            sandbox.terminate()
             self.assertEqual(
                 client.requests[-2][:3],
-                ("POST", "/sandboxes/sbx-test/stop", {"graceful": False}),
+                ("POST", "/sandboxes/sbx-test/stop", None),
             )
             self.assertEqual(client.requests[-1][1], "/sandboxes/sbx-test")
 
