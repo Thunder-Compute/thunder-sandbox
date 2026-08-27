@@ -13,9 +13,9 @@ from datetime import timezone
 from pathlib import Path
 from unittest import mock
 
-from thunder.client import Client, USER_AGENT
-from thunder.config import ClientConfig, DEFAULT_API_URL, ThunderPaths
-from thunder.exceptions import (
+from src.client import Client, USER_AGENT
+from src.config import ClientConfig, DEFAULT_API_URL, ThunderPaths
+from src.exceptions import (
     AuthenticationError,
     ConflictError,
     ConnectionError as ThunderConnectionError,
@@ -26,13 +26,13 @@ from thunder.exceptions import (
     ThunderError,
     UnsupportedFeatureError,
 )
-from thunder.process import ContainerProcess
-from thunder.sandbox import AsyncSandbox, Sandbox
-from thunder.exceptions import CapacityError
-from thunder.exceptions import RateLimitError
-from thunder.exceptions import RetryableError
-from thunder.exceptions import ServiceUnavailableError
-from thunder.types import GPUType, SandboxStatus
+from src.process import ContainerProcess
+from src.sandbox import AsyncSandbox, Sandbox
+from src.exceptions import CapacityError
+from src.exceptions import RateLimitError
+from src.exceptions import RetryableError
+from src.exceptions import ServiceUnavailableError
+from src.types import GPUType, SandboxStatus
 import thunder_sandbox
 
 
@@ -116,7 +116,7 @@ class ConfigTest(unittest.TestCase):
                 json.dumps({"api_url": "https://project"}), encoding="utf-8"
             )
 
-            with mock.patch("thunder.config.Path.cwd", return_value=root), mock.patch.dict(
+            with mock.patch("src.config.Path.cwd", return_value=root), mock.patch.dict(
                 os.environ,
                 {"TNR_API_TOKEN": "env-token", "TNR_API_URL": "https://env"},
                 clear=True,
@@ -145,12 +145,12 @@ class ConfigTest(unittest.TestCase):
             (root / ".thunder.json").write_text(
                 json.dumps({"api_url": "https://project"}), encoding="utf-8"
             )
-            with mock.patch("thunder.config.Path.cwd", return_value=root), mock.patch.dict(
+            with mock.patch("src.config.Path.cwd", return_value=root), mock.patch.dict(
                 os.environ, {}, clear=True
             ):
                 self.assertEqual(ClientConfig(paths=paths).api_url, "https://project")
             with mock.patch(
-                "thunder.config.Path.cwd", return_value=root / "empty-project"
+                "src.config.Path.cwd", return_value=root / "empty-project"
             ), mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     ClientConfig(
@@ -207,7 +207,7 @@ class ClientRequestTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             client = self._client(directory)
-            with mock.patch("thunder.client.urllib.request.urlopen", urlopen):
+            with mock.patch("src.client.urllib.request.urlopen", urlopen):
                 response = client._request(
                     "POST",
                     "/sandboxes/start",
@@ -249,7 +249,7 @@ class ClientRequestTest(unittest.TestCase):
                     fp=io.BytesIO(b'{"message":"specific failure"}'),
                 )
                 with self.subTest(status=status), mock.patch(
-                    "thunder.client.urllib.request.urlopen", side_effect=error
+                    "src.client.urllib.request.urlopen", side_effect=error
                 ), self.assertRaisesRegex(error_type, "specific failure"):
                     client._request("GET", "/sandboxes")
 
@@ -263,7 +263,7 @@ class ClientRequestTest(unittest.TestCase):
             ]
             for response in responses:
                 with self.subTest(response=response), mock.patch(
-                    "thunder.client.urllib.request.urlopen",
+                    "src.client.urllib.request.urlopen",
                     side_effect=response if isinstance(response, Exception) else None,
                     return_value=response if not isinstance(response, Exception) else None,
                 ), self.assertRaises(ThunderConnectionError):
@@ -273,7 +273,7 @@ class ClientRequestTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = self._client(directory)
             with mock.patch(
-                "thunder.client.urllib.request.urlopen",
+                "src.client.urllib.request.urlopen",
                 return_value=HTTPResponse(b""),
             ):
                 self.assertEqual(client._request("DELETE", "/sandboxes/x"), {})
@@ -335,7 +335,7 @@ class SandboxCreationTest(unittest.TestCase):
             paths = ThunderPaths(Path(directory))
             client = FakeClient(paths)
             with mock.patch(
-                "thunder.sandbox._generate_key_pair", side_effect=write_generated_key
+                "src.sandbox._generate_key_pair", side_effect=write_generated_key
             ):
                 Sandbox.create(client=client)
 
@@ -474,7 +474,7 @@ class SandboxCreationTest(unittest.TestCase):
             client = FakeClient(ThunderPaths(Path(directory)))
             client._request = mock.Mock(return_value={})  # type: ignore[method-assign]
             with mock.patch(
-                "thunder.sandbox._generate_key_pair", side_effect=write_generated_key
+                "src.sandbox._generate_key_pair", side_effect=write_generated_key
             ), self.assertRaisesRegex(SandboxFailedError, "sandbox ID"):
                 Sandbox.create(client=client)
 
@@ -562,7 +562,7 @@ class SandboxOperationTest(unittest.TestCase):
                 returncode=None,
             )
             with mock.patch(
-                "thunder.sandbox.subprocess.Popen", return_value=process
+                "src.sandbox.subprocess.Popen", return_value=process
             ) as popen:
                 sandbox.exec(
                     "printf",
@@ -585,7 +585,7 @@ class SandboxOperationTest(unittest.TestCase):
     def test_upload_and_download_build_scp_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(directory)
-            with mock.patch("thunder.sandbox.subprocess.run") as run:
+            with mock.patch("src.sandbox.subprocess.run") as run:
                 sandbox.upload("local dir", "/remote dir", recursive=True)
                 upload = run.call_args.args[0]
                 self.assertEqual(upload[0], "scp")
@@ -603,11 +603,11 @@ class SandboxOperationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(directory)
             with mock.patch(
-                "thunder.sandbox.subprocess.run", side_effect=FileNotFoundError
+                "src.sandbox.subprocess.run", side_effect=FileNotFoundError
             ), self.assertRaises(UnsupportedFeatureError):
                 sandbox.upload("local", "/remote")
             with mock.patch(
-                "thunder.sandbox.subprocess.run",
+                "src.sandbox.subprocess.run",
                 side_effect=subprocess.CalledProcessError(23, ["scp"]),
             ), self.assertRaisesRegex(SandboxFailedError, "status 23"):
                 sandbox.download("/remote", "local")
@@ -664,14 +664,14 @@ class SandboxWaitTest(unittest.TestCase):
                     "ready",
                 ],
             )
-            with mock.patch("thunder.sandbox.time.sleep"):
+            with mock.patch("src.sandbox.time.sleep"):
                 self.assertIs(sandbox.wait_until_ready(timeout=30), sandbox)
 
     def test_terminate_waits_for_ready_before_sending_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(directory, ["created", "ready"])
             sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
-            with mock.patch("thunder.sandbox.time.sleep"):
+            with mock.patch("src.sandbox.time.sleep"):
                 sandbox.terminate(timeout=30)
             stop_requests = [request for request in sandbox._client.requests if request[:2] == ("POST", "/sandboxes/sbx-test/stop")]
             self.assertEqual(len(stop_requests), 1)
@@ -689,8 +689,8 @@ class SandboxWaitTest(unittest.TestCase):
             sandbox = self._sandbox(directory, ["created"] * 10)
             sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
             clock = iter([0.0, 1.0, 6.0])
-            with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
-                "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
+            with mock.patch("src.sandbox.time.sleep"), mock.patch(
+                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ), self.assertRaises(SandboxTimeoutError):
                 sandbox.terminate(timeout=5)
             self.assertFalse(any(request[:2] == ("POST", "/sandboxes/sbx-test/stop") for request in sandbox._client.requests))
@@ -701,8 +701,8 @@ class SandboxWaitTest(unittest.TestCase):
                 directory, [ThunderConnectionError("down")] * 100
             )
             clock = iter(float(value) for value in range(0, 1000, 5))
-            with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
-                "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
+            with mock.patch("src.sandbox.time.sleep"), mock.patch(
+                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ), self.assertRaises(ThunderConnectionError):
                 sandbox.wait_until_ready(timeout=3600)
 
@@ -720,8 +720,8 @@ class SandboxWaitTest(unittest.TestCase):
                 ],
             )
             clock = iter(float(value) for value in range(0, 1000, 20))
-            with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
-                "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
+            with mock.patch("src.sandbox.time.sleep"), mock.patch(
+                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ):
                 self.assertIs(sandbox.wait_until_ready(timeout=3600), sandbox)
 
@@ -743,8 +743,8 @@ class SandboxWaitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox = self._sandbox(directory, ["created"] * 10)
             clock = iter([0.0, 1.0, 6.0])
-            with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
-                "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)
+            with mock.patch("src.sandbox.time.sleep"), mock.patch(
+                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
             ), self.assertRaises(SandboxTimeoutError):
                 sandbox.wait_until_ready(timeout=5)
 
@@ -941,7 +941,7 @@ class APIErrorMappingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = Client(ClientConfig(api_url="https://api.example", api_token="token",
                                          paths=ThunderPaths(Path(directory))))
-            with mock.patch("thunder.client.urllib.request.urlopen", urlopen):
+            with mock.patch("src.client.urllib.request.urlopen", urlopen):
                 with self.assertRaises(ThunderError) as caught:
                     client._request("POST", "/sandboxes/start", {})
         return caught.exception
