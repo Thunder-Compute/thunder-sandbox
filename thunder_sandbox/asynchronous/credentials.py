@@ -70,6 +70,17 @@ class CredentialStore:
         self._current = await self._mint(client, reuse=cached)
         return self._current
 
+    async def renew(self, client: "Client") -> SSHCredential:
+        """Mint a replacement for a credential the sandbox would not accept.
+
+        A cached certificate can be unexpired and still useless: signed by
+        another environment's authority, or by one that has since rotated.
+        Expiry cannot detect either, so the only evidence is the sandbox
+        refusing it.
+        """
+        self._current = await self._mint(client, reuse=self._load())
+        return self._current
+
     def _load(self) -> SSHCredential | None:
         """Adopt the cached credential. Any damage means mint a fresh one."""
         try:

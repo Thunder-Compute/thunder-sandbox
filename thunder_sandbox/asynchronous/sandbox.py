@@ -16,6 +16,8 @@ from urllib.parse import quote
 
 import asyncssh
 
+from . import credentials
+
 from .._common.config import ThunderPaths
 from .._common.exceptions import (
     ConflictError,
@@ -326,19 +328,17 @@ class Sandbox:
                 pinned = _pinned_host_key(self.id)
                 known_hosts = ([pinned], [], []) if pinned is not None else None
                 credential = await self._client._credentials.ensure(self._client)
-                connection = await asyncssh.connect(
-                    ssh.host,
-                    ssh.port,
-                    username=ssh.user,
-                    # The sandbox trusts the authority that signed this, not
-                    # the key itself, so the same credential opens every
-                    # sandbox the organization owns.
-                    client_keys=[(credential.key, credential.certificate)],
-                    known_hosts=known_hosts,
-                    agent_path=None,
-                    preferred_auth=["publickey"],
-                    config=None,
-                )
+                try:
+                    connection = await self._open(ssh, credential, known_hosts)
+                except asyncssh.PermissionDenied:
+                    # The cached certificate is unexpired but this sandbox will
+                    # not take it, which happens when it was signed for another
+                    # environment or by an authority that has since rotated.
+                    # Mint once against the API this client is actually talking
+                    # to rather than failing every future connection the same
+                    # way.
+                    credential = await self._client._credentials.renew(self._client)
+                    connection = await self._open(ssh, credential, known_hosts)
                 if pinned is None:
                     try:
                         _remember_host_key(self.id, connection.get_server_host_key())
@@ -352,6 +352,26 @@ class Sandbox:
                 ) from exc
             self._connection = connection
             return connection
+
+    async def _open(
+        self,
+        ssh: SSHConnection,
+        credential: "credentials.SSHCredential",
+        known_hosts: object,
+    ) -> asyncssh.SSHClientConnection:
+        return await asyncssh.connect(
+            ssh.host,
+            ssh.port,
+            username=ssh.user,
+            # The sandbox trusts the authority that signed this, not the key
+            # itself, so the same credential opens every sandbox the
+            # organization owns.
+            client_keys=[(credential.key, credential.certificate)],
+            known_hosts=known_hosts,
+            agent_path=None,
+            preferred_auth=["publickey"],
+            config=None,
+        )
 
     async def _discard_connection(
         self, connection: asyncssh.SSHClientConnection
