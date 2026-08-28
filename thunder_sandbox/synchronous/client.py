@@ -1,0 +1,110 @@
+"""Blocking adapter over the native asynchronous Thunder client."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any, TYPE_CHECKING
+
+from ._bridge import AsyncBridge
+from ..asynchronous.client import Client as NativeClient
+from .._common.config import ClientConfig
+from .._common.exceptions import ConnectionError
+from .._common.types import SandboxStatus
+
+if TYPE_CHECKING:
+    from ..asynchronous.sandbox import Sandbox as NativeSandbox
+    from .sandbox import Sandbox
+
+
+class Client:
+    def __init__(self, config: ClientConfig | None = None) -> None:
+        self._client = NativeClient(config)
+        self._bridge = AsyncBridge()
+        self.config = self._client.config
+        self._closed = False
+        self._sandboxes: set[NativeSandbox] = set()
+
+    @classmethod
+    def from_cli(cls) -> "Client":
+        return cls(ClientConfig.from_cli())
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        query: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return self._bridge.run(self._client._request(method, path, body, query))
+
+    def create_sandbox(self, *args: str, **options: object) -> "Sandbox":
+        from .sandbox import Sandbox
+
+        return Sandbox.create(*args, client=self, **options)
+
+    def _wrap_sandbox(self, sandbox: "NativeSandbox") -> "Sandbox":
+        from .sandbox import Sandbox
+
+        self._sandboxes.add(sandbox)
+        return Sandbox(self, sandbox)
+
+    def get_sandbox(self, sandbox_id: str) -> "Sandbox":
+        from .sandbox import Sandbox
+
+        sandbox = self._bridge.run(
+            self._client.get_sandbox(sandbox_id)
+        )
+        return self._wrap_sandbox(sandbox)
+
+    def get_sandbox_by_name(self, name: str) -> "Sandbox":
+        from .sandbox import Sandbox
+
+        sandbox = self._bridge.run(
+            self._client.get_sandbox_by_name(name)
+        )
+        return self._wrap_sandbox(sandbox)
+
+    def list_sandboxes(
+        self, *, status: str | SandboxStatus = "active"
+    ) -> Iterator["Sandbox"]:
+        from .sandbox import Sandbox
+
+        iterator = self._client.list_sandboxes(status=status)
+        try:
+            while True:
+                try:
+                    sandbox = self._bridge.run(anext(iterator))
+                except StopAsyncIteration:
+                    return
+                yield self._wrap_sandbox(sandbox)
+        finally:
+            self._bridge.run(iterator.aclose())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        async def close_resources() -> None:
+            for sandbox in self._sandboxes:
+                await sandbox._close_connection()
+            self._sandboxes.clear()
+            await self._client.close()
+
+        try:
+            self._bridge.run(close_resources())
+        finally:
+            self._bridge.close()
+
+    def __enter__(self) -> "Client":
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+__all__ = ["Client"]

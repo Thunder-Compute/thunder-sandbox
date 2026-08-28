@@ -5,13 +5,12 @@ small, typed Python API.
 
 Thunder Sandbox uses the same account and credentials as the Thunder CLI. It
 handles sandbox lifecycle, SSH key creation, readiness polling, command
-execution, uploads, and downloads without adding any runtime Python
-dependencies.
+execution, uploads, and downloads with native synchronous and asynchronous
+Python APIs.
 
 ## Installation
 
-Thunder Sandbox requires Python 3.10 or newer and the system `ssh`, `scp`, and
-`ssh-keygen` executables.
+Thunder Sandbox requires Python 3.10 or newer.
 
 ```bash
 pip install thunder-sandbox
@@ -35,7 +34,7 @@ Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
 ## Quick start
 
 ```python
-import thunder_sandbox as thunder
+import thunder_sandbox.synchronous as thunder
 
 sandbox = thunder.Sandbox.create(
     cpu=4,
@@ -174,16 +173,16 @@ files against an existing sandbox.
 
 ## Async API
 
-`AsyncSandbox` exposes the same lifecycle and remote-operation primitives for
-async applications:
+The asynchronous namespace exposes the same lifecycle and remote-operation
+primitives with awaitable methods:
 
 ```python
 import asyncio
-import thunder_sandbox as thunder
+import thunder_sandbox.asynchronous as thunder
 
 
 async def main() -> None:
-    sandbox = await thunder.AsyncSandbox.create(
+    sandbox = await thunder.Sandbox.create(
         gpu_type=thunder.GPUType.A6000,
         gpu_count=1,
     )
@@ -192,8 +191,8 @@ async def main() -> None:
         process = await sandbox.exec("nvidia-smi")
         exit_code = await process.wait()
         if exit_code != 0:
-            raise RuntimeError(process.stderr.read())
-        print(process.stdout.read())
+            raise RuntimeError(await process.stderr.read())
+        print(await process.stdout.read())
     finally:
         await sandbox.terminate()
 
