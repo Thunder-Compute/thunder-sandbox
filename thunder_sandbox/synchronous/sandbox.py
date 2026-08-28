@@ -58,8 +58,6 @@ class Sandbox:
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
-                    ssh_public_key=ssh_public_key,
-                    ssh_private_key=ssh_private_key,
                     client=resolved_client._client,
                 )
             )
@@ -104,8 +102,6 @@ class Sandbox:
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
-                    ssh_public_key=ssh_public_key,
-                    ssh_private_key=ssh_private_key,
                     client=resolved_client._client,
                 )
             )
