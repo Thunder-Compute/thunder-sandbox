@@ -82,9 +82,8 @@ class SSHConnection:
             "ssh", "-i", str(self.private_key_path), "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
-        if self.known_hosts_path is None:
-            command.extend(("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"))
-        else:
+        command.extend(("-o", "StrictHostKeyChecking=accept-new"))
+        if self.known_hosts_path is not None:
             command.extend(("-o", f"UserKnownHostsFile={self.known_hosts_path}"))
         command.append(f"{self.user}@{self.host}")
         return tuple(command)

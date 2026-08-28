@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any, TYPE_CHECKING
 
 from ._bridge import AsyncBridge
@@ -39,10 +39,30 @@ class Client:
             raise ConnectionError("client is closed")
         return self._bridge.run(self._client._request(method, path, body, query))
 
+    async def _request_async(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        query: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return await self._bridge.run_async(
+            self._client._request(method, path, body, query)
+        )
+
     def create_sandbox(self, *args: str, **options: object) -> "Sandbox":
         from .sandbox import Sandbox
 
         return Sandbox.create(*args, client=self, **options)
+
+    async def create_sandbox_async(
+        self, *args: str, **options: object
+    ) -> "Sandbox":
+        from .sandbox import Sandbox
+
+        return await Sandbox.create_async(*args, client=self, **options)
 
     def _wrap_sandbox(self, sandbox: "NativeSandbox") -> "Sandbox":
         from .sandbox import Sandbox
@@ -58,10 +78,20 @@ class Client:
         )
         return self._wrap_sandbox(sandbox)
 
+    async def get_sandbox_async(self, sandbox_id: str) -> "Sandbox":
+        sandbox = await self._bridge.run_async(self._client.get_sandbox(sandbox_id))
+        return self._wrap_sandbox(sandbox)
+
     def get_sandbox_by_name(self, name: str) -> "Sandbox":
         from .sandbox import Sandbox
 
         sandbox = self._bridge.run(
+            self._client.get_sandbox_by_name(name)
+        )
+        return self._wrap_sandbox(sandbox)
+
+    async def get_sandbox_by_name_async(self, name: str) -> "Sandbox":
+        sandbox = await self._bridge.run_async(
             self._client.get_sandbox_by_name(name)
         )
         return self._wrap_sandbox(sandbox)
@@ -82,6 +112,20 @@ class Client:
         finally:
             self._bridge.run(iterator.aclose())
 
+    async def list_sandboxes_async(
+        self, *, status: str | SandboxStatus = "active"
+    ) -> AsyncIterator["Sandbox"]:
+        iterator = self._client.list_sandboxes(status=status)
+        try:
+            while True:
+                try:
+                    sandbox = await self._bridge.run_async(anext(iterator))
+                except StopAsyncIteration:
+                    return
+                yield self._wrap_sandbox(sandbox)
+        finally:
+            await self._bridge.run_async(iterator.aclose())
+
     def close(self) -> None:
         if self._closed:
             return
@@ -98,6 +142,22 @@ class Client:
         finally:
             self._bridge.close()
 
+    async def close_async(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        async def close_resources() -> None:
+            for sandbox in self._sandboxes:
+                await sandbox._close_connection()
+            self._sandboxes.clear()
+            await self._client.close()
+
+        try:
+            await self._bridge.run_async(close_resources())
+        finally:
+            self._bridge.close()
+
     def __enter__(self) -> "Client":
         if self._closed:
             raise ConnectionError("client is closed")
@@ -105,6 +165,16 @@ class Client:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+    async def __aenter__(self) -> "Client":
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return self
+
+    async def __aexit__(
+        self, exc_type: object, exc: object, traceback: object
+    ) -> None:
+        await self.close_async()
 
 
 __all__ = ["Client"]

@@ -11,6 +11,7 @@ from unittest import mock
 
 import thunder_sandbox.asynchronous as asynchronous
 import thunder_sandbox.synchronous as synchronous
+import thunder_sandbox as thunder
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
@@ -21,6 +22,7 @@ from thunder_sandbox._common.exceptions import (
     ConnectionError,
     InvalidRequestError,
     RateLimitError,
+    ServiceUnavailableError,
     SandboxTimeoutError,
 )
 from thunder_sandbox._common.types import GPUType, SandboxStatus
@@ -61,6 +63,9 @@ def prepare_key(paths: ThunderPaths) -> None:
 
 class ConfigTest(unittest.TestCase):
     def test_public_distribution_exports_both_apis(self) -> None:
+        self.assertIs(thunder.Client, Client)
+        self.assertIs(thunder.Sandbox, Sandbox)
+        self.assertIs(thunder.Process, Process)
         self.assertIs(synchronous.Client, Client)
         self.assertIs(synchronous.Sandbox, Sandbox)
         self.assertIs(synchronous.Process, Process)
@@ -85,7 +90,7 @@ class ConfigTest(unittest.TestCase):
             (root / ".thunder.json").write_text(
                 json.dumps({"api_url": "https://project"}), encoding="utf-8"
             )
-            with mock.patch("thunder_sandbox._common.config.Path.cwd", return_value=root), mock.patch.dict(
+            with mock.patch.dict(
                 os.environ,
                 {"TNR_API_TOKEN": "environment", "TNR_API_URL": "https://environment"},
                 clear=True,
@@ -93,6 +98,26 @@ class ConfigTest(unittest.TestCase):
                 resolved = ClientConfig(paths=paths)
             self.assertEqual(resolved.api_token, "environment")
             self.assertEqual(resolved.api_url, "https://environment")
+
+    def test_project_config_cannot_redirect_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = ThunderPaths(root / "state")
+            paths.root.mkdir()
+            paths.credentials.write_text(
+                json.dumps({"token": "secret", "api_url": "https://api.example"}),
+                encoding="utf-8",
+            )
+            (root / ".thunder.json").write_text(
+                json.dumps({"api_url": "https://attacker.example"}), encoding="utf-8"
+            )
+            with mock.patch("thunder_sandbox._common.config.Path.cwd", return_value=root):
+                resolved = ClientConfig(paths=paths)
+            self.assertEqual(resolved.api_url, "https://api.example")
+
+    def test_api_url_requires_https(self) -> None:
+        with self.assertRaisesRegex(InvalidRequestError, "HTTPS"):
+            ClientConfig(api_url="http://api.example", api_token="secret")
 
     def test_default_url_and_missing_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -134,6 +159,22 @@ class BridgeTest(unittest.TestCase):
                 bridge.close()
 
         self.assertEqual(asyncio.run(caller()), 42)
+
+    def test_sync_and_async_calls_share_the_bridge_loop(self) -> None:
+        async def caller() -> None:
+            bridge = AsyncBridge()
+
+            async def identity() -> tuple[int, int]:
+                return id(asyncio.get_running_loop()), threading.get_ident()
+
+            try:
+                synchronous_result = bridge.run(identity())
+                asynchronous_result = await bridge.run_async(identity())
+            finally:
+                bridge.close()
+            self.assertEqual(synchronous_result, asynchronous_result)
+
+        asyncio.run(caller())
 
 
 class SynchronousClientTest(unittest.TestCase):
@@ -201,6 +242,39 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
+    async def test_ssh_uses_accept_new_and_shared_known_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            command = sandbox.ssh.command
+            self.assertIn("StrictHostKeyChecking=accept-new", command)
+            self.assertIn(
+                f"UserKnownHostsFile={client.config.paths.known_hosts}", command
+            )
+            self.assertNotIn("StrictHostKeyChecking=no", command)
+            self.assertNotIn("UserKnownHostsFile=/dev/null", command)
+            await client.close()
+
+    async def test_api_host_key_is_pinned_on_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            response = {
+                **SANDBOX_RESPONSE,
+                "ssh": {
+                    **SANDBOX_RESPONSE["ssh"],
+                    "host_key": "ssh-ed25519 AAAATEST",
+                },
+            }
+            sandbox = AsyncSandbox._from_response(client, response)
+            self.assertEqual(
+                client.config.paths.known_hosts.read_text(encoding="utf-8"),
+                "[sandbox.example]:2222 ssh-ed25519 AAAATEST\n",
+            )
+            self.assertEqual(
+                sandbox.ssh.known_hosts_path, client.config.paths.known_hosts
+            )
+            await client.close()
+
     async def test_exec_uses_asyncssh_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -233,8 +307,76 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
             ) as sleep:
                 self.assertIs(await sandbox.wait_until_ready(), sandbox)
-            sleep.assert_awaited_once_with(1.0)
+            sleep.assert_awaited_once()
             await client.close()
+
+    async def test_wait_survives_retryable_polling_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    ServiceUnavailableError("retry", retry_after=3),
+                    SANDBOX_RESPONSE,
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
+            ) as sleep, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.random.uniform", return_value=0
+            ):
+                self.assertIs(await sandbox.wait_until_ready(), sandbox)
+            sleep.assert_awaited_once_with(3)
+            await client.close()
+
+    async def test_create_rolls_back_after_allocation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value={"id": "sbx-test"}
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._validate_create_options"
+            ):
+                with self.assertRaisesRegex(InvalidRequestError, "already exists"):
+                    await AsyncSandbox.create(
+                        ssh_public_key="ssh-ed25519 AAAA",
+                        ssh_private_key="PRIVATE",
+                        client=client,
+                    )
+            self.assertEqual(
+                [call.args[:2] for call in client._request.await_args_list],
+                [
+                    ("POST", "/sandboxes/start"),
+                    ("POST", "/sandboxes/sbx-test/stop"),
+                ],
+            )
+            await client.close()
+
+    async def test_invalid_private_key_fails_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            with self.assertRaisesRegex(InvalidRequestError, "valid private key"):
+                await AsyncSandbox.create(
+                    ssh_public_key="ssh-ed25519 AAAA",
+                    ssh_private_key="not a private key",
+                    client=client,
+                )
+            client._request.assert_not_awaited()
+            await client.close()
+
+    async def test_implicit_client_is_closed_by_terminate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[SANDBOX_RESPONSE, {}, {**SANDBOX_RESPONSE, "status": "finished"}]
+            )
+            client.close = mock.AsyncMock()  # type: ignore[method-assign]
+            with mock.patch.object(AsyncClient, "from_cli", return_value=client):
+                sandbox = await AsyncSandbox.from_id("sbx-test")
+            await sandbox.terminate()
+            client.close.assert_awaited_once_with()
 
     async def test_unknown_status_and_gpu_are_forward_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -335,6 +477,26 @@ class SynchronousSandboxTest(unittest.TestCase):
                     sandbox.wait(timeout=1)
             finally:
                 client.close()
+
+    def test_async_named_lifecycle_methods_use_same_public_object(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                sandbox, client, asynchronous = self.sandbox(directory)
+                asynchronous.refresh = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+                asynchronous.poll = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+                asynchronous.wait = mock.AsyncMock(return_value=0)  # type: ignore[method-assign]
+                asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+                try:
+                    self.assertIs(await sandbox.refresh_async(), sandbox)
+                    self.assertIsNone(await sandbox.poll_async())
+                    self.assertEqual(await sandbox.wait_async(timeout=3), 0)
+                    self.assertIs(
+                        await sandbox.wait_until_ready_async(timeout=4), sandbox
+                    )
+                finally:
+                    await client.close_async()
+
+        asyncio.run(exercise())
 
 
 class ErrorContractTest(unittest.TestCase):

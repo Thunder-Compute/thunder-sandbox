@@ -1,7 +1,7 @@
-"""Shared types and explicit synchronous/asynchronous Thunder APIs."""
+"""Unified blocking and asynchronous Thunder Sandbox API."""
 
 from ._shared import *
 from ._shared import __all__ as _shared_all
-from . import asynchronous, synchronous
+from .synchronous import Client, Process, Sandbox
 
-__all__ = [*_shared_all, "asynchronous", "synchronous"]
+__all__ = ["Client", "Process", "Sandbox", *_shared_all]

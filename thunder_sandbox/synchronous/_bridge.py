@@ -51,6 +51,18 @@ class AsyncBridge:
         future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         return future.result()
 
+    async def run_async(self, coroutine: Coroutine[Any, Any, T]) -> T:
+        """Await a coroutine on the bridge loop without blocking the caller's loop."""
+        if self._closed or self._loop is None:
+            coroutine.close()
+            raise RuntimeError("client is closed")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
     def close(self) -> None:
         if self._closed:
             return
@@ -59,4 +71,3 @@ class AsyncBridge:
         if loop is not None:
             loop.call_soon_threadsafe(loop.stop)
         self._thread.join()
-

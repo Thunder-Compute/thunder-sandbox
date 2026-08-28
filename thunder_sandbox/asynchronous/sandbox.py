@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import shlex
 import tempfile
 import time
@@ -23,6 +24,7 @@ from .._common.exceptions import (
     ConnectionError,
     InvalidRequestError,
     NotFoundError,
+    RetryableError,
     SandboxFailedError,
     SandboxTimeoutError,
 )
@@ -41,8 +43,11 @@ OUTAGE_GRACE_SECONDS = 30.0
 class Sandbox:
     """A native asynchronous handle to an immutable Thunder sandbox."""
 
-    def __init__(self, client: Client, info: SandboxInfo) -> None:
+    def __init__(
+        self, client: Client, info: SandboxInfo, *, owns_client: bool = False
+    ) -> None:
         self._client = client
+        self._owns_client = owns_client
         self._info = info
         self._main_process: Process[str] | None = None
         self._connection: asyncssh.SSHClientConnection | None = None
@@ -76,6 +81,7 @@ class Sandbox:
             ssh_public_key=ssh_public_key,
             ssh_private_key=ssh_private_key,
         )
+        owns_client = client is None
         resolved_client = client or Client.from_cli()
         paths = resolved_client.config.paths
         paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -128,6 +134,7 @@ class Sandbox:
             "ssh_public_key": public_key,
             **({"name": name} if name is not None else {}),
         }
+        sandbox_id: str | None = None
         try:
             response = await resolved_client._request("POST", "/sandboxes/start", request)
             sandbox_id = str(response.get("id", ""))
@@ -145,43 +152,71 @@ class Sandbox:
             else:
                 _write_key(private_destination, ssh_private_key or "", 0o600)
                 _write_key(public_destination, public_key + "\n", 0o644)
+            sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
+            sandbox._owns_client = owns_client
+            if args:
+                await sandbox.wait_until_ready(timeout=timeout)
+                sandbox._main_process = await sandbox.exec(*args)
+            return sandbox
+        except BaseException:
+            if sandbox_id:
+                try:
+                    await _stop_sandbox(
+                        resolved_client,
+                        sandbox_id,
+                        deadline=time.monotonic() + OUTAGE_GRACE_SECONDS,
+                    )
+                except BaseException:
+                    pass
+            if owns_client:
+                await resolved_client.close()
+            raise
         finally:
             if temporary_directory is not None:
                 temporary_directory.cleanup()
-
-        sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
-        if args:
-            await sandbox.wait_until_ready(timeout=timeout)
-            sandbox._main_process = await sandbox.exec(*args)
-        return sandbox
 
     @staticmethod
     async def from_id(
         sandbox_id: str, *, client: Client | None = None
     ) -> "Sandbox":
+        owns_client = client is None
         resolved_client = client or Client.from_cli()
-        response = await resolved_client._request(
-            "GET", f"/sandboxes/{_path_segment(sandbox_id)}"
-        )
-        return Sandbox._from_response(resolved_client, response)
+        try:
+            response = await resolved_client._request(
+                "GET", f"/sandboxes/{_path_segment(sandbox_id)}"
+            )
+            sandbox = Sandbox._from_response(resolved_client, response)
+            sandbox._owns_client = owns_client
+            return sandbox
+        except BaseException:
+            if owns_client:
+                await resolved_client.close()
+            raise
 
     @staticmethod
     async def from_name(
         name: str, *, client: Client | None = None
     ) -> "Sandbox":
+        owns_client = client is None
         resolved_client = client or Client.from_cli()
-        matches = [
-            sandbox
-            async for sandbox in resolved_client.list_sandboxes(status="active")
-            if sandbox.name == name
-        ]
-        if not matches:
-            raise NotFoundError(f"no live sandbox is named {name!r}")
-        if len(matches) > 1:
-            raise ConflictError(
-                f"{len(matches)} live sandboxes are named {name!r}; address one by ID"
-            )
-        return matches[0]
+        try:
+            matches = [
+                sandbox
+                async for sandbox in resolved_client.list_sandboxes(status="active")
+                if sandbox.name == name
+            ]
+            if not matches:
+                raise NotFoundError(f"no live sandbox is named {name!r}")
+            if len(matches) > 1:
+                raise ConflictError(
+                    f"{len(matches)} live sandboxes are named {name!r}; address one by ID"
+                )
+            matches[0]._owns_client = owns_client
+            return matches[0]
+        except BaseException:
+            if owns_client:
+                await resolved_client.close()
+            raise
 
     @staticmethod
     def _from_response(
@@ -307,20 +342,23 @@ class Sandbox:
                 return connection
             ssh = self.ssh
             try:
+                known_hosts = (
+                    ssh.known_hosts_path
+                    if _known_host_is_pinned(ssh)
+                    else None
+                )
                 connection = await asyncssh.connect(
                     ssh.host,
                     ssh.port,
                     username=ssh.user,
                     client_keys=[ssh.private_key_path],
-                    known_hosts=(
-                        ssh.known_hosts_path
-                        if ssh.known_hosts_path is not None
-                        else None
-                    ),
+                    known_hosts=known_hosts,
                     agent_path=None,
                     preferred_auth=["publickey"],
                     config=None,
                 )
+                if known_hosts is None:
+                    _pin_host_key(ssh, connection.get_server_host_key())
             except (OSError, asyncssh.Error) as exc:
                 raise ConnectionError(
                     f"could not connect to sandbox over SSH: {exc}"
@@ -362,18 +400,18 @@ class Sandbox:
 
     async def _refresh_while_waiting(
         self, deadline: float | None, failing_since: float | None
-    ) -> tuple[bool, float | None]:
+    ) -> tuple[bool, float | None, float | None]:
         try:
             await self.refresh()
-        except ConnectionError:
+        except (ConnectionError, RetryableError) as exc:
             now = time.monotonic()
             started = now if failing_since is None else failing_since
             if now - started >= OUTAGE_GRACE_SECONDS:
                 raise
             if deadline is not None and now >= deadline:
                 raise
-            return False, started
-        return True, None
+            return False, started, exc.retry_after
+        return True, None, None
 
     async def wait(self, *, timeout: float | None = None) -> int | None:
         if self._main_process is not None:
@@ -385,8 +423,9 @@ class Sandbox:
                 ) from exc
         deadline = None if timeout is None else time.monotonic() + timeout
         failing_since: float | None = None
+        poll_delay = 1.0
         while True:
-            ok, failing_since = await self._refresh_while_waiting(
+            ok, failing_since, retry_after = await self._refresh_while_waiting(
                 deadline, failing_since
             )
             if ok:
@@ -398,15 +437,17 @@ class Sandbox:
                 raise SandboxTimeoutError(
                     f"sandbox {self.id} did not stop within {timeout} seconds"
                 )
-            await _sleep_until_next_poll(deadline)
+            await _sleep_until_next_poll(deadline, poll_delay, retry_after)
+            poll_delay = min(5.0, poll_delay * 2.0)
 
     async def wait_until_ready(
         self, *, timeout: float | None = 300
     ) -> "Sandbox":
         deadline = None if timeout is None else time.monotonic() + timeout
         failing_since: float | None = None
+        poll_delay = 1.0
         while True:
-            ok, failing_since = await self._refresh_while_waiting(
+            ok, failing_since, retry_after = await self._refresh_while_waiting(
                 deadline, failing_since
             )
             if ok:
@@ -420,14 +461,16 @@ class Sandbox:
                 raise SandboxTimeoutError(
                     f"sandbox {self.id} did not become ready within {timeout} seconds"
                 )
-            await _sleep_until_next_poll(deadline)
+            await _sleep_until_next_poll(deadline, poll_delay, retry_after)
+            poll_delay = min(5.0, poll_delay * 2.0)
 
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
             failing_since: float | None = None
+            poll_delay = 1.0
             while self.status == SandboxStatus.CREATED:
-                ok, failing_since = await self._refresh_while_waiting(
+                ok, failing_since, retry_after = await self._refresh_while_waiting(
                     deadline, failing_since
                 )
                 if ok and self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
@@ -437,15 +480,16 @@ class Sandbox:
                         f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
                     )
                 if self.status == SandboxStatus.CREATED:
-                    await _sleep_until_next_poll(deadline)
+                    await _sleep_until_next_poll(deadline, poll_delay, retry_after)
+                    poll_delay = min(5.0, poll_delay * 2.0)
             if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
                 return
-            await self._client._request(
-                "POST", f"/sandboxes/{_path_segment(self.id)}/stop"
-            )
+            await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
         finally:
             await self._close_connection()
+            if self._owns_client:
+                await self._client.close()
 
 
 async def _generate_key_pair(path: Path) -> None:
@@ -499,7 +543,11 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             port=int(ssh_value.get("port", 22)),
             user=str(ssh_value.get("user", "ubuntu")),
             private_key_path=paths.sandbox_private_key(sandbox_id),
+            known_hosts_path=paths.known_hosts,
         )
+        host_key = ssh_value.get("host_key")
+        if host_key:
+            _pin_host_key(ssh, str(host_key))
     return SandboxInfo(
         id=sandbox_id,
         name=name,
@@ -526,6 +574,51 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     )
 
 
+def _known_host_name(ssh: SSHConnection) -> str:
+    return ssh.host if ssh.port == 22 else f"[{ssh.host}]:{ssh.port}"
+
+
+def _known_host_is_pinned(ssh: SSHConnection) -> bool:
+    path = ssh.known_hosts_path
+    if path is None:
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SandboxFailedError(f"could not read SSH known-hosts file {path}: {exc}") from exc
+    name = _known_host_name(ssh)
+    return any(
+        line and not line.startswith("#") and name in line.split(None, 1)[0].split(",")
+        for line in lines
+    )
+
+
+def _pin_host_key(ssh: SSHConnection, key: object) -> None:
+    path = ssh.known_hosts_path
+    if path is None or _known_host_is_pinned(ssh):
+        return
+    if hasattr(key, "export_public_key"):
+        exported = key.export_public_key()  # type: ignore[union-attr]
+        key_text = exported.decode("ascii") if isinstance(exported, bytes) else str(exported)
+    else:
+        key_text = str(key)
+    key_text = key_text.strip()
+    if not key_text:
+        raise SandboxFailedError("Thunder returned an empty SSH host key")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{_known_host_name(ssh)} {key_text}\n"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(descriptor, line.encode("ascii"))
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeError) as exc:
+        raise SandboxFailedError(f"could not pin SSH host key in {path}: {exc}") from exc
+
+
 def _validate_create_options(
     *,
     timeout: int | None,
@@ -541,6 +634,15 @@ def _validate_create_options(
         raise InvalidRequestError(
             "ssh_public_key and ssh_private_key must be provided together"
         )
+    if ssh_public_key is not None and not ssh_public_key.strip():
+        raise InvalidRequestError("ssh_public_key cannot be empty")
+    if ssh_private_key is not None:
+        if not ssh_private_key.strip():
+            raise InvalidRequestError("ssh_private_key cannot be empty")
+        try:
+            asyncssh.import_private_key(ssh_private_key)
+        except (asyncssh.Error, ValueError) as exc:
+            raise InvalidRequestError("ssh_private_key is not a valid private key") from exc
     if timeout is not None and timeout < 0:
         raise InvalidRequestError("timeout cannot be negative")
     if gpu_type is not None and not isinstance(gpu_type, GPUType):
@@ -575,11 +677,36 @@ def _network_policy(
     return "restricted", cidrs, domains
 
 
-async def _sleep_until_next_poll(deadline: float | None) -> None:
-    delay = 1.0
+async def _sleep_until_next_poll(
+    deadline: float | None, delay: float, retry_after: float | None = None
+) -> None:
+    delay = max(delay, retry_after or 0.0)
+    delay += random.uniform(0.0, min(delay * 0.2, 1.0))
     if deadline is not None:
         delay = max(0.0, min(delay, deadline - time.monotonic()))
     await asyncio.sleep(delay)
+
+
+async def _stop_sandbox(
+    client: Client, sandbox_id: str, *, deadline: float | None
+) -> None:
+    failing_since: float | None = None
+    delay = 1.0
+    while True:
+        try:
+            await client._request(
+                "POST", f"/sandboxes/{_path_segment(sandbox_id)}/stop"
+            )
+            return
+        except (ConnectionError, RetryableError) as exc:
+            now = time.monotonic()
+            failing_since = now if failing_since is None else failing_since
+            if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                raise
+            if deadline is not None and now >= deadline:
+                raise
+            await _sleep_until_next_poll(deadline, delay, exc.retry_after)
+            delay = min(5.0, delay * 2.0)
 
 
 def _remote_command(

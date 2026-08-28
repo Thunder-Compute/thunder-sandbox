@@ -5,8 +5,8 @@ small, typed Python API.
 
 Thunder Sandbox uses the same account and credentials as the Thunder CLI. It
 handles sandbox lifecycle, SSH key creation, readiness polling, command
-execution, uploads, and downloads with native synchronous and asynchronous
-Python APIs.
+execution, uploads, and downloads through one synchronous and asynchronous
+Python API.
 
 ## Installation
 
@@ -34,7 +34,7 @@ Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
 ## Quick start
 
 ```python
-import thunder_sandbox.synchronous as thunder
+import thunder_sandbox as thunder
 
 sandbox = thunder.Sandbox.create(
     cpu=4,
@@ -173,28 +173,29 @@ files against an existing sandbox.
 
 ## Async API
 
-The asynchronous namespace exposes the same lifecycle and remote-operation
-primitives with awaitable methods:
+Every blocking operation has an awaitable `_async` twin on the same public
+class. This makes it possible to use one import and pass `Client`, `Sandbox`,
+and `Process` objects between synchronous and asynchronous application code:
 
 ```python
 import asyncio
-import thunder_sandbox.asynchronous as thunder
+import thunder_sandbox as thunder
 
 
 async def main() -> None:
-    sandbox = await thunder.Sandbox.create(
+    sandbox = await thunder.Sandbox.create_async(
         gpu_type=thunder.GPUType.A6000,
         gpu_count=1,
     )
     try:
-        await sandbox.wait_until_ready()
-        process = await sandbox.exec("nvidia-smi")
-        exit_code = await process.wait()
+        await sandbox.wait_until_ready_async()
+        process = await sandbox.exec_async("nvidia-smi")
+        exit_code = await process.wait_async()
         if exit_code != 0:
-            raise RuntimeError(await process.stderr.read())
-        print(await process.stdout.read())
+            raise RuntimeError(await process.stderr.read_async())
+        print(await process.stdout.read_async())
     finally:
-        await sandbox.terminate()
+        await sandbox.terminate_async()
 
 
 asyncio.run(main())

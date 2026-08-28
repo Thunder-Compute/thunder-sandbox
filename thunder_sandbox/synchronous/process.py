@@ -21,6 +21,12 @@ class StreamReader(Generic[T]):
     def readline(self) -> T:
         return self._bridge.run(self._stream.readline())  # type: ignore[attr-defined, no-any-return]
 
+    async def read_async(self, n: int = -1) -> T:
+        return await self._bridge.run_async(self._stream.read(n))  # type: ignore[attr-defined, no-any-return]
+
+    async def readline_async(self) -> T:
+        return await self._bridge.run_async(self._stream.readline())  # type: ignore[attr-defined, no-any-return]
+
     def __iter__(self) -> "StreamReader[T]":
         return self
 
@@ -47,12 +53,30 @@ class StreamWriter(Generic[T]):
     def flush(self) -> None:
         self._bridge.run(self._stream.drain())  # type: ignore[attr-defined]
 
+    async def write_async(self, data: T) -> int:
+        async def write() -> int:
+            self._stream.write(data)  # type: ignore[attr-defined]
+            await self._stream.drain()  # type: ignore[attr-defined]
+            return len(data)
+
+        return await self._bridge.run_async(write())
+
+    async def flush_async(self) -> None:
+        await self._bridge.run_async(self._stream.drain())  # type: ignore[attr-defined]
+
     def close(self) -> None:
         async def close() -> None:
             self._stream.write_eof()  # type: ignore[attr-defined]
             await self._stream.drain()  # type: ignore[attr-defined]
 
         self._bridge.run(close())
+
+    async def close_async(self) -> None:
+        async def close() -> None:
+            self._stream.write_eof()  # type: ignore[attr-defined]
+            await self._stream.drain()  # type: ignore[attr-defined]
+
+        await self._bridge.run_async(close())
 
 
 class Process(Generic[T]):
@@ -73,11 +97,20 @@ class Process(Generic[T]):
     def poll(self) -> int | None:
         return self._bridge.run(self._process.poll())
 
+    async def poll_async(self) -> int | None:
+        return await self._bridge.run_async(self._process.poll())
+
     def wait(self, *, timeout: float | None = None) -> int:
         return self._bridge.run(self._process.wait(timeout=timeout))
 
+    async def wait_async(self, *, timeout: float | None = None) -> int:
+        return await self._bridge.run_async(self._process.wait(timeout=timeout))
+
     def terminate(self) -> None:
         self._bridge.run(self._process.terminate())
+
+    async def terminate_async(self) -> None:
+        await self._bridge.run_async(self._process.terminate())
 
 
 __all__ = ["Process"]

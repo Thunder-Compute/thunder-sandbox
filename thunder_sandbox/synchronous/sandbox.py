@@ -73,6 +73,54 @@ class Sandbox:
         return wrapped
 
     @staticmethod
+    async def create_async(
+        *args: str,
+        name: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        timeout: int | None = 300,
+        cpu: int | None = None,
+        memory: int | None = None,
+        storage: int | None = None,
+        gpu_type: GPUType | None = None,
+        gpu_count: int | None = None,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+        ssh_public_key: str | None = None,
+        ssh_private_key: str | None = None,
+        client: Client | None = None,
+    ) -> "Sandbox":
+        owns_client = client is None
+        resolved_client = client or Client.from_cli()
+        try:
+            sandbox = await resolved_client._bridge.run_async(
+                NativeSandbox.create(
+                    *args,
+                    name=name,
+                    env=env,
+                    timeout=timeout,
+                    cpu=cpu,
+                    memory=memory,
+                    storage=storage,
+                    gpu_type=gpu_type,
+                    gpu_count=gpu_count,
+                    block_network=block_network,
+                    outbound_cidr_allowlist=outbound_cidr_allowlist,
+                    outbound_domain_allowlist=outbound_domain_allowlist,
+                    ssh_public_key=ssh_public_key,
+                    ssh_private_key=ssh_private_key,
+                    client=resolved_client._client,
+                )
+            )
+        except BaseException:
+            if owns_client:
+                await resolved_client.close_async()
+            raise
+        wrapped = resolved_client._wrap_sandbox(sandbox)
+        wrapped._owns_client = owns_client
+        return wrapped
+
+    @staticmethod
     def from_id(sandbox_id: str, *, client: Client | None = None) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -89,6 +137,24 @@ class Sandbox:
         return wrapped
 
     @staticmethod
+    async def from_id_async(
+        sandbox_id: str, *, client: Client | None = None
+    ) -> "Sandbox":
+        owns_client = client is None
+        resolved_client = client or Client.from_cli()
+        try:
+            sandbox = await resolved_client._bridge.run_async(
+                NativeSandbox.from_id(sandbox_id, client=resolved_client._client)
+            )
+        except BaseException:
+            if owns_client:
+                await resolved_client.close_async()
+            raise
+        wrapped = resolved_client._wrap_sandbox(sandbox)
+        wrapped._owns_client = owns_client
+        return wrapped
+
+    @staticmethod
     def from_name(name: str, *, client: Client | None = None) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -99,6 +165,24 @@ class Sandbox:
         except BaseException:
             if owns_client:
                 resolved_client.close()
+            raise
+        wrapped = resolved_client._wrap_sandbox(sandbox)
+        wrapped._owns_client = owns_client
+        return wrapped
+
+    @staticmethod
+    async def from_name_async(
+        name: str, *, client: Client | None = None
+    ) -> "Sandbox":
+        owns_client = client is None
+        resolved_client = client or Client.from_cli()
+        try:
+            sandbox = await resolved_client._bridge.run_async(
+                NativeSandbox.from_name(name, client=resolved_client._client)
+            )
+        except BaseException:
+            if owns_client:
+                await resolved_client.close_async()
             raise
         wrapped = resolved_client._wrap_sandbox(sandbox)
         wrapped._owns_client = owns_client
@@ -159,11 +243,36 @@ class Sandbox:
         )
         return Process(self._client._bridge, process)
 
+    async def exec_async(
+        self, *args: str, timeout: float | None = None,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+        text: bool = True, pty: bool = False,
+    ) -> Process[str] | Process[bytes]:
+        process = await self._client._bridge.run_async(
+            self._sandbox.exec(
+                *args,
+                timeout=timeout,
+                workdir=workdir,
+                env=env,
+                text=text,
+                pty=pty,
+            )
+        )
+        return Process(self._client._bridge, process)
+
     def upload(
         self, local_path: str | os.PathLike[str], remote_path: str, *,
         recursive: bool = False,
     ) -> None:
         self._client._bridge.run(
+            self._sandbox.upload(local_path, remote_path, recursive=recursive)
+        )
+
+    async def upload_async(
+        self, local_path: str | os.PathLike[str], remote_path: str, *,
+        recursive: bool = False,
+    ) -> None:
+        await self._client._bridge.run_async(
             self._sandbox.upload(local_path, remote_path, recursive=recursive)
         )
 
@@ -175,18 +284,46 @@ class Sandbox:
             self._sandbox.download(remote_path, local_path, recursive=recursive)
         )
 
+    async def download_async(
+        self, remote_path: str, local_path: str | os.PathLike[str], *,
+        recursive: bool = False,
+    ) -> None:
+        await self._client._bridge.run_async(
+            self._sandbox.download(remote_path, local_path, recursive=recursive)
+        )
+
     def refresh(self) -> "Sandbox":
         self._client._bridge.run(self._sandbox.refresh())
+        return self
+
+    async def refresh_async(self) -> "Sandbox":
+        await self._client._bridge.run_async(self._sandbox.refresh())
         return self
 
     def poll(self) -> int | None:
         return self._client._bridge.run(self._sandbox.poll())
 
+    async def poll_async(self) -> int | None:
+        return await self._client._bridge.run_async(self._sandbox.poll())
+
     def wait(self, *, timeout: float | None = None) -> int | None:
         return self._client._bridge.run(self._sandbox.wait(timeout=timeout))
 
+    async def wait_async(self, *, timeout: float | None = None) -> int | None:
+        return await self._client._bridge.run_async(
+            self._sandbox.wait(timeout=timeout)
+        )
+
     def wait_until_ready(self, *, timeout: float | None = 300) -> "Sandbox":
         self._client._bridge.run(self._sandbox.wait_until_ready(timeout=timeout))
+        return self
+
+    async def wait_until_ready_async(
+        self, *, timeout: float | None = 300
+    ) -> "Sandbox":
+        await self._client._bridge.run_async(
+            self._sandbox.wait_until_ready(timeout=timeout)
+        )
         return self
 
     def terminate(self, *, timeout: float | None = 300) -> None:
@@ -195,6 +332,15 @@ class Sandbox:
         finally:
             if self._owns_client:
                 self._client.close()
+
+    async def terminate_async(self, *, timeout: float | None = 300) -> None:
+        try:
+            await self._client._bridge.run_async(
+                self._sandbox.terminate(timeout=timeout)
+            )
+        finally:
+            if self._owns_client:
+                await self._client.close_async()
 
 
 __all__ = ["Sandbox"]
