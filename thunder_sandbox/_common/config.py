@@ -20,7 +20,6 @@ class ThunderPaths:
         self.root = Path(root or configured_root or Path.home() / ".thunder").expanduser()
         self.credentials = self.root / "cli_config.json"
         self.sandbox_keys = self.root / "sandbox_keys"
-        self.known_hosts = self.root / "known_hosts"
 
     def sandbox_private_key(self, name: str) -> Path:
         _validate_sandbox_name(name)

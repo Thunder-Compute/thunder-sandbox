@@ -106,14 +106,25 @@ class CredentialStore:
         except (asyncssh.Error, ValueError) as exc:
             raise SandboxError(f"Thunder returned an unusable SSH certificate: {exc}") from exc
         expires_at = _expiry(response)
-        self._save(key, line, expires_at)
+        self._save(key, line, expires_at, replace_key=reuse is None)
         return SSHCredential(key, certificate, expires_at)
 
-    def _save(self, key: asyncssh.SSHKey, certificate: str, expires_at: float) -> None:
+    def _save(
+        self,
+        key: asyncssh.SSHKey,
+        certificate: str,
+        expires_at: float,
+        *,
+        replace_key: bool,
+    ) -> None:
         """Cache best effort. A client that cannot write still connects."""
         try:
             self._paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if not self._paths.ssh_key.exists():
+            # Written whenever this key is new, which includes the case where a
+            # damaged file is what forced a fresh one. Skipping on mere
+            # existence would leave the unreadable key in place for every later
+            # process to trip over.
+            if replace_key:
                 self._paths.ssh_key.write_bytes(key.export_private_key())
                 self._paths.ssh_key.chmod(0o600)
             self._paths.ssh_certificate.write_text(certificate + "\n", encoding="utf-8")

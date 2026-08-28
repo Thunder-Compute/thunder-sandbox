@@ -33,6 +33,7 @@ from thunder_sandbox.asynchronous.client import USER_AGENT
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
+from thunder_sandbox.asynchronous.sandbox import _pinned_host_key
 from thunder_sandbox.synchronous._bridge import AsyncBridge
 from thunder_sandbox.synchronous.client import Client
 from thunder_sandbox.synchronous.process import Process
@@ -265,16 +266,15 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
-    async def test_ssh_uses_accept_new_and_shared_known_hosts(self) -> None:
+    async def test_ssh_keeps_no_known_hosts_file(self) -> None:
+        # The node reuses forwarded ports, so any entry outlives the sandbox
+        # that wrote it and makes ssh refuse the next sandbox on that port.
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             command = sandbox.ssh.command
             self.assertIn("StrictHostKeyChecking=accept-new", command)
-            self.assertIn(
-                f"UserKnownHostsFile={client.config.paths.known_hosts}", command
-            )
+            self.assertIn("UserKnownHostsFile=/dev/null", command)
             self.assertNotIn("StrictHostKeyChecking=no", command)
-            self.assertNotIn("UserKnownHostsFile=/dev/null", command)
             await client.close()
 
     async def test_api_host_key_is_pinned_on_response(self) -> None:
@@ -291,12 +291,16 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 },
             }
             sandbox = AsyncSandbox._from_response(client, response)
+            # Remembered against the sandbox, in memory only: a file keyed by
+            # host and port would reject the next sandbox on a reused port.
+            pinned = _pinned_host_key(sandbox.id)
+            self.assertIsNotNone(pinned)
             self.assertEqual(
-                client.config.paths.known_hosts.read_text(encoding="utf-8"),
-                f"[sandbox.example]:2222 {host_key_text}\n",
+                pinned.export_public_key().decode("ascii").strip(), host_key_text
             )
-            self.assertEqual(
-                sandbox.ssh.known_hosts_path, client.config.paths.known_hosts
+            self.assertFalse(
+                [entry for entry in Path(directory).rglob("known_hosts*")],
+                "pinning a host key must not create a known-hosts file",
             )
             await client.close()
 

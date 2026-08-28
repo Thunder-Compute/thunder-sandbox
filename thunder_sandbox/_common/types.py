@@ -80,7 +80,6 @@ class SSHConnection:
     # certificate as values, so a client whose cache is unwritable still works.
     private_key_path: Path | None = None
     certificate_path: Path | None = None
-    known_hosts_path: Path | None = None
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -95,9 +94,15 @@ class SSHConnection:
             "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
-        command.extend(("-o", "StrictHostKeyChecking=accept-new"))
-        if self.known_hosts_path is not None:
-            command.extend(("-o", f"UserKnownHostsFile={self.known_hosts_path}"))
+        # Sandboxes are short-lived and the node reuses forwarded ports, so a
+        # known-hosts entry outlives the sandbox that created it and makes ssh
+        # refuse the next one. Nothing verifies the first connection anyway, so
+        # keep no file rather than one guaranteed to go stale.
+        command.extend((
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+        ))
         command.append(f"{self.user}@{self.host}")
         return tuple(command)
 

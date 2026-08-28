@@ -318,11 +318,13 @@ class Sandbox:
                 return connection
             ssh = self.ssh
             try:
-                known_hosts = (
-                    ssh.known_hosts_path
-                    if _known_host_is_pinned(ssh)
-                    else None
-                )
+                # The node reuses forwarded ports across sandboxes, so a pin
+                # keyed by host and port would reject the next sandbox that
+                # lands on a finished one's port. Pin per sandbox instead, and
+                # hand asyncssh the key itself: it reads a known-hosts file
+                # only from a string path, never a Path.
+                pinned = _pinned_host_key(self.id)
+                known_hosts = ([pinned], [], []) if pinned is not None else None
                 credential = await self._client._credentials.ensure(self._client)
                 connection = await asyncssh.connect(
                     ssh.host,
@@ -337,9 +339,9 @@ class Sandbox:
                     preferred_auth=["publickey"],
                     config=None,
                 )
-                if known_hosts is None:
+                if pinned is None:
                     try:
-                        _pin_host_key(ssh, connection.get_server_host_key())
+                        _remember_host_key(self.id, connection.get_server_host_key())
                     except BaseException:
                         connection.close()
                         await connection.wait_closed()
@@ -518,11 +520,10 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             user=str(ssh_value.get("user", "ubuntu")),
             private_key_path=paths.ssh_key,
             certificate_path=paths.ssh_certificate,
-            known_hosts_path=paths.known_hosts,
         )
         host_key = ssh_value.get("host_key")
         if host_key:
-            _pin_host_key(ssh, str(host_key))
+            _remember_host_key(sandbox_id, str(host_key))
     return SandboxInfo(
         id=sandbox_id,
         name=name,
@@ -559,52 +560,40 @@ def _string_tuple(value: object) -> tuple[str, ...]:
 
 def _known_host_name(ssh: SSHConnection) -> str:
     return ssh.host if ssh.port == 22 else f"[{ssh.host}]:{ssh.port}"
+# Host keys are remembered only for the life of this process. A sandbox is
+# short-lived and nothing verifies the key on the first connection, so a file
+# would add staleness and an unwritable-home failure mode without buying any
+# trust the process does not already have.
+_REMEMBERED_HOST_KEYS: dict[str, str] = {}
 
 
-def _known_host_is_pinned(ssh: SSHConnection) -> bool:
-    path = ssh.known_hosts_path
-    if path is None:
-        return False
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        raise SandboxFailedError(f"could not read SSH known-hosts file {path}: {exc}") from exc
-    name = _known_host_name(ssh)
-    return any(
-        line and not line.startswith("#") and name in line.split(None, 1)[0].split(",")
-        for line in lines
-    )
-
-
-def _pin_host_key(ssh: SSHConnection, key: object) -> None:
-    path = ssh.known_hosts_path
-    if path is None or _known_host_is_pinned(ssh):
-        return
+def _host_key_text(key: object) -> str:
     if hasattr(key, "export_public_key"):
         exported = key.export_public_key()  # type: ignore[union-attr]
-        key_text = exported.decode("ascii") if isinstance(exported, bytes) else str(exported)
+        text = exported.decode("ascii") if isinstance(exported, bytes) else str(exported)
     else:
-        key_text = str(key)
-    key_text = key_text.strip()
-    if not key_text:
+        text = str(key)
+    text = text.strip()
+    if not text:
         raise SandboxFailedError("Thunder returned an empty SSH host key")
     try:
-        parsed_key = asyncssh.import_public_key(key_text)
-        key_text = parsed_key.export_public_key().decode("ascii").strip()
+        return asyncssh.import_public_key(text).export_public_key().decode("ascii").strip()
     except (asyncssh.Error, UnicodeError, ValueError) as exc:
         raise SandboxFailedError("Thunder returned an invalid SSH host key") from exc
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = f"{_known_host_name(ssh)} {key_text}\n"
+
+
+def _pinned_host_key(sandbox_id: str) -> "asyncssh.SSHKey | None":
+    text = _REMEMBERED_HOST_KEYS.get(sandbox_id)
+    if text is None:
+        return None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(descriptor, line.encode("ascii"))
-        finally:
-            os.close(descriptor)
-    except (OSError, UnicodeError) as exc:
-        raise SandboxFailedError(f"could not pin SSH host key in {path}: {exc}") from exc
+        return asyncssh.import_public_key(text)
+    except (asyncssh.Error, UnicodeError, ValueError):
+        return None
+
+
+def _remember_host_key(sandbox_id: str, key: object) -> None:
+    _REMEMBERED_HOST_KEYS[sandbox_id] = _host_key_text(key)
 
 
 def _validate_create_options(
