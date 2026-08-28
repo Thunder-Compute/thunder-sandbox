@@ -452,7 +452,10 @@ class SandboxOperationTest(unittest.TestCase):
     def setUp(self) -> None:
         # Connecting mints a credential; that path has its own tests below, and
         # these cases are about the commands built once one exists.
-        patcher = mock.patch("src.sandbox.ensure_credential", return_value=None)
+        patcher = mock.patch(
+            "src.sandbox.ensure_credential",
+            side_effect=lambda client: (client.config.paths.ssh_key, client.config.paths.ssh_certificate),
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -768,6 +771,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
 class CredentialTest(unittest.TestCase):
     """One key per machine, one certificate per organization, renewed in time."""
 
+    def setUp(self) -> None:
+        # The module caches the credential for the life of the process.
+        credentials._current = None
+        self.addCleanup(setattr, credentials, "_current", None)
+
     def _client(self, directory: str, certificate: str = "ssh-ed25519-cert AAAAsigned") -> FakeClient:
         client = FakeClient(ThunderPaths(Path(directory)))
         client._request = mock.Mock(  # type: ignore[method-assign]
@@ -836,6 +844,63 @@ class CredentialTest(unittest.TestCase):
                     return_value=subprocess.CompletedProcess([], 0, f"Valid: from 2026-01-01T00:00:00 to {window}\n", ""),
                 ):
                     self.assertEqual(credentials._certificate_is_usable(path), want)
+
+
+class CredentialFallbackTest(unittest.TestCase):
+    """A client with nowhere to cache must still be able to connect."""
+
+    def setUp(self) -> None:
+        credentials._current = None
+        self.addCleanup(setattr, credentials, "_current", None)
+
+    def _client(self, root: Path) -> FakeClient:
+        client = FakeClient(ThunderPaths(root))
+        client._request = mock.Mock(  # type: ignore[method-assign]
+            return_value={"ssh_certificate": "ssh-ed25519-cert AAAAsigned"}
+        )
+        return client
+
+    def test_an_unwritable_cache_still_yields_a_usable_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "home"
+            root.mkdir()
+            client = self._client(root)
+            # A read-only home is the case this exists for: a container with no
+            # writable mount must not be unable to reach its sandboxes.
+            os.chmod(root, 0o500)
+            try:
+                key, certificate = credentials.ensure_credential(client)
+                self.assertTrue(key.exists(), "a key must exist somewhere ssh can read it")
+                self.assertTrue(certificate.exists())
+                self.assertNotEqual(key.parent, client.config.paths.sandbox_keys)
+                self.assertEqual(
+                    certificate.read_text(encoding="utf-8").strip(), "ssh-ed25519-cert AAAAsigned"
+                )
+            finally:
+                # Restore before the temporary directory is removed.
+                os.chmod(root, 0o700)
+
+    def test_a_credential_that_could_not_be_cached_is_reused_in_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "home"
+            root.mkdir()
+            client = self._client(root)
+            os.chmod(root, 0o500)
+            try:
+                first = credentials.ensure_credential(client)
+                with mock.patch.object(credentials, "_certificate_is_usable", return_value=True):
+                    second = credentials.ensure_credential(client)
+                self.assertEqual(first, second)
+                self.assertEqual(client._request.call_count, 1, "the process copy must be reused")
+            finally:
+                os.chmod(root, 0o700)
+
+    def test_a_cached_credential_is_preferred_when_the_cache_works(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(Path(directory))
+            key, certificate = credentials.ensure_credential(client)
+            self.assertEqual(key, client.config.paths.ssh_key)
+            self.assertEqual(certificate, client.config.paths.ssh_certificate)
 
 
 class GPUTypeTest(unittest.TestCase):

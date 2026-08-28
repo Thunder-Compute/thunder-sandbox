@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Literal, overload
 
 from .client import Client
+from dataclasses import replace
+
 from .credentials import ensure_credential
 from .exceptions import (
     ConflictError,
@@ -180,7 +182,17 @@ class Sandbox:
         return self._info.ssh
 
     @property
-    def ssh_command(self) -> tuple[str, ...]: return self.ssh.command
+    def ssh_command(self) -> tuple[str, ...]: return self._connection().command
+
+    def _connection(self) -> SSHConnection:
+        """The connection with the credential this process can actually use.
+
+        Sandbox.ssh reports where the credential is cached; a client whose
+        cache is unwritable connects from scratch space instead, so the paths
+        are resolved here rather than taken from configuration.
+        """
+        key, certificate = ensure_credential(self._client)
+        return replace(self.ssh, private_key_path=key, certificate_path=certificate)
 
     @overload
     def exec(self, *args: str, timeout: float | None = None, workdir: str | None = None, env: Mapping[str, str | None] | None = None, text: Literal[True] = True, pty: bool = False) -> ContainerProcess[str]: ...
@@ -190,8 +202,7 @@ class Sandbox:
     def exec(self, *args: str, timeout: float | None = None, workdir: str | None = None, env: Mapping[str, str | None] | None = None, text: bool = True, pty: bool = False) -> ContainerProcess[str] | ContainerProcess[bytes]:
         if not args:
             raise InvalidRequestError("exec requires a command")
-        ensure_credential(self._client)
-        command = list(self.ssh_command)
+        command = list(self._connection().command)
         if pty:
             command.insert(1, "-tt")
         command.append(_remote_command(args, workdir=workdir, env=env))
@@ -207,14 +218,12 @@ class Sandbox:
         )
 
     def upload(self, local_path: str | os.PathLike[str], remote_path: str, *, recursive: bool = False) -> None:
-        ensure_credential(self._client)
-        command = _scp_command(self.ssh, recursive)
+        command = _scp_command(self._connection(), recursive)
         command.extend((str(local_path), f"{self.ssh.user}@{self.ssh.host}:{shlex.quote(remote_path)}"))
         _run_transfer(command)
 
     def download(self, remote_path: str, local_path: str | os.PathLike[str], *, recursive: bool = False) -> None:
-        ensure_credential(self._client)
-        command = _scp_command(self.ssh, recursive)
+        command = _scp_command(self._connection(), recursive)
         command.extend((f"{self.ssh.user}@{self.ssh.host}:{shlex.quote(remote_path)}", str(local_path)))
         _run_transfer(command)
 
