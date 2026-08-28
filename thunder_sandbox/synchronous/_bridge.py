@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from collections.abc import Awaitable
 from typing import TypeVar
@@ -66,11 +67,48 @@ class AsyncBridge:
         if self._closed or self._loop is None:
             self._close(coroutine)
             raise RuntimeError("client is closed")
-        future = asyncio.run_coroutine_threadsafe(self._await(coroutine), self._loop)
+        loop = self._loop
+        result: concurrent.futures.Future[T] = concurrent.futures.Future()
+        task_holder: list[asyncio.Task[T] | None] = [None]
+
+        def start() -> None:
+            if result.cancelled():
+                self._close(coroutine)
+                return
+            task = loop.create_task(self._await(coroutine))
+            task_holder[0] = task
+            if result.cancelled():
+                task.cancel()
+                return
+
+            def done(finished: asyncio.Task[T]) -> None:
+                if result.cancelled():
+                    return
+                try:
+                    if finished.cancelled():
+                        result.cancel()
+                    else:
+                        exc = finished.exception()
+                        if exc is not None:
+                            result.set_exception(exc)
+                        else:
+                            result.set_result(finished.result())
+                except concurrent.futures.InvalidStateError:
+                    return
+
+            task.add_done_callback(done)
+
+        loop.call_soon_threadsafe(start)
         try:
-            return await asyncio.wrap_future(future)
+            return await asyncio.wrap_future(result)
         except asyncio.CancelledError:
-            future.cancel()
+            def cancel() -> None:
+                task = task_holder[0]
+                if task is not None:
+                    task.cancel()
+                result.cancel()
+
+            loop.call_soon_threadsafe(cancel)
             raise
 
     def close(self) -> None:

@@ -195,6 +195,36 @@ class BridgeTest(unittest.TestCase):
 
         asyncio.run(caller())
 
+    def test_run_async_cancel_cancels_work_on_the_bridge_loop(self) -> None:
+        bridge = AsyncBridge()
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        async def work() -> str:
+            started.set()
+            try:
+                await asyncio.sleep(5)
+                return "ok"
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def caller() -> None:
+            task = asyncio.create_task(bridge.run_async(work()))
+            await asyncio.get_running_loop().run_in_executor(None, started.wait)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: cancelled.wait(1)
+            )
+
+        try:
+            asyncio.run(caller())
+            self.assertTrue(cancelled.is_set())
+        finally:
+            bridge.close()
+
 
 class SynchronousClientTest(unittest.TestCase):
     def test_request_delegates_to_async_client_on_bridge_loop(self) -> None:
@@ -619,6 +649,44 @@ class SynchronousSandboxTest(unittest.TestCase):
                     self.assertIs(
                         await sandbox.wait_until_ready_async(timeout=4), sandbox
                     )
+                finally:
+                    await client.close_async()
+
+        asyncio.run(exercise())
+
+    def test_create_async_cancel_terminates_started_sandbox(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                client = Client(config(directory))
+                prepare_key(client.config.paths)
+                native = AsyncSandbox._from_response(client._client, SANDBOX_RESPONSE)
+                started = threading.Event()
+                native.terminate = mock.AsyncMock()  # type: ignore[method-assign]
+
+                async def fake_create(*args, **kwargs):
+                    started.set()
+                    await asyncio.sleep(0.2)
+                    return native
+
+                try:
+                    with mock.patch(
+                        "thunder_sandbox.synchronous.sandbox.NativeSandbox.create",
+                        new=fake_create,
+                    ):
+                        task = asyncio.create_task(
+                            Sandbox.create_async(client=client)
+                        )
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, started.wait
+                        )
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        for _ in range(50):
+                            if native.terminate.await_count:
+                                break
+                            await asyncio.sleep(0.05)
+                    native.terminate.assert_awaited()  # type: ignore[attr-defined]
                 finally:
                     await client.close_async()
 

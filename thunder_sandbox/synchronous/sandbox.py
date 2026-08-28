@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import Literal, cast, overload
 
 from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
@@ -93,8 +95,8 @@ class Sandbox:
     ) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
-        try:
-            sandbox = await resolved_client._bridge.run_async(
+        create = asyncio.create_task(
+            resolved_client._bridge.run_async(
                 NativeSandbox.create(
                     *args,
                     name=name,
@@ -113,6 +115,16 @@ class Sandbox:
                     client=resolved_client._client,
                 )
             )
+        )
+        try:
+            sandbox = await asyncio.shield(create)
+        except asyncio.CancelledError:
+            create.add_done_callback(
+                lambda task: _stop_cancelled_create(
+                    task, resolved_client, owns_client
+                )
+            )
+            raise
         except BaseException:
             if owns_client:
                 await resolved_client.close_async()
@@ -378,6 +390,33 @@ class Sandbox:
         finally:
             if self._owns_client:
                 await self._client.close_async()
+
+
+def _stop_cancelled_create(
+    task: asyncio.Task[NativeSandbox],
+    client: Client,
+    owns_client: bool,
+) -> None:
+    """Stop a sandbox whose create finished after the caller was cancelled."""
+
+    async def cleanup() -> None:
+        try:
+            sandbox = task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException:
+            if owns_client:
+                with suppress(BaseException):
+                    await client.close_async()
+            return
+        wrapped = client._wrap_sandbox(sandbox)
+        wrapped._owns_client = owns_client
+        with suppress(BaseException):
+            await wrapped.terminate_async()
+
+    loop = task.get_loop()
+    if not loop.is_closed():
+        loop.create_task(cleanup())
 
 
 __all__ = ["Sandbox"]
