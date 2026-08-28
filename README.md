@@ -29,7 +29,7 @@ tnr login
 ```
 
 Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
-`TNR_API_URL`.
+`TNR_API_URL`. API endpoints must use HTTPS.
 
 ## Quick start
 

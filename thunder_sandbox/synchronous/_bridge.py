@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Coroutine
-from typing import Any, TypeVar
+from collections.abc import Awaitable
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -41,22 +41,32 @@ class AsyncBridge:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
-    def run(self, coroutine: Coroutine[Any, Any, T]) -> T:
+    @staticmethod
+    async def _await(awaitable: Awaitable[T]) -> T:
+        return await awaitable
+
+    @staticmethod
+    def _close(awaitable: Awaitable[object]) -> None:
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+
+    def run(self, coroutine: Awaitable[T]) -> T:
         if self._closed or self._loop is None:
-            coroutine.close()
+            self._close(coroutine)
             raise RuntimeError("synchronous client is closed")
         if threading.current_thread() is self._thread:
-            coroutine.close()
+            self._close(coroutine)
             raise RuntimeError("cannot call the synchronous API from its event-loop thread")
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        future = asyncio.run_coroutine_threadsafe(self._await(coroutine), self._loop)
         return future.result()
 
-    async def run_async(self, coroutine: Coroutine[Any, Any, T]) -> T:
+    async def run_async(self, coroutine: Awaitable[T]) -> T:
         """Await a coroutine on the bridge loop without blocking the caller's loop."""
         if self._closed or self._loop is None:
-            coroutine.close()
+            self._close(coroutine)
             raise RuntimeError("client is closed")
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        future = asyncio.run_coroutine_threadsafe(self._await(coroutine), self._loop)
         try:
             return await asyncio.wrap_future(future)
         except asyncio.CancelledError:

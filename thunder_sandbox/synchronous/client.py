@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
-from typing import Any, TYPE_CHECKING
+from collections.abc import AsyncGenerator, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
-from ._bridge import AsyncBridge
-from ..asynchronous.client import Client as NativeClient
 from .._common.config import ClientConfig
 from .._common.exceptions import ConnectionError
-from .._common.types import SandboxStatus
+from .._common.types import GPUType, SandboxStatus
+from ..asynchronous.client import Client as NativeClient
+from ._bridge import AsyncBridge
 
 if TYPE_CHECKING:
     from ..asynchronous.sandbox import Sandbox as NativeSandbox
@@ -52,17 +52,79 @@ class Client:
             self._client._request(method, path, body, query)
         )
 
-    def create_sandbox(self, *args: str, **options: object) -> "Sandbox":
-        from .sandbox import Sandbox
-
-        return Sandbox.create(*args, client=self, **options)
-
-    async def create_sandbox_async(
-        self, *args: str, **options: object
+    def create_sandbox(
+        self,
+        *args: str,
+        name: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        timeout: int | None = 300,
+        cpu: int | None = None,
+        memory: int | None = None,
+        storage: int | None = None,
+        gpu_type: GPUType | None = None,
+        gpu_count: int | None = None,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+        ssh_public_key: str | None = None,
+        ssh_private_key: str | None = None,
     ) -> "Sandbox":
         from .sandbox import Sandbox
 
-        return await Sandbox.create_async(*args, client=self, **options)
+        return Sandbox.create(
+            *args,
+            name=name,
+            env=env,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            storage=storage,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            block_network=block_network,
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+            ssh_public_key=ssh_public_key,
+            ssh_private_key=ssh_private_key,
+            client=self,
+        )
+
+    async def create_sandbox_async(
+        self,
+        *args: str,
+        name: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        timeout: int | None = 300,
+        cpu: int | None = None,
+        memory: int | None = None,
+        storage: int | None = None,
+        gpu_type: GPUType | None = None,
+        gpu_count: int | None = None,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+        ssh_public_key: str | None = None,
+        ssh_private_key: str | None = None,
+    ) -> "Sandbox":
+        from .sandbox import Sandbox
+
+        return await Sandbox.create_async(
+            *args,
+            name=name,
+            env=env,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            storage=storage,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            block_network=block_network,
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+            ssh_public_key=ssh_public_key,
+            ssh_private_key=ssh_private_key,
+            client=self,
+        )
 
     def _wrap_sandbox(self, sandbox: "NativeSandbox") -> "Sandbox":
         from .sandbox import Sandbox
@@ -71,7 +133,6 @@ class Client:
         return Sandbox(self, sandbox)
 
     def get_sandbox(self, sandbox_id: str) -> "Sandbox":
-        from .sandbox import Sandbox
 
         sandbox = self._bridge.run(
             self._client.get_sandbox(sandbox_id)
@@ -83,7 +144,6 @@ class Client:
         return self._wrap_sandbox(sandbox)
 
     def get_sandbox_by_name(self, name: str) -> "Sandbox":
-        from .sandbox import Sandbox
 
         sandbox = self._bridge.run(
             self._client.get_sandbox_by_name(name)
@@ -99,7 +159,6 @@ class Client:
     def list_sandboxes(
         self, *, status: str | SandboxStatus = "active"
     ) -> Iterator["Sandbox"]:
-        from .sandbox import Sandbox
 
         iterator = self._client.list_sandboxes(status=status)
         try:
@@ -114,7 +173,7 @@ class Client:
 
     async def list_sandboxes_async(
         self, *, status: str | SandboxStatus = "active"
-    ) -> AsyncIterator["Sandbox"]:
+    ) -> AsyncGenerator["Sandbox", None]:
         iterator = self._client.list_sandboxes(status=status)
         try:
             while True:

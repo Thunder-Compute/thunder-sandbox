@@ -9,28 +9,30 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import asyncssh
+
+import thunder_sandbox as thunder
 import thunder_sandbox.asynchronous as asynchronous
 import thunder_sandbox.synchronous as synchronous
-import thunder_sandbox as thunder
-from thunder_sandbox.asynchronous.client import Client as AsyncClient
-from thunder_sandbox.asynchronous.process import Process as AsyncProcess
-from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
-from thunder_sandbox._common.config import ClientConfig, DEFAULT_API_URL, ThunderPaths
+from thunder_sandbox._common.config import DEFAULT_API_URL, ClientConfig, ThunderPaths
 from thunder_sandbox._common.exceptions import (
     AuthenticationError,
     CapacityError,
     ConnectionError,
     InvalidRequestError,
     RateLimitError,
-    ServiceUnavailableError,
     SandboxTimeoutError,
+    ServiceUnavailableError,
 )
 from thunder_sandbox._common.types import GPUType, SandboxStatus
+from thunder_sandbox.asynchronous.client import USER_AGENT
+from thunder_sandbox.asynchronous.client import Client as AsyncClient
+from thunder_sandbox.asynchronous.process import Process as AsyncProcess
+from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.synchronous._bridge import AsyncBridge
 from thunder_sandbox.synchronous.client import Client
 from thunder_sandbox.synchronous.process import Process
 from thunder_sandbox.synchronous.sandbox import Sandbox
-
 
 SANDBOX_RESPONSE = {
     "id": "sbx-test",
@@ -77,6 +79,23 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(AsyncProcess.__name__, Process.__name__)
         self.assertEqual(set(asynchronous.__all__), set(synchronous.__all__))
         self.assertIs(asynchronous.GPUType, synchronous.GPUType)
+        self.assertEqual(USER_AGENT, f"thunder-python-sdk/{thunder.__version__}")
+
+    def test_public_io_methods_have_async_twins(self) -> None:
+        for cls, methods in {
+            thunder.Client: (
+                "close", "create_sandbox", "get_sandbox",
+                "get_sandbox_by_name", "list_sandboxes",
+            ),
+            thunder.Sandbox: (
+                "create", "download", "exec", "from_id", "from_name", "poll",
+                "refresh", "terminate", "upload", "wait", "wait_until_ready",
+            ),
+            thunder.Process: ("poll", "terminate", "wait"),
+        }.items():
+            for method in methods:
+                with self.subTest(cls=cls.__name__, method=method):
+                    self.assertTrue(callable(getattr(cls, f"{method}_async")))
 
     def test_configuration_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -258,17 +277,19 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             prepare_key(client.config.paths)
+            host_key = asyncssh.generate_private_key("ssh-ed25519").export_public_key()
+            host_key_text = host_key.decode("ascii").strip()
             response = {
                 **SANDBOX_RESPONSE,
                 "ssh": {
                     **SANDBOX_RESPONSE["ssh"],
-                    "host_key": "ssh-ed25519 AAAATEST",
+                    "host_key": host_key_text,
                 },
             }
             sandbox = AsyncSandbox._from_response(client, response)
             self.assertEqual(
                 client.config.paths.known_hosts.read_text(encoding="utf-8"),
-                "[sandbox.example]:2222 ssh-ed25519 AAAATEST\n",
+                f"[sandbox.example]:2222 {host_key_text}\n",
             )
             self.assertEqual(
                 sandbox.ssh.known_hosts_path, client.config.paths.known_hosts
@@ -278,8 +299,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
     async def test_exec_uses_asyncssh_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
+            stdout = mock.Mock()
+            stdout.read = mock.AsyncMock(return_value=b"")
+            stderr = mock.Mock()
+            stderr.read = mock.AsyncMock(return_value=b"")
             process = mock.Mock(
-                stdin=mock.Mock(), stdout=mock.Mock(), stderr=mock.Mock(), returncode=0
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=0
             )
             process.wait_closed = mock.AsyncMock()
             connection = mock.Mock()
@@ -366,6 +391,21 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             client._request.assert_not_awaited()
             await client.close()
 
+    async def test_mismatched_ssh_keys_fail_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            private_key = asyncssh.generate_private_key("ssh-ed25519")
+            other_key = asyncssh.generate_private_key("ssh-ed25519")
+            with self.assertRaisesRegex(InvalidRequestError, "do not match"):
+                await AsyncSandbox.create(
+                    ssh_public_key=other_key.export_public_key().decode("ascii"),
+                    ssh_private_key=private_key.export_private_key().decode("ascii"),
+                    client=client,
+                )
+            client._request.assert_not_awaited()
+            await client.close()
+
     async def test_implicit_client_is_closed_by_terminate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
@@ -435,8 +475,12 @@ class SynchronousSandboxTest(unittest.TestCase):
             sandbox, client, asynchronous = self.sandbox(directory)
 
             class Reader:
+                def __init__(self):
+                    self.value = "output"
+
                 async def read(self, n=-1):
-                    return "output"
+                    value, self.value = self.value, ""
+                    return value
 
                 async def readline(self):
                     return ""
@@ -491,6 +535,60 @@ class SynchronousSandboxTest(unittest.TestCase):
             self.assertEqual(await process.stderr.read(), "stderr")
             raw.wait.assert_not_awaited()
             raw.wait_closed.assert_awaited_once_with()
+
+        asyncio.run(exercise())
+
+    def test_process_stdin_is_transport_neutral(self) -> None:
+        async def exercise() -> None:
+            raw_stdin = mock.Mock()
+            raw_stdin.drain = mock.AsyncMock()
+            stdout = mock.Mock()
+            stdout.read = mock.AsyncMock(return_value="")
+            stderr = mock.Mock()
+            stderr.read = mock.AsyncMock(return_value="")
+            raw = mock.Mock(
+                stdin=raw_stdin,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=0,
+            )
+            process = AsyncProcess(raw)
+
+            self.assertNotIsInstance(process.stdin, asyncssh.SSHWriter)
+            self.assertEqual(process.stdin.write("answer\n"), 7)
+            await process.stdin.drain()
+            process.stdin.write_eof()
+            raw_stdin.write.assert_called_once_with("answer\n")
+            raw_stdin.drain.assert_awaited_once_with()
+            raw_stdin.write_eof.assert_called_once_with()
+
+        asyncio.run(exercise())
+
+    def test_wait_drains_large_output_without_losing_it(self) -> None:
+        async def exercise() -> None:
+            expected = "x" * (3 * 1024 * 1024)
+
+            class Reader:
+                def __init__(self, value: str) -> None:
+                    self.value = value
+
+                async def read(self, n=-1):
+                    if not self.value:
+                        return ""
+                    value, self.value = self.value[:65536], self.value[65536:]
+                    await asyncio.sleep(0)
+                    return value
+
+            raw = mock.Mock(
+                stdin=mock.Mock(),
+                stdout=Reader(expected),
+                stderr=Reader(""),
+                returncode=0,
+            )
+            raw.wait_closed = mock.AsyncMock()
+            process = AsyncProcess(raw)
+            self.assertEqual(await process.wait(), 0)
+            self.assertEqual(await process.stdout.read(), expected)
 
         asyncio.run(exercise())
 

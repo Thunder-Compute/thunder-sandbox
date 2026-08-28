@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, overload
@@ -16,8 +17,6 @@ from urllib.parse import quote
 
 import asyncssh
 
-from .client import Client
-from .process import Process
 from .._common.config import ThunderPaths
 from .._common.exceptions import (
     ConflictError,
@@ -36,6 +35,8 @@ from .._common.types import (
     SandboxStatus,
     SSHConnection,
 )
+from .client import Client
+from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
 
@@ -84,57 +85,66 @@ class Sandbox:
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         paths = resolved_client.config.paths
-        paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-        if ssh_public_key is None:
-            temporary_directory = tempfile.TemporaryDirectory(
-                prefix=".creating-", dir=paths.sandbox_keys
-            )
-            temporary_key = Path(temporary_directory.name) / "key"
-            await _generate_key_pair(temporary_key)
-            public_key = temporary_key.with_suffix(".pub").read_text(
-                encoding="utf-8"
-            ).strip()
-            private_key_source = temporary_key
-            public_key_source = temporary_key.with_suffix(".pub")
-        else:
-            public_key = ssh_public_key.strip()
-            if not public_key:
-                raise InvalidRequestError("ssh_public_key cannot be empty")
-            private_key_source = public_key_source = None
+        try:
+            paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if ssh_public_key is None:
+                temporary_directory = tempfile.TemporaryDirectory(
+                    prefix=".creating-", dir=paths.sandbox_keys
+                )
+                temporary_key = Path(temporary_directory.name) / "key"
+                await _generate_key_pair(temporary_key)
+                public_key = temporary_key.with_suffix(".pub").read_text(
+                    encoding="utf-8"
+                ).strip()
+                private_key_source: Path | None = temporary_key
+                public_key_source: Path | None = temporary_key.with_suffix(".pub")
+            else:
+                public_key = ssh_public_key.strip()
+                private_key_source = public_key_source = None
 
-        internet_access, cidrs, domains = _network_policy(
-            block_network,
-            outbound_cidr_allowlist,
-            outbound_domain_allowlist,
-        )
-        request = {
-            "spec": {
-                "cpu_count": cpu if cpu is not None else 4,
-                "memory_gib": memory if memory is not None else 32,
-                "storage_gib": storage if storage is not None else 50,
-                **(
-                    {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
-                    if gpu_type is not None
-                    else {}
-                ),
-            },
-            "env": {
-                key: value for key, value in (env or {}).items() if value is not None
-            },
-            "lifetime": {
-                "enforce_ttl": timeout is not None,
-                **({"max_ttl_seconds": timeout} if timeout is not None else {}),
-            },
-            "network_policy": {
-                "internet_access": internet_access,
-                "cidr_allowlist": cidrs,
-                "domain_allowlist": domains,
-            },
-            "ssh_public_key": public_key,
-            **({"name": name} if name is not None else {}),
-        }
+            internet_access, cidrs, domains = _network_policy(
+                block_network,
+                outbound_cidr_allowlist,
+                outbound_domain_allowlist,
+            )
+            request = {
+                "spec": {
+                    "cpu_count": cpu if cpu is not None else 4,
+                    "memory_gib": memory if memory is not None else 32,
+                    "storage_gib": storage if storage is not None else 50,
+                    **(
+                        {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
+                        if gpu_type is not None
+                        else {}
+                    ),
+                },
+                "env": {
+                    key: value
+                    for key, value in (env or {}).items()
+                    if value is not None
+                },
+                "lifetime": {
+                    "enforce_ttl": timeout is not None,
+                    **({"max_ttl_seconds": timeout} if timeout is not None else {}),
+                },
+                "network_policy": {
+                    "internet_access": internet_access,
+                    "cidr_allowlist": cidrs,
+                    "domain_allowlist": domains,
+                },
+                "ssh_public_key": public_key,
+                **({"name": name} if name is not None else {}),
+            }
+        except BaseException:
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+            if owns_client:
+                await resolved_client.close()
+            raise
         sandbox_id: str | None = None
+        private_key_created = False
+        public_key_created = False
         try:
             response = await resolved_client._request("POST", "/sandboxes/start", request)
             sandbox_id = str(response.get("id", ""))
@@ -148,10 +158,14 @@ class Sandbox:
                 )
             if private_key_source is not None and public_key_source is not None:
                 os.replace(private_key_source, private_destination)
+                private_key_created = True
                 os.replace(public_key_source, public_destination)
+                public_key_created = True
             else:
                 _write_key(private_destination, ssh_private_key or "", 0o600)
+                private_key_created = True
                 _write_key(public_destination, public_key + "\n", 0o644)
+                public_key_created = True
             sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
             sandbox._owns_client = owns_client
             if args:
@@ -160,14 +174,18 @@ class Sandbox:
             return sandbox
         except BaseException:
             if sandbox_id:
-                try:
+                with suppress(BaseException):
                     await _stop_sandbox(
                         resolved_client,
                         sandbox_id,
                         deadline=time.monotonic() + OUTAGE_GRACE_SECONDS,
                     )
-                except BaseException:
-                    pass
+            if public_key_created:
+                with suppress(OSError):
+                    public_destination.unlink(missing_ok=True)
+            if private_key_created:
+                with suppress(OSError):
+                    private_destination.unlink(missing_ok=True)
             if owns_client:
                 await resolved_client.close()
             raise
@@ -278,6 +296,17 @@ class Sandbox:
         pty: bool = False,
     ) -> Process[bytes]: ...
 
+    @overload
+    async def exec(
+        self,
+        *args: str,
+        timeout: float | None = None,
+        workdir: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        text: bool,
+        pty: bool = False,
+    ) -> Process[str] | Process[bytes]: ...
+
     async def exec(
         self,
         *args: str,
@@ -300,7 +329,7 @@ class Sandbox:
         except (OSError, asyncssh.Error) as exc:
             await self._discard_connection(connection)
             raise ConnectionError(f"could not open a sandbox SSH session: {exc}") from exc
-        return Process(process, timeout=timeout)
+        return Process(process, timeout=timeout, text=text)
 
     async def upload(
         self,
@@ -311,7 +340,9 @@ class Sandbox:
     ) -> None:
         connection = await self._connect()
         try:
-            await asyncssh.scp(local_path, (connection, remote_path), recurse=recursive)
+            await asyncssh.scp(
+                os.fspath(local_path), (connection, remote_path), recurse=recursive
+            )
         except (OSError, asyncssh.Error) as exc:
             if connection.is_closed():
                 await self._discard_connection(connection)
@@ -326,7 +357,9 @@ class Sandbox:
     ) -> None:
         connection = await self._connect()
         try:
-            await asyncssh.scp((connection, remote_path), local_path, recurse=recursive)
+            await asyncssh.scp(
+                (connection, remote_path), os.fspath(local_path), recurse=recursive
+            )
         except (OSError, asyncssh.Error) as exc:
             if connection.is_closed():
                 await self._discard_connection(connection)
@@ -358,7 +391,12 @@ class Sandbox:
                     config=None,
                 )
                 if known_hosts is None:
-                    _pin_host_key(ssh, connection.get_server_host_key())
+                    try:
+                        _pin_host_key(ssh, connection.get_server_host_key())
+                    except BaseException:
+                        connection.close()
+                        await connection.wait_closed()
+                        raise
             except (OSError, asyncssh.Error) as exc:
                 raise ConnectionError(
                     f"could not connect to sandbox over SSH: {exc}"
@@ -517,6 +555,14 @@ def _path_segment(value: str) -> str:
     return quote(value, safe="")
 
 
+@overload
+def _datetime(value: object, optional: Literal[False] = False) -> datetime: ...
+
+
+@overload
+def _datetime(value: object, optional: Literal[True]) -> datetime | None: ...
+
+
 def _datetime(value: object, optional: bool = False) -> datetime | None:
     if value in (None, ""):
         return None if optional else datetime.fromtimestamp(0).astimezone()
@@ -528,11 +574,11 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     name = str(response.get("name", ""))
     if not sandbox_id:
         raise SandboxFailedError("Thunder did not return a sandbox ID")
-    spec = response.get("spec") if isinstance(response.get("spec"), dict) else {}
-    policy = (
-        response.get("network_policy")
-        if isinstance(response.get("network_policy"), dict)
-        else {}
+    spec_value = response.get("spec")
+    spec: dict[str, object] = spec_value if isinstance(spec_value, dict) else {}
+    policy_value = response.get("network_policy")
+    policy: dict[str, object] = (
+        policy_value if isinstance(policy_value, dict) else {}
     )
     gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
     ssh_value = response.get("ssh")
@@ -553,16 +599,18 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         name=name,
         status=SandboxStatus(str(response.get("status", "created"))),
         resources=Resources(
-            cpu=int(spec.get("cpu_count", 0)),
-            memory=int(spec.get("memory_gib", 0)),
-            storage=int(spec.get("storage_gib", 0)),
+            cpu=int(str(spec.get("cpu_count", 0))),
+            memory=int(str(spec.get("memory_gib", 0))),
+            storage=int(str(spec.get("storage_gib", 0))),
             gpu_type=gpu_type,
-            gpu_count=int(spec.get("gpu_count", 0)),
+            gpu_count=int(str(spec.get("gpu_count", 0))),
         ),
         network_policy=NetworkPolicy(
             internet_access=str(policy.get("internet_access", "closed")),
-            outbound_cidr_allowlist=tuple(policy.get("cidr_allowlist", ()) or ()),
-            outbound_domain_allowlist=tuple(policy.get("domain_allowlist", ()) or ()),
+            outbound_cidr_allowlist=_string_tuple(policy.get("cidr_allowlist")),
+            outbound_domain_allowlist=_string_tuple(
+                policy.get("domain_allowlist")
+            ),
         ),
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
@@ -572,6 +620,12 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         ),
         failure=str(response["failure"]) if response.get("failure") else None,
     )
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in value)
 
 
 def _known_host_name(ssh: SSHConnection) -> str:
@@ -607,6 +661,11 @@ def _pin_host_key(ssh: SSHConnection, key: object) -> None:
     key_text = key_text.strip()
     if not key_text:
         raise SandboxFailedError("Thunder returned an empty SSH host key")
+    try:
+        parsed_key = asyncssh.import_public_key(key_text)
+        key_text = parsed_key.export_public_key().decode("ascii").strip()
+    except (asyncssh.Error, UnicodeError, ValueError) as exc:
+        raise SandboxFailedError("Thunder returned an invalid SSH host key") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     line = f"{_known_host_name(ssh)} {key_text}\n"
     try:
@@ -640,9 +699,15 @@ def _validate_create_options(
         if not ssh_private_key.strip():
             raise InvalidRequestError("ssh_private_key cannot be empty")
         try:
-            asyncssh.import_private_key(ssh_private_key)
+            private_key = asyncssh.import_private_key(ssh_private_key)
         except (asyncssh.Error, ValueError) as exc:
             raise InvalidRequestError("ssh_private_key is not a valid private key") from exc
+        try:
+            public_key = asyncssh.import_public_key(ssh_public_key or "")
+        except (asyncssh.Error, ValueError) as exc:
+            raise InvalidRequestError("ssh_public_key is not a valid public key") from exc
+        if private_key.get_fingerprint() != public_key.get_fingerprint():
+            raise InvalidRequestError("SSH public and private keys do not match")
     if timeout is not None and timeout < 0:
         raise InvalidRequestError("timeout cannot be negative")
     if gpu_type is not None and not isinstance(gpu_type, GPUType):

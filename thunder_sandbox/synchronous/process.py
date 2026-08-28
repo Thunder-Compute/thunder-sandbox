@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Generic, TypeVar
 
-from ._bridge import AsyncBridge
 from ..asynchronous.process import Process as NativeProcess
+from ._bridge import AsyncBridge
 
 T = TypeVar("T", str, bytes)
 
@@ -36,6 +36,15 @@ class StreamReader(Generic[T]):
             raise StopIteration
         return line
 
+    def __aiter__(self) -> "StreamReader[T]":
+        return self
+
+    async def __anext__(self) -> T:
+        line = await self.readline_async()
+        if not line:
+            raise StopAsyncIteration
+        return line
+
 
 class StreamWriter(Generic[T]):
     def __init__(self, bridge: AsyncBridge, stream: object) -> None:
@@ -44,9 +53,9 @@ class StreamWriter(Generic[T]):
 
     def write(self, data: T) -> int:
         async def write() -> int:
-            self._stream.write(data)  # type: ignore[attr-defined]
+            written = self._stream.write(data)  # type: ignore[attr-defined]
             await self._stream.drain()  # type: ignore[attr-defined]
-            return len(data)
+            return written if isinstance(written, int) else len(data)
 
         return self._bridge.run(write())
 
@@ -55,9 +64,9 @@ class StreamWriter(Generic[T]):
 
     async def write_async(self, data: T) -> int:
         async def write() -> int:
-            self._stream.write(data)  # type: ignore[attr-defined]
+            written = self._stream.write(data)  # type: ignore[attr-defined]
             await self._stream.drain()  # type: ignore[attr-defined]
-            return len(data)
+            return written if isinstance(written, int) else len(data)
 
         return await self._bridge.run_async(write())
 
@@ -84,11 +93,11 @@ class Process(Generic[T]):
         self, bridge: AsyncBridge, process: NativeProcess[T]
     ) -> None:
         self._bridge = bridge
-        self._process = process
+        self._process: NativeProcess[T] = process
         self.id = process.id
-        self.stdin = StreamWriter[T](bridge, process.stdin)
-        self.stdout = StreamReader[T](bridge, process.stdout)
-        self.stderr = StreamReader[T](bridge, process.stderr)
+        self.stdin: StreamWriter[T] = StreamWriter(bridge, process.stdin)
+        self.stdout: StreamReader[T] = StreamReader(bridge, process.stdout)
+        self.stderr: StreamReader[T] = StreamReader(bridge, process.stderr)
 
     @property
     def returncode(self) -> int | None:

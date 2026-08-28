@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
+from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
+from ..asynchronous.process import Process as NativeProcess
+from ..asynchronous.sandbox import Sandbox as NativeSandbox
 from .client import Client
 from .process import Process
-from ..asynchronous.sandbox import Sandbox as NativeSandbox
-from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
 
 
 class Sandbox:
@@ -226,6 +227,13 @@ class Sandbox:
         text: Literal[False] = False, pty: bool = False,
     ) -> Process[bytes]: ...
 
+    @overload
+    def exec(
+        self, *args: str, timeout: float | None = None,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+        text: bool, pty: bool = False,
+    ) -> Process[str] | Process[bytes]: ...
+
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
@@ -241,7 +249,32 @@ class Sandbox:
                 pty=pty,
             )
         )
-        return Process(self._client._bridge, process)
+        if text:
+            return Process(
+                self._client._bridge, cast("NativeProcess[str]", process)
+            )
+        return Process(self._client._bridge, cast("NativeProcess[bytes]", process))
+
+    @overload
+    async def exec_async(
+        self, *args: str, timeout: float | None = None,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+        text: Literal[True] = True, pty: bool = False,
+    ) -> Process[str]: ...
+
+    @overload
+    async def exec_async(
+        self, *args: str, timeout: float | None = None,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+        text: Literal[False] = False, pty: bool = False,
+    ) -> Process[bytes]: ...
+
+    @overload
+    async def exec_async(
+        self, *args: str, timeout: float | None = None,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+        text: bool, pty: bool = False,
+    ) -> Process[str] | Process[bytes]: ...
 
     async def exec_async(
         self, *args: str, timeout: float | None = None,
@@ -258,7 +291,11 @@ class Sandbox:
                 pty=pty,
             )
         )
-        return Process(self._client._bridge, process)
+        if text:
+            return Process(
+                self._client._bridge, cast("NativeProcess[str]", process)
+            )
+        return Process(self._client._bridge, cast("NativeProcess[bytes]", process))
 
     def upload(
         self, local_path: str | os.PathLike[str], remote_path: str, *,

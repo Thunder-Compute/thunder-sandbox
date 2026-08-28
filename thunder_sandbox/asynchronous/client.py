@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
-from typing import Any, TYPE_CHECKING
+from collections.abc import AsyncGenerator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
@@ -21,12 +21,13 @@ from .._common.exceptions import (
     ServiceUnavailableError,
     ThunderError,
 )
-from .._common.types import SandboxStatus
+from .._common.types import GPUType, SandboxStatus
+from .._version import __version__
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
 
-USER_AGENT = "thunder-python-sdk/0.1.0"
+USER_AGENT = f"thunder-python-sdk/{__version__}"
 
 _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_capacity_unavailable": CapacityError,
@@ -140,10 +141,42 @@ class Client:
             raise ConnectionError("Thunder returned an unexpected response")
         return result
 
-    async def create_sandbox(self, *args: str, **options: object) -> "Sandbox":
+    async def create_sandbox(
+        self,
+        *args: str,
+        name: str | None = None,
+        env: Mapping[str, str | None] | None = None,
+        timeout: int | None = 300,
+        cpu: int | None = None,
+        memory: int | None = None,
+        storage: int | None = None,
+        gpu_type: GPUType | None = None,
+        gpu_count: int | None = None,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+        ssh_public_key: str | None = None,
+        ssh_private_key: str | None = None,
+    ) -> "Sandbox":
         from .sandbox import Sandbox
 
-        return await Sandbox.create(*args, client=self, **options)
+        return await Sandbox.create(
+            *args,
+            name=name,
+            env=env,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            storage=storage,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            block_network=block_network,
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+            ssh_public_key=ssh_public_key,
+            ssh_private_key=ssh_private_key,
+            client=self,
+        )
 
     async def get_sandbox(self, sandbox_id: str) -> "Sandbox":
         from .sandbox import Sandbox
@@ -157,7 +190,7 @@ class Client:
 
     async def list_sandboxes(
         self, *, status: str | SandboxStatus = "active"
-    ) -> AsyncIterator["Sandbox"]:
+    ) -> AsyncGenerator["Sandbox", None]:
         from .sandbox import Sandbox
 
         wanted = status.value if isinstance(status, SandboxStatus) else str(status)
