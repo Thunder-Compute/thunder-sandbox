@@ -75,6 +75,7 @@ class SSHConnection:
     user: str
     private_key_path: Path
     known_hosts_path: Path | None = None
+    certificate_path: Path | None = None
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -82,6 +83,10 @@ class SSHConnection:
             "ssh", "-i", str(self.private_key_path), "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
+        if self.certificate_path is not None:
+            # The sandbox trusts the authority that signed this, not the key
+            # itself, which is why the same credential opens every sandbox.
+            command.extend(("-o", f"CertificateFile={self.certificate_path}"))
         if self.known_hosts_path is None:
             command.extend(("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"))
         else:

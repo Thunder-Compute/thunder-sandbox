@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 from dataclasses import replace
@@ -14,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from src.client import Client, USER_AGENT
+from src import credentials
 from src.config import ClientConfig, DEFAULT_API_URL, ThunderPaths
 from src.exceptions import (
     AuthenticationError,
@@ -21,6 +23,7 @@ from src.exceptions import (
     ConnectionError as ThunderConnectionError,
     InvalidRequestError,
     NotFoundError,
+    SandboxError,
     SandboxFailedError,
     SandboxTimeoutError,
     ThunderError,
@@ -330,29 +333,6 @@ class SandboxCreationTest(unittest.TestCase):
                 with self.subTest(options=options), self.assertRaises(InvalidRequestError):
                     Sandbox.create(client=client, **options)  # type: ignore[arg-type]
 
-    def test_generated_key_exists_before_start_and_moves_to_sandbox_name(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = ThunderPaths(Path(directory))
-            client = FakeClient(paths)
-            with mock.patch(
-                "src.sandbox._generate_key_pair", side_effect=write_generated_key
-            ):
-                Sandbox.create(client=client)
-
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            self.assertEqual(request["ssh_public_key"], "ssh-ed25519 GENERATED")
-            self.assertEqual(
-                paths.sandbox_private_key("sbx-test").read_text(encoding="utf-8"),
-                "PRIVATE",
-            )
-            self.assertFalse(
-                any(
-                    path.name.startswith(".creating-")
-                    for path in paths.sandbox_keys.iterdir()
-                )
-            )
-
     def test_request_contains_resources_environment_lifetime_and_gpu(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(ThunderPaths(Path(directory)))
@@ -366,8 +346,6 @@ class SandboxCreationTest(unittest.TestCase):
                 timeout=None,
                 outbound_cidr_allowlist=["203.0.113.0/24"],
                 outbound_domain_allowlist=["example.com"],
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
                 client=client,
             )
 
@@ -398,8 +376,6 @@ class SandboxCreationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(ThunderPaths(Path(directory)))
             Sandbox.create(
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
                 client=client,
             )
             request = client.requests[0][2]
@@ -418,8 +394,6 @@ class SandboxCreationTest(unittest.TestCase):
             client = FakeClient(ThunderPaths(Path(directory)))
             Sandbox.create(
                 outbound_domain_allowlist=["example.com"],
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
                 client=client,
             )
             request = client.requests[0][2]
@@ -434,8 +408,6 @@ class SandboxCreationTest(unittest.TestCase):
             client = FakeClient(ThunderPaths(Path(directory)))
             Sandbox.create(
                 block_network=True,
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
                 client=client,
             )
             request = client.requests[0][2]
@@ -452,7 +424,6 @@ class SandboxCreationTest(unittest.TestCase):
     def test_invalid_creation_options_fail_before_request(self) -> None:
         cases = [
             {"timeout": -1},
-            {"ssh_public_key": "public"},
             {
                 "block_network": True,
                 "outbound_domain_allowlist": ["example.com"],
@@ -473,31 +444,23 @@ class SandboxCreationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = FakeClient(ThunderPaths(Path(directory)))
             client._request = mock.Mock(return_value={})  # type: ignore[method-assign]
-            with mock.patch(
-                "src.sandbox._generate_key_pair", side_effect=write_generated_key
-            ), self.assertRaisesRegex(SandboxFailedError, "sandbox ID"):
+            with self.assertRaisesRegex(SandboxFailedError, "sandbox ID"):
                 Sandbox.create(client=client)
-
-    def test_existing_key_is_never_overwritten(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = ThunderPaths(Path(directory))
-            paths.sandbox_keys.mkdir(parents=True)
-            private_key = paths.sandbox_private_key("sbx-test")
-            private_key.write_text("EXISTING", encoding="utf-8")
-            with self.assertRaisesRegex(InvalidRequestError, "already exists"):
-                Sandbox.create(
-                    ssh_public_key="ssh-ed25519 PUBLIC",
-                    ssh_private_key="NEW",
-                    client=FakeClient(paths),
-                )
-            self.assertEqual(private_key.read_text(encoding="utf-8"), "EXISTING")
 
 
 class SandboxOperationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Connecting mints a credential; that path has its own tests below, and
+        # these cases are about the commands built once one exists.
+        patcher = mock.patch("src.sandbox.ensure_credential", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _sandbox(self, directory: str, response: dict[str, object] | None = None) -> Sandbox:
         paths = ThunderPaths(Path(directory))
         paths.sandbox_keys.mkdir(parents=True)
-        paths.sandbox_private_key("sbx-test").write_text("PRIVATE", encoding="utf-8")
+        paths.ssh_key.write_text("PRIVATE", encoding="utf-8")
+        paths.ssh_certificate.write_text("ssh-ed25519-cert CERT", encoding="utf-8")
         return Sandbox._from_response(FakeClient(paths), response or SANDBOX_RESPONSE)
 
     def test_response_is_parsed_into_typed_info(self) -> None:
@@ -800,8 +763,79 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(await async_sandbox.refresh(), async_sandbox)
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+
+class CredentialTest(unittest.TestCase):
+    """One key per machine, one certificate per organization, renewed in time."""
+
+    def _client(self, directory: str, certificate: str = "ssh-ed25519-cert AAAAsigned") -> FakeClient:
+        client = FakeClient(ThunderPaths(Path(directory)))
+        client._request = mock.Mock(  # type: ignore[method-assign]
+            return_value={"ssh_certificate": certificate}
+        )
+        return client
+
+    def test_a_key_is_generated_once_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory)
+            key, certificate = credentials.ensure_credential(client)
+            self.assertTrue(key.exists())
+            self.assertEqual(certificate.read_text(encoding="utf-8").strip(), "ssh-ed25519-cert AAAAsigned")
+            # The private key is this machine's; regenerating it would strand
+            # every certificate already issued for it.
+            original = key.read_bytes()
+            with mock.patch.object(credentials, "_certificate_is_usable", return_value=True):
+                credentials.ensure_credential(client)
+            self.assertEqual(key.read_bytes(), original)
+
+    def test_a_usable_certificate_is_not_reminted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory)
+            credentials.ensure_credential(client)
+            self.assertEqual(client._request.call_count, 1)
+            with mock.patch.object(credentials, "_certificate_is_usable", return_value=True):
+                credentials.ensure_credential(client)
+            self.assertEqual(client._request.call_count, 1, "a valid certificate must be reused")
+
+    def test_an_expiring_certificate_is_renewed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory)
+            credentials.ensure_credential(client)
+            with mock.patch.object(credentials, "_certificate_is_usable", return_value=False):
+                credentials.ensure_credential(client)
+            self.assertEqual(client._request.call_count, 2)
+
+    def test_a_certificate_without_a_key_is_discarded(self) -> None:
+        # A certificate signs one key. Keeping it beside a regenerated key
+        # would present a credential the sandbox cannot match.
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory)
+            paths = client.config.paths
+            paths.sandbox_keys.mkdir(mode=0o700, parents=True)
+            paths.ssh_certificate.write_text("ssh-ed25519-cert STALE", encoding="utf-8")
+            _, certificate = credentials.ensure_credential(client)
+            self.assertEqual(certificate.read_text(encoding="utf-8").strip(), "ssh-ed25519-cert AAAAsigned")
+
+    def test_a_refused_certificate_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory, certificate="")
+            with self.assertRaises(SandboxError):
+                credentials.ensure_credential(client)
+
+    def test_expiry_is_read_from_the_certificate(self) -> None:
+        # The window is trusted from the certificate rather than remembered
+        # from the response, so a stale file on disk is detected.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cert"
+            path.write_text("x", encoding="utf-8")
+            soon = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 60))
+            far = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 6 * 3600))
+            for window, want in ((soon, False), (far, True)):
+                with mock.patch.object(
+                    credentials.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, f"Valid: from 2026-01-01T00:00:00 to {window}\n", ""),
+                ):
+                    self.assertEqual(credentials._certificate_is_usable(path), want)
 
 
 class GPUTypeTest(unittest.TestCase):
@@ -996,3 +1030,6 @@ class ListStatusTest(unittest.TestCase):
                 list(client.list_sandboxes(**kwargs))
                 self.assertEqual(request.call_args.kwargs["query"]["status"], expected)
 
+
+if __name__ == "__main__":
+    unittest.main()

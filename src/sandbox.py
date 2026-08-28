@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Literal, overload
 
 from .client import Client
+from .credentials import ensure_credential
 from .exceptions import (
     ConflictError,
     ConnectionError,
@@ -55,12 +55,8 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
-        ssh_public_key: str | None = None,
-        ssh_private_key: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
-        if (ssh_public_key is None) != (ssh_private_key is None):
-            raise InvalidRequestError("ssh_public_key and ssh_private_key must be provided together")
         if timeout is not None and timeout < 0:
             raise InvalidRequestError("timeout cannot be negative")
         if gpu_type is not None and not isinstance(gpu_type, GPUType):
@@ -73,21 +69,6 @@ class Sandbox:
             raise InvalidRequestError("network allowlists cannot be combined with block_network")
 
         resolved_client = client or Client.from_cli()
-        paths = resolved_client.config.paths
-        paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-        if ssh_public_key is None:
-            temporary_directory = tempfile.TemporaryDirectory(prefix=".creating-", dir=paths.sandbox_keys)
-            temporary_key = Path(temporary_directory.name) / "key"
-            _generate_key_pair(temporary_key)
-            public_key = temporary_key.with_suffix(".pub").read_text(encoding="utf-8").strip()
-            private_key_source = temporary_key
-            public_key_source = temporary_key.with_suffix(".pub")
-        else:
-            public_key = ssh_public_key.strip()
-            if not public_key:
-                raise InvalidRequestError("ssh_public_key cannot be empty")
-            private_key_source = public_key_source = None
 
         if block_network:
             internet_access, cidrs, domains = "closed", [], []
@@ -111,27 +92,12 @@ class Sandbox:
             "env": {key: value for key, value in (env or {}).items() if value is not None},
             "lifetime": {"enforce_ttl": timeout is not None, **({"max_ttl_seconds": timeout} if timeout is not None else {})},
             "network_policy": {"internet_access": internet_access, "cidr_allowlist": cidrs, "domain_allowlist": domains},
-            "ssh_public_key": public_key,
             **({"name": name} if name is not None else {}),
         }
-        try:
-            response = resolved_client._request("POST", "/sandboxes/start", request)
-            sandbox_id = str(response.get("id", ""))
-            if not sandbox_id:
-                raise SandboxFailedError("Thunder did not return a sandbox ID")
-            private_destination = paths.sandbox_private_key(sandbox_id)
-            public_destination = paths.sandbox_public_key(sandbox_id)
-            if private_destination.exists() or public_destination.exists():
-                raise InvalidRequestError(f"SSH key already exists for sandbox {sandbox_id}")
-            if private_key_source is not None and public_key_source is not None:
-                os.replace(private_key_source, private_destination)
-                os.replace(public_key_source, public_destination)
-            else:
-                _write_key(private_destination, ssh_private_key or "", 0o600)
-                _write_key(public_destination, public_key + "\n", 0o644)
-        finally:
-            if temporary_directory is not None:
-                temporary_directory.cleanup()
+        response = resolved_client._request("POST", "/sandboxes/start", request)
+        sandbox_id = str(response.get("id", ""))
+        if not sandbox_id:
+            raise SandboxFailedError("Thunder did not return a sandbox ID")
 
         sandbox = Sandbox.from_id(sandbox_id, client=resolved_client)
         if args:
@@ -178,7 +144,14 @@ class Sandbox:
         ssh_value = response.get("ssh")
         ssh = None
         if isinstance(ssh_value, dict) and ssh_value.get("host"):
-            ssh = SSHConnection(host=str(ssh_value["host"]), port=int(ssh_value.get("port", 22)), user=str(ssh_value.get("user", "ubuntu")), private_key_path=client.config.paths.sandbox_private_key(sandbox_id))
+            # The credential is minted when a connection is actually made, not
+            # here: listing sandboxes must not reach the API for a certificate.
+            ssh = SSHConnection(
+                host=str(ssh_value["host"]), port=int(ssh_value.get("port", 22)),
+                user=str(ssh_value.get("user", "ubuntu")),
+                private_key_path=client.config.paths.ssh_key,
+                certificate_path=client.config.paths.ssh_certificate,
+            )
         info = SandboxInfo(
             id=sandbox_id, name=name, status=SandboxStatus(str(response.get("status", "created"))),
             resources=Resources(cpu=int(spec.get("cpu_count", 0)), memory=int(spec.get("memory_gib", 0)), storage=int(spec.get("storage_gib", 0)), gpu_type=gpu_type, gpu_count=gpu_count),
@@ -217,6 +190,7 @@ class Sandbox:
     def exec(self, *args: str, timeout: float | None = None, workdir: str | None = None, env: Mapping[str, str | None] | None = None, text: bool = True, pty: bool = False) -> ContainerProcess[str] | ContainerProcess[bytes]:
         if not args:
             raise InvalidRequestError("exec requires a command")
+        ensure_credential(self._client)
         command = list(self.ssh_command)
         if pty:
             command.insert(1, "-tt")
@@ -233,11 +207,13 @@ class Sandbox:
         )
 
     def upload(self, local_path: str | os.PathLike[str], remote_path: str, *, recursive: bool = False) -> None:
+        ensure_credential(self._client)
         command = _scp_command(self.ssh, recursive)
         command.extend((str(local_path), f"{self.ssh.user}@{self.ssh.host}:{shlex.quote(remote_path)}"))
         _run_transfer(command)
 
     def download(self, remote_path: str, local_path: str | os.PathLike[str], *, recursive: bool = False) -> None:
+        ensure_credential(self._client)
         command = _scp_command(self.ssh, recursive)
         command.extend((f"{self.ssh.user}@{self.ssh.host}:{shlex.quote(remote_path)}", str(local_path)))
         _run_transfer(command)
@@ -361,21 +337,6 @@ class AsyncSandbox:
     async def terminate(self, *, timeout: float | None = 300) -> None: await asyncio.to_thread(self._sandbox.terminate, timeout=timeout)
 
 
-def _generate_key_pair(path: Path) -> None:
-    if shutil.which("ssh-keygen") is None:
-        raise UnsupportedFeatureError("ssh-keygen is required to create sandbox SSH keys")
-    try:
-        subprocess.run(("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "thunder-sandbox", "-f", str(path)), check=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        raise SandboxFailedError(f"could not generate sandbox SSH key: {exc.stderr.decode(errors='replace').strip()}") from exc
-
-
-def _write_key(path: Path, content: str, mode: int) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    try: os.write(descriptor, content.encode("utf-8"))
-    finally: os.close(descriptor)
-
-
 def _path_segment(value: str) -> str:
     from urllib.parse import quote
     if not value: raise InvalidRequestError("sandbox ID cannot be empty")
@@ -401,6 +362,9 @@ def _remote_command(args: Sequence[str], *, workdir: str | None, env: Mapping[st
 
 def _scp_command(connection: SSHConnection, recursive: bool) -> list[str]:
     command = ["scp", "-i", str(connection.private_key_path), "-P", str(connection.port), "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    # Copies authenticate the same way sessions do.
+    if connection.certificate_path is not None:
+        command.extend(("-o", f"CertificateFile={connection.certificate_path}"))
     if recursive: command.append("-r")
     return command
 
