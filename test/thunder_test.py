@@ -281,7 +281,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             process = mock.Mock(
                 stdin=mock.Mock(), stdout=mock.Mock(), stderr=mock.Mock(), returncode=0
             )
-            process.wait = mock.AsyncMock()
+            process.wait_closed = mock.AsyncMock()
             connection = mock.Mock()
             connection.create_process = mock.AsyncMock(return_value=process)
             with mock.patch.object(
@@ -455,7 +455,7 @@ class SynchronousSandboxTest(unittest.TestCase):
                     pass
 
             raw = mock.Mock(stdin=Writer(), stdout=Reader(), stderr=Reader(), returncode=0)
-            raw.wait = mock.AsyncMock()
+            raw.wait_closed = mock.AsyncMock()
             remote = AsyncProcess(raw)
             asynchronous.exec = mock.AsyncMock(return_value=remote)  # type: ignore[method-assign]
             try:
@@ -465,6 +465,34 @@ class SynchronousSandboxTest(unittest.TestCase):
                 self.assertEqual(process.wait(), 0)
             finally:
                 client.close()
+
+    def test_wait_does_not_consume_process_output(self) -> None:
+        async def exercise() -> None:
+            class Reader:
+                def __init__(self, value: str) -> None:
+                    self.value = value
+
+                async def read(self, n=-1):
+                    value, self.value = self.value, ""
+                    return value
+
+            raw = mock.Mock(
+                stdin=mock.Mock(),
+                stdout=Reader("stdout"),
+                stderr=Reader("stderr"),
+                returncode=0,
+            )
+            raw.wait = mock.AsyncMock()
+            raw.wait_closed = mock.AsyncMock()
+            process = AsyncProcess(raw)
+
+            self.assertEqual(await process.wait(), 0)
+            self.assertEqual(await process.stdout.read(), "stdout")
+            self.assertEqual(await process.stderr.read(), "stderr")
+            raw.wait.assert_not_awaited()
+            raw.wait_closed.assert_awaited_once_with()
+
+        asyncio.run(exercise())
 
     def test_async_timeout_propagates_through_sync_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

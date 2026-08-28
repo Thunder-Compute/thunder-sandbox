@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Generic, TypeVar
 
@@ -37,7 +38,9 @@ class Process(Generic[T]):
 
     async def wait(self, *, timeout: float | None = None) -> int:
         resolved_timeout = self._timeout if timeout is None else timeout
-        await self._process.wait(timeout=resolved_timeout)
+        await asyncio.wait_for(
+            self._process.wait_closed(), timeout=resolved_timeout
+        )
         return self._process.returncode
 
     async def terminate(self) -> None:
