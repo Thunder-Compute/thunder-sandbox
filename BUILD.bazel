@@ -3,11 +3,9 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 py_library(
     name = "thunder_client",
     srcs = glob([
-        "src/*.py",
-        "thunder_sandbox/*.py",
+        "thunder_sandbox/**/*.py",
     ]),
     data = [
-        "src/py.typed",
         "thunder_sandbox/py.typed",
     ],
     imports = ["."],

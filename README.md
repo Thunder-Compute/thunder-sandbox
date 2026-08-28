@@ -5,13 +5,12 @@ small, typed Python API.
 
 Thunder Sandbox uses the same account and credentials as the Thunder CLI. It
 handles sandbox lifecycle, SSH key creation, readiness polling, command
-execution, uploads, and downloads without adding any runtime Python
-dependencies.
+execution, uploads, and downloads through one synchronous and asynchronous
+Python API.
 
 ## Installation
 
-Thunder Sandbox requires Python 3.10 or newer and the system `ssh`, `scp`, and
-`ssh-keygen` executables.
+Thunder Sandbox requires Python 3.10 or newer.
 
 ```bash
 pip install thunder-sandbox
@@ -30,7 +29,7 @@ tnr login
 ```
 
 Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
-`TNR_API_URL`.
+`TNR_API_URL`. API endpoints must use HTTPS.
 
 ## Quick start
 
@@ -174,8 +173,9 @@ files against an existing sandbox.
 
 ## Async API
 
-`AsyncSandbox` exposes the same lifecycle and remote-operation primitives for
-async applications:
+Every blocking operation has an awaitable `_async` twin on the same public
+class. This makes it possible to use one import and pass `Client`, `Sandbox`,
+and `Process` objects between synchronous and asynchronous application code:
 
 ```python
 import asyncio
@@ -183,19 +183,19 @@ import thunder_sandbox as thunder
 
 
 async def main() -> None:
-    sandbox = await thunder.AsyncSandbox.create(
+    sandbox = await thunder.Sandbox.create_async(
         gpu_type=thunder.GPUType.A6000,
         gpu_count=1,
     )
     try:
-        await sandbox.wait_until_ready()
-        process = await sandbox.exec("nvidia-smi")
-        exit_code = await process.wait()
+        await sandbox.wait_until_ready_async()
+        process = await sandbox.exec_async("nvidia-smi")
+        exit_code = await process.wait_async()
         if exit_code != 0:
-            raise RuntimeError(process.stderr.read())
-        print(process.stdout.read())
+            raise RuntimeError(await process.stderr.read_async())
+        print(await process.stdout.read_async())
     finally:
-        await sandbox.terminate()
+        await sandbox.terminate_async()
 
 
 asyncio.run(main())

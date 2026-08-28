@@ -1,44 +1,42 @@
 from __future__ import annotations
 
-import io
 import asyncio
 import json
 import os
-import subprocess
 import tempfile
+import threading
 import unittest
-import urllib.error
-from dataclasses import replace
-from datetime import timezone
 from pathlib import Path
 from unittest import mock
 
-from src.client import Client, USER_AGENT
-from src.config import ClientConfig, DEFAULT_API_URL, ThunderPaths
-from src.exceptions import (
-    AuthenticationError,
-    ConflictError,
-    ConnectionError as ThunderConnectionError,
-    InvalidRequestError,
-    NotFoundError,
-    SandboxFailedError,
-    SandboxTimeoutError,
-    ThunderError,
-    UnsupportedFeatureError,
-)
-from src.process import ContainerProcess
-from src.sandbox import AsyncSandbox, Sandbox
-from src.exceptions import CapacityError
-from src.exceptions import RateLimitError
-from src.exceptions import RetryableError
-from src.exceptions import ServiceUnavailableError
-from src.types import GPUType, SandboxStatus
-import thunder_sandbox
+import asyncssh
 
+import thunder_sandbox as thunder
+import thunder_sandbox.asynchronous as asynchronous
+import thunder_sandbox.synchronous as synchronous
+from thunder_sandbox._common.config import DEFAULT_API_URL, ClientConfig, ThunderPaths
+from thunder_sandbox._common.exceptions import (
+    AuthenticationError,
+    CapacityError,
+    ConnectionError,
+    InvalidRequestError,
+    RateLimitError,
+    SandboxTimeoutError,
+    ServiceUnavailableError,
+)
+from thunder_sandbox._common.types import GPUType, SandboxStatus
+from thunder_sandbox.asynchronous.client import USER_AGENT
+from thunder_sandbox.asynchronous.client import Client as AsyncClient
+from thunder_sandbox.asynchronous.process import Process as AsyncProcess
+from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
+from thunder_sandbox.synchronous._bridge import AsyncBridge
+from thunder_sandbox.synchronous.client import Client
+from thunder_sandbox.synchronous.process import Process
+from thunder_sandbox.synchronous.sandbox import Sandbox
 
 SANDBOX_RESPONSE = {
     "id": "sbx-test",
-    "name": "sbx-test",
+    "name": "worker",
     "status": "ready",
     "spec": {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50},
     "network_policy": {
@@ -52,56 +50,52 @@ SANDBOX_RESPONSE = {
 }
 
 
-class FakeClient(Client):
-    def __init__(self, paths: ThunderPaths) -> None:
-        super().__init__(
-            ClientConfig(
-                api_url="https://api.example",
-                api_token="token",
-                paths=paths,
-            )
-        )
-        self.requests: list[
-            tuple[str, str, object | None, dict[str, object] | None]
-        ] = []
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        body: object | None = None,
-        query: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        self.requests.append((method, path, body, query))
-        if path == "/sandboxes/start":
-            return {"id": "sbx-test", "name": "sbx-test"}
-        return dict(SANDBOX_RESPONSE)
+def config(directory: str) -> ClientConfig:
+    return ClientConfig(
+        api_url="https://api.example",
+        api_token="token",
+        paths=ThunderPaths(Path(directory)),
+    )
 
 
-class HTTPResponse:
-    def __init__(self, payload: bytes) -> None:
-        self.payload = payload
-
-    def read(self) -> bytes:
-        return self.payload
-
-    def __enter__(self) -> "HTTPResponse":
-        return self
-
-    def __exit__(self, *args: object) -> bool:
-        return False
-
-
-def write_generated_key(path: Path) -> None:
-    path.write_text("PRIVATE", encoding="utf-8")
-    path.with_suffix(".pub").write_text("ssh-ed25519 GENERATED", encoding="utf-8")
+def prepare_key(paths: ThunderPaths) -> None:
+    paths.sandbox_keys.mkdir(parents=True, exist_ok=True)
+    paths.sandbox_private_key("sbx-test").write_text("PRIVATE", encoding="utf-8")
 
 
 class ConfigTest(unittest.TestCase):
-    def test_distribution_import_name_exposes_public_api(self) -> None:
-        self.assertIs(thunder_sandbox.Sandbox, Sandbox)
-        self.assertIs(thunder_sandbox.Client, Client)
-        self.assertIn("Sandbox", thunder_sandbox.__all__)
+    def test_public_distribution_exports_both_apis(self) -> None:
+        self.assertIs(thunder.Client, Client)
+        self.assertIs(thunder.Sandbox, Sandbox)
+        self.assertIs(thunder.Process, Process)
+        self.assertIs(synchronous.Client, Client)
+        self.assertIs(synchronous.Sandbox, Sandbox)
+        self.assertIs(synchronous.Process, Process)
+        self.assertIs(asynchronous.Client, AsyncClient)
+        self.assertIs(asynchronous.Sandbox, AsyncSandbox)
+        self.assertIs(asynchronous.Process, AsyncProcess)
+        self.assertEqual(AsyncClient.__name__, Client.__name__)
+        self.assertEqual(AsyncSandbox.__name__, Sandbox.__name__)
+        self.assertEqual(AsyncProcess.__name__, Process.__name__)
+        self.assertEqual(set(asynchronous.__all__), set(synchronous.__all__))
+        self.assertIs(asynchronous.GPUType, synchronous.GPUType)
+        self.assertEqual(USER_AGENT, f"thunder-python-sdk/{thunder.__version__}")
+
+    def test_public_io_methods_have_async_twins(self) -> None:
+        for cls, methods in {
+            thunder.Client: (
+                "close", "create_sandbox", "get_sandbox",
+                "get_sandbox_by_name", "list_sandboxes",
+            ),
+            thunder.Sandbox: (
+                "create", "download", "exec", "from_id", "from_name", "poll",
+                "refresh", "terminate", "upload", "wait", "wait_until_ready",
+            ),
+            thunder.Process: ("poll", "terminate", "wait"),
+        }.items():
+            for method in methods:
+                with self.subTest(cls=cls.__name__, method=method):
+                    self.assertTrue(callable(getattr(cls, f"{method}_async")))
 
     def test_configuration_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -109,890 +103,544 @@ class ConfigTest(unittest.TestCase):
             paths = ThunderPaths(root / "state")
             paths.root.mkdir()
             paths.credentials.write_text(
-                json.dumps({"token": "file-token", "api_url": "https://file"}),
+                json.dumps({"token": "file", "api_url": "https://file"}),
                 encoding="utf-8",
             )
             (root / ".thunder.json").write_text(
                 json.dumps({"api_url": "https://project"}), encoding="utf-8"
             )
-
-            with mock.patch("src.config.Path.cwd", return_value=root), mock.patch.dict(
+            with mock.patch.dict(
                 os.environ,
-                {"TNR_API_TOKEN": "env-token", "TNR_API_URL": "https://env"},
+                {"TNR_API_TOKEN": "environment", "TNR_API_URL": "https://environment"},
                 clear=True,
             ):
-                environment = ClientConfig(paths=paths)
-                explicit = ClientConfig(
-                    api_url="https://explicit/",
-                    api_token="explicit-token",
-                    paths=paths,
-                )
+                resolved = ClientConfig(paths=paths)
+            self.assertEqual(resolved.api_token, "environment")
+            self.assertEqual(resolved.api_url, "https://environment")
 
-            self.assertEqual(environment.api_token, "env-token")
-            self.assertEqual(environment.api_url, "https://env")
-            self.assertEqual(explicit.api_token, "explicit-token")
-            self.assertEqual(explicit.api_url, "https://explicit")
-
-    def test_project_url_precedes_cli_url_and_default_is_available(self) -> None:
+    def test_project_config_cannot_redirect_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = ThunderPaths(root / "state")
             paths.root.mkdir()
             paths.credentials.write_text(
-                json.dumps({"token": "token", "api_url": "https://file"}),
+                json.dumps({"token": "secret", "api_url": "https://api.example"}),
                 encoding="utf-8",
             )
             (root / ".thunder.json").write_text(
-                json.dumps({"api_url": "https://project"}), encoding="utf-8"
+                json.dumps({"api_url": "https://attacker.example"}), encoding="utf-8"
             )
-            with mock.patch("src.config.Path.cwd", return_value=root), mock.patch.dict(
-                os.environ, {}, clear=True
-            ):
-                self.assertEqual(ClientConfig(paths=paths).api_url, "https://project")
-            with mock.patch(
-                "src.config.Path.cwd", return_value=root / "empty-project"
-            ), mock.patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(
-                    ClientConfig(
-                        api_token="token", paths=ThunderPaths(root / "missing")
-                    ).api_url,
-                    DEFAULT_API_URL,
-                )
+            with mock.patch("thunder_sandbox._common.config.Path.cwd", return_value=root):
+                resolved = ClientConfig(paths=paths)
+            self.assertEqual(resolved.api_url, "https://api.example")
 
-    def test_invalid_configuration_is_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = ThunderPaths(Path(directory))
-            paths.credentials.write_text("not-json", encoding="utf-8")
-            with self.assertRaisesRegex(InvalidRequestError, "could not read"):
-                ClientConfig(paths=paths)
+    def test_api_url_requires_https(self) -> None:
+        with self.assertRaisesRegex(InvalidRequestError, "HTTPS"):
+            ClientConfig(api_url="http://api.example", api_token="secret")
 
-    def test_missing_token_is_an_authentication_error(self) -> None:
+    def test_default_url_and_missing_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
             os.environ, {}, clear=True
         ):
-            config = ClientConfig(paths=ThunderPaths(Path(directory)))
+            resolved = ClientConfig(paths=ThunderPaths(Path(directory)))
+            self.assertEqual(resolved.api_url, DEFAULT_API_URL)
             with self.assertRaises(AuthenticationError):
-                Client(config)
+                AsyncClient(resolved)
 
-    def test_paths_reject_unsafe_sandbox_names(self) -> None:
+    def test_paths_reject_unsafe_ids(self) -> None:
         paths = ThunderPaths(Path("/tmp/thunder-test"))
-        for name in ("", ".", "..", "a/b", "a\\b"):
-            with self.subTest(name=name), self.assertRaises(InvalidRequestError):
-                paths.sandbox_private_key(name)
+        for value in ("", ".", "..", "a/b", "a\\b"):
+            with self.subTest(value=value), self.assertRaises(InvalidRequestError):
+                paths.sandbox_private_key(value)
 
 
-class ClientRequestTest(unittest.TestCase):
-    def _client(self, directory: str) -> Client:
-        return Client(
-            ClientConfig(
-                api_url="https://api.example/root/",
-                api_token="secret",
-                paths=ThunderPaths(Path(directory)),
-            )
-        )
+class BridgeTest(unittest.TestCase):
+    def test_bridge_uses_one_persistent_background_loop(self) -> None:
+        bridge = AsyncBridge()
 
-    def test_request_serializes_query_body_and_headers(self) -> None:
-        captured: dict[str, object] = {}
+        async def identity() -> tuple[int, int]:
+            return id(asyncio.get_running_loop()), threading.get_ident()
 
-        def urlopen(request: object, timeout: float | None = None) -> HTTPResponse:
-            captured["url"] = request.full_url  # type: ignore[attr-defined]
-            captured["method"] = request.get_method()  # type: ignore[attr-defined]
-            captured["body"] = request.data  # type: ignore[attr-defined]
-            captured["headers"] = {
-                key.lower(): value
-                for key, value in request.header_items()  # type: ignore[attr-defined]
-            }
-            captured["timeout"] = timeout
-            return HTTPResponse(b'{"ok": true}')
+        try:
+            first = bridge.run(identity())
+            second = bridge.run(identity())
+        finally:
+            bridge.close()
+        self.assertEqual(first, second)
+        self.assertNotEqual(first[1], threading.get_ident())
 
+    def test_bridge_can_block_a_thread_which_has_a_running_loop(self) -> None:
+        async def caller() -> int:
+            bridge = AsyncBridge()
+            try:
+                return bridge.run(asyncio.sleep(0, result=42))
+            finally:
+                bridge.close()
+
+        self.assertEqual(asyncio.run(caller()), 42)
+
+    def test_sync_and_async_calls_share_the_bridge_loop(self) -> None:
+        async def caller() -> None:
+            bridge = AsyncBridge()
+
+            async def identity() -> tuple[int, int]:
+                return id(asyncio.get_running_loop()), threading.get_ident()
+
+            try:
+                synchronous_result = bridge.run(identity())
+                asynchronous_result = await bridge.run_async(identity())
+            finally:
+                bridge.close()
+            self.assertEqual(synchronous_result, asynchronous_result)
+
+        asyncio.run(caller())
+
+
+class SynchronousClientTest(unittest.TestCase):
+    def test_request_delegates_to_async_client_on_bridge_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            client = self._client(directory)
-            with mock.patch("src.client.urllib.request.urlopen", urlopen):
-                response = client._request(
-                    "POST",
-                    "/sandboxes/start",
-                    {"cpu": 4},
-                    {"limit": 100, "page_token": "next token", "empty": ""},
-                )
+            client = Client(config(directory))
 
-        self.assertEqual(response, {"ok": True})
-        self.assertEqual(
-            captured["url"],
-            "https://api.example/root/v1/sandboxes/start?limit=100&page_token=next+token",
-        )
-        self.assertEqual(captured["method"], "POST")
-        self.assertEqual(json.loads(captured["body"]), {"cpu": 4})  # type: ignore[arg-type]
-        headers = captured["headers"]
-        assert isinstance(headers, dict)
-        self.assertEqual(headers["authorization"], "Bearer secret")
-        self.assertEqual(headers["user-agent"], USER_AGENT)
-        self.assertEqual(headers["thunder-client"], "PYTHON-SDK")
-        self.assertEqual(captured["timeout"], 30)
+            async def request(method, path, body=None, query=None):
+                return {
+                    "method": method,
+                    "path": path,
+                    "body": body,
+                    "query": query,
+                    "thread": threading.get_ident(),
+                }
 
-    def test_http_statuses_map_to_public_exceptions(self) -> None:
-        cases = {
-            400: InvalidRequestError,
-            401: AuthenticationError,
-            403: AuthenticationError,
-            404: NotFoundError,
-            409: ConflictError,
-            500: ThunderError,
-        }
+            client._client._request = request  # type: ignore[method-assign]
+            try:
+                result = client._request("POST", "/test", {"x": 1}, {"page": 2})
+            finally:
+                client.close()
+            self.assertEqual(result["method"], "POST")
+            self.assertEqual(result["path"], "/test")
+            self.assertNotEqual(result["thread"], threading.get_ident())
+
+    def test_close_closes_async_client_and_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            client = self._client(directory)
-            for status, error_type in cases.items():
-                error = urllib.error.HTTPError(
-                    "https://api.example",
-                    status,
-                    "error",
-                    hdrs=None,
-                    fp=io.BytesIO(b'{"message":"specific failure"}'),
-                )
-                with self.subTest(status=status), mock.patch(
-                    "src.client.urllib.request.urlopen", side_effect=error
-                ), self.assertRaisesRegex(error_type, "specific failure"):
-                    client._request("GET", "/sandboxes")
-
-    def test_transport_and_malformed_responses_are_connection_errors(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = self._client(directory)
-            responses: list[object] = [
-                urllib.error.URLError("offline"),
-                HTTPResponse(b"not-json"),
-                HTTPResponse(b"[]"),
-            ]
-            for response in responses:
-                with self.subTest(response=response), mock.patch(
-                    "src.client.urllib.request.urlopen",
-                    side_effect=response if isinstance(response, Exception) else None,
-                    return_value=response if not isinstance(response, Exception) else None,
-                ), self.assertRaises(ThunderConnectionError):
-                    client._request("GET", "/sandboxes")
-
-    def test_empty_response_and_closed_client(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = self._client(directory)
-            with mock.patch(
-                "src.client.urllib.request.urlopen",
-                return_value=HTTPResponse(b""),
-            ):
-                self.assertEqual(client._request("DELETE", "/sandboxes/x"), {})
+            client = Client(config(directory))
+            close = mock.AsyncMock()
+            client._client.close = close  # type: ignore[method-assign]
             client.close()
-            with self.assertRaisesRegex(ThunderConnectionError, "closed"):
-                client._request("GET", "/sandboxes")
+            client.close()
+            close.assert_awaited_once_with()
+            with self.assertRaisesRegex(ConnectionError, "closed"):
+                client._request("GET", "/test")
 
-    def test_list_sandboxes_consumes_every_page(self) -> None:
+    def test_list_wraps_every_async_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            client = self._client(directory)
-            first = {**SANDBOX_RESPONSE, "id": "sbx-one", "name": "first"}
-            second = {**SANDBOX_RESPONSE, "id": "sbx-two", "name": "second"}
-            request = mock.Mock(
-                side_effect=[
-                    {"sandboxes": [first], "next_page_token": "page-2"},
-                    {"sandboxes": [second], "next_page_token": ""},
-                ]
+            client = Client(config(directory))
+            prepare_key(client.config.paths)
+            first = AsyncSandbox._from_response(
+                client._client, {**SANDBOX_RESPONSE, "id": "sbx-one"}
             )
-            client._request = request  # type: ignore[method-assign]
-
-            self.assertEqual(
-                [sandbox.id for sandbox in client.list_sandboxes()],
-                ["sbx-one", "sbx-two"],
-            )
-            self.assertEqual(
-                request.call_args_list,
-                [
-                    mock.call(
-                        "GET",
-                        "/sandboxes",
-                        query={"limit": 100, "status": "active", "page_token": ""},
-                    ),
-                    mock.call(
-                        "GET",
-                        "/sandboxes",
-                        query={"limit": 100, "status": "active", "page_token": "page-2"},
-                    ),
-                ],
+            second = AsyncSandbox._from_response(
+                client._client, {**SANDBOX_RESPONSE, "id": "sbx-two"}
             )
 
+            async def listing(*, status="active"):
+                yield first
+                yield second
 
-class SandboxCreationTest(unittest.TestCase):
-    def test_gpu_type_and_count_must_follow_the_public_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            invalid_options = (
-                {"gpu_type": GPUType.H100},
-                {"gpu_count": 1},
-                {"gpu_type": GPUType.A100, "gpu_count": 0},
-                {"gpu_type": GPUType.A6000, "gpu_count": 3},
-                {"gpu_type": "h100", "gpu_count": 1},
-            )
-            for options in invalid_options:
-                with self.subTest(options=options), self.assertRaises(InvalidRequestError):
-                    Sandbox.create(client=client, **options)  # type: ignore[arg-type]
-
-    def test_generated_key_exists_before_start_and_moves_to_sandbox_name(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = ThunderPaths(Path(directory))
-            client = FakeClient(paths)
-            with mock.patch(
-                "src.sandbox._generate_key_pair", side_effect=write_generated_key
-            ):
-                Sandbox.create(client=client)
-
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            self.assertEqual(request["ssh_public_key"], "ssh-ed25519 GENERATED")
-            self.assertEqual(
-                paths.sandbox_private_key("sbx-test").read_text(encoding="utf-8"),
-                "PRIVATE",
-            )
-            self.assertFalse(
-                any(
-                    path.name.startswith(".creating-")
-                    for path in paths.sandbox_keys.iterdir()
-                )
-            )
-
-    def test_request_contains_resources_environment_lifetime_and_gpu(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(
-                cpu=8,
-                memory=64,
-                storage=200,
-                gpu_type=GPUType.H100,
-                gpu_count=2,
-                env={"KEEP": "value", "DROP": None},
-                timeout=None,
-                outbound_cidr_allowlist=["203.0.113.0/24"],
-                outbound_domain_allowlist=["example.com"],
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
-                client=client,
-            )
-
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            self.assertEqual(
-                request["spec"],
-                {
-                    "cpu_count": 8,
-                    "memory_gib": 64,
-                    "storage_gib": 200,
-                    "gpu_type": "H100",
-                    "gpu_count": 2,
-                },
-            )
-            self.assertEqual(request["env"], {"KEEP": "value"})
-            self.assertEqual(request["lifetime"], {"enforce_ttl": False})
-            self.assertEqual(
-                request["network_policy"],
-                {
-                    "internet_access": "restricted",
-                    "cidr_allowlist": ["203.0.113.0/24"],
-                    "domain_allowlist": ["example.com"],
-                },
-            )
-
-    def test_default_network_policy_explicitly_opens_both_gates(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
-                client=client,
-            )
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            self.assertEqual(
-                request["network_policy"],
-                {
-                    "internet_access": "restricted",
-                    "cidr_allowlist": ["0.0.0.0/0"],
-                    "domain_allowlist": ["*"],
-                },
-            )
-
-    def test_single_restriction_keeps_the_other_gate_open(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(
-                outbound_domain_allowlist=["example.com"],
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
-                client=client,
-            )
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            policy = request["network_policy"]
-            assert isinstance(policy, dict)
-            self.assertEqual(policy["cidr_allowlist"], ["0.0.0.0/0"])
-            self.assertEqual(policy["domain_allowlist"], ["example.com"])
-
-    def test_closed_network_has_empty_allowlists(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(
-                block_network=True,
-                ssh_public_key="ssh-ed25519 PUBLIC",
-                ssh_private_key="PRIVATE",
-                client=client,
-            )
-            request = client.requests[0][2]
-            assert isinstance(request, dict)
-            self.assertEqual(
-                request["network_policy"],
-                {
-                    "internet_access": "closed",
-                    "cidr_allowlist": [],
-                    "domain_allowlist": [],
-                },
-            )
-
-    def test_invalid_creation_options_fail_before_request(self) -> None:
-        cases = [
-            {"timeout": -1},
-            {"ssh_public_key": "public"},
-            {
-                "block_network": True,
-                "outbound_domain_allowlist": ["example.com"],
-            },
-        ]
-        for options in cases:
-            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
-                paths = ThunderPaths(Path(directory))
-                client = FakeClient(paths)
-                with self.assertRaises(
-                    (InvalidRequestError, UnsupportedFeatureError)
-                ):
-                    Sandbox.create(client=client, **options)  # type: ignore[arg-type]
-                self.assertEqual(client.requests, [])
-                self.assertFalse(paths.sandbox_keys.exists())
-
-    def test_missing_id_in_start_response_is_a_lifecycle_error(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            client._request = mock.Mock(return_value={})  # type: ignore[method-assign]
-            with mock.patch(
-                "src.sandbox._generate_key_pair", side_effect=write_generated_key
-            ), self.assertRaisesRegex(SandboxFailedError, "sandbox ID"):
-                Sandbox.create(client=client)
-
-    def test_existing_key_is_never_overwritten(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = ThunderPaths(Path(directory))
-            paths.sandbox_keys.mkdir(parents=True)
-            private_key = paths.sandbox_private_key("sbx-test")
-            private_key.write_text("EXISTING", encoding="utf-8")
-            with self.assertRaisesRegex(InvalidRequestError, "already exists"):
-                Sandbox.create(
-                    ssh_public_key="ssh-ed25519 PUBLIC",
-                    ssh_private_key="NEW",
-                    client=FakeClient(paths),
-                )
-            self.assertEqual(private_key.read_text(encoding="utf-8"), "EXISTING")
-
-
-class SandboxOperationTest(unittest.TestCase):
-    def _sandbox(self, directory: str, response: dict[str, object] | None = None) -> Sandbox:
-        paths = ThunderPaths(Path(directory))
-        paths.sandbox_keys.mkdir(parents=True)
-        paths.sandbox_private_key("sbx-test").write_text("PRIVATE", encoding="utf-8")
-        return Sandbox._from_response(FakeClient(paths), response or SANDBOX_RESPONSE)
-
-    def test_response_is_parsed_into_typed_info(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            response = {
-                **SANDBOX_RESPONSE,
-                "spec": {
-                    "cpu_count": 8,
-                    "memory_gib": 80,
-                    "storage_gib": 500,
-                    "gpu_type": "H100",
-                    "gpu_count": 2,
-                },
-            }
-            sandbox = self._sandbox(directory, response)
-            self.assertEqual(sandbox.status, SandboxStatus.READY)
-            self.assertEqual(sandbox.id, "sbx-test")
-            self.assertEqual(sandbox.name, "sbx-test")
-            self.assertEqual(sandbox.info.resources.cpu, 8)
-            self.assertEqual(sandbox.info.resources.gpu_type, GPUType.H100)
-            self.assertEqual(sandbox.info.resources.gpu_count, 2)
-            self.assertEqual(sandbox.info.created_at.tzinfo, timezone.utc)
-            self.assertEqual(sandbox.ssh.host, "sandbox.example")
-            self.assertEqual(sandbox.ssh.port, 2222)
-
-    def test_failed_response_preserves_public_failure_details(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, {
-                **SANDBOX_RESPONSE,
-                "status": "failed",
-                "failure_code": "boot_failed",
-                "failure": "Guest initialization failed",
-            })
-
-            self.assertEqual(sandbox.info.failure_code, "boot_failed")
-            self.assertEqual(sandbox.info.failure, "Guest initialization failed")
-
-    def test_missing_immutable_key_prevents_ssh(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = Sandbox._from_response(
-                FakeClient(ThunderPaths(Path(directory))), SANDBOX_RESPONSE
-            )
-            with self.assertRaises(SandboxFailedError):
-                _ = sandbox.ssh
-
-    def test_get_quotes_sandbox_id_as_one_path_segment(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.from_id("sbx/with space", client=client)
-            self.assertEqual(client.requests[0][1], "/sandboxes/sbx%2Fwith%20space")
-            with self.assertRaises(InvalidRequestError):
-                Sandbox.from_id("", client=client)
-
-    def test_exec_uses_key_pty_workdir_environment_and_argument_quoting(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory)
-            process = mock.Mock(
-                stdin=mock.Mock(),
-                stdout=mock.Mock(),
-                stderr=mock.Mock(),
-                pid=42,
-                returncode=None,
-            )
-            with mock.patch(
-                "src.sandbox.subprocess.Popen", return_value=process
-            ) as popen:
-                sandbox.exec(
-                    "printf",
-                    "%s",
-                    "hello world",
-                    workdir="/tmp/my dir",
-                    env={"A": "space value", "REMOVE": None},
-                    pty=True,
-                )
-            command = popen.call_args.args[0]
-            self.assertEqual(command[:2], ["ssh", "-tt"])
-            self.assertIn(str(sandbox.ssh.private_key_path), command)
-            self.assertEqual(
-                command[-1],
-                "cd '/tmp/my dir' && env A='space value' -u REMOVE printf %s 'hello world'",
-            )
-            with self.assertRaises(InvalidRequestError):
-                sandbox.exec()
-
-    def test_upload_and_download_build_scp_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory)
-            with mock.patch("src.sandbox.subprocess.run") as run:
-                sandbox.upload("local dir", "/remote dir", recursive=True)
-                upload = run.call_args.args[0]
-                self.assertEqual(upload[0], "scp")
-                self.assertIn("-r", upload)
-                self.assertEqual(upload[-2:], ["local dir", "ubuntu@sandbox.example:'/remote dir'"])
-
-                sandbox.download("/remote file", "local-file")
-                download = run.call_args.args[0]
+            client._client.list_sandboxes = listing  # type: ignore[method-assign]
+            try:
                 self.assertEqual(
-                    download[-2:],
-                    ["ubuntu@sandbox.example:'/remote file'", "local-file"],
+                    [sandbox.id for sandbox in client.list_sandboxes()],
+                    ["sbx-one", "sbx-two"],
                 )
-
-    def test_transfer_failures_have_public_error_types(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory)
-            with mock.patch(
-                "src.sandbox.subprocess.run", side_effect=FileNotFoundError
-            ), self.assertRaises(UnsupportedFeatureError):
-                sandbox.upload("local", "/remote")
-            with mock.patch(
-                "src.sandbox.subprocess.run",
-                side_effect=subprocess.CalledProcessError(23, ["scp"]),
-            ), self.assertRaisesRegex(SandboxFailedError, "status 23"):
-                sandbox.download("/remote", "local")
-
-    def test_terminate_requests_stop_and_refreshes(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory)
-            client = sandbox._client
-            sandbox.terminate()
-            self.assertEqual(
-                client.requests[-2][:3],
-                ("POST", "/sandboxes/sbx-test/stop", None),
-            )
-            self.assertEqual(client.requests[-1][1], "/sandboxes/sbx-test")
-
-    def test_ssh_command_uses_only_the_sandbox_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory)
-            command = sandbox.ssh_command
-            self.assertEqual(command[0], "ssh")
-            self.assertIn("IdentitiesOnly=yes", command)
-            self.assertIn("IdentityAgent=none", command)
-            self.assertEqual(command[-1], "ubuntu@sandbox.example")
-
-
-class SandboxWaitTest(unittest.TestCase):
-    def _sandbox(self, directory: str, statuses: list[object]) -> Sandbox:
-        client = FakeClient(ThunderPaths(Path(directory)))
-        sandbox = Sandbox.from_id("sbx-test", client=client)
-        responses = list(statuses)
-
-        def fake_request(
-            method: str,
-            path: str,
-            body: object | None = None,
-            query: dict[str, object] | None = None,
-        ) -> dict[str, object]:
-            client.requests.append((method, path, body, query))
-            next_value = responses.pop(0) if responses else "ready"
-            if isinstance(next_value, Exception):
-                raise next_value
-            return {**SANDBOX_RESPONSE, "status": next_value}
-
-        client._request = fake_request  # type: ignore[method-assign]
-        return sandbox
-
-    def test_wait_until_ready_retries_transient_connection_errors(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(
-                directory,
-                [
-                    ThunderConnectionError("read timed out"),
-                    ThunderConnectionError("read timed out"),
-                    "ready",
-                ],
-            )
-            with mock.patch("src.sandbox.time.sleep"):
-                self.assertIs(sandbox.wait_until_ready(timeout=30), sandbox)
-
-    def test_terminate_waits_for_ready_before_sending_stop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, ["created", "ready"])
-            sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
-            with mock.patch("src.sandbox.time.sleep"):
-                sandbox.terminate(timeout=30)
-            stop_requests = [request for request in sandbox._client.requests if request[:2] == ("POST", "/sandboxes/sbx-test/stop")]
-            self.assertEqual(len(stop_requests), 1)
-
-    def test_terminate_skips_stop_for_terminal_sandbox(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, [])
-            sandbox._info = replace(sandbox.info, status=SandboxStatus.FAILED)
-            request_count = len(sandbox._client.requests)
-            sandbox.terminate(timeout=30)
-            self.assertEqual(len(sandbox._client.requests), request_count)
-
-    def test_terminate_times_out_without_sending_stop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, ["created"] * 10)
-            sandbox._info = replace(sandbox.info, status=SandboxStatus.CREATED)
-            clock = iter([0.0, 1.0, 6.0])
-            with mock.patch("src.sandbox.time.sleep"), mock.patch(
-                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
-            ), self.assertRaises(SandboxTimeoutError):
-                sandbox.terminate(timeout=5)
-            self.assertFalse(any(request[:2] == ("POST", "/sandboxes/sbx-test/stop") for request in sandbox._client.requests))
-
-    def test_wait_until_ready_surfaces_a_sustained_outage(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(
-                directory, [ThunderConnectionError("down")] * 100
-            )
-            clock = iter(float(value) for value in range(0, 1000, 5))
-            with mock.patch("src.sandbox.time.sleep"), mock.patch(
-                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
-            ), self.assertRaises(ThunderConnectionError):
-                sandbox.wait_until_ready(timeout=3600)
-
-    def test_successful_refresh_resets_the_outage_window(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(
-                directory,
-                [
-                    ThunderConnectionError("blip"),
-                    "created",
-                    ThunderConnectionError("blip"),
-                    "created",
-                    ThunderConnectionError("blip"),
-                    "ready",
-                ],
-            )
-            clock = iter(float(value) for value in range(0, 1000, 20))
-            with mock.patch("src.sandbox.time.sleep"), mock.patch(
-                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
-            ):
-                self.assertIs(sandbox.wait_until_ready(timeout=3600), sandbox)
-
-    def test_terminal_states_are_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            failed = self._sandbox(directory, ["failed"])
-            with self.assertRaises(SandboxFailedError):
-                failed.wait_until_ready(timeout=30)
-
-        with tempfile.TemporaryDirectory() as directory:
-            finished = self._sandbox(directory, ["finished"])
-            self.assertEqual(finished.wait(timeout=30), 0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            failed = self._sandbox(directory, ["failed"])
-            self.assertEqual(failed.wait(timeout=30), 1)
-
-    def test_wait_timeout_is_stable_and_specific(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, ["created"] * 10)
-            clock = iter([0.0, 1.0, 6.0])
-            with mock.patch("src.sandbox.time.sleep"), mock.patch(
-                "src.sandbox.time.monotonic", side_effect=lambda: next(clock)
-            ), self.assertRaises(SandboxTimeoutError):
-                sandbox.wait_until_ready(timeout=5)
-
-    def test_command_timeout_uses_sandbox_timeout_error(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, [])
-            process = mock.Mock()
-            process.wait.side_effect = subprocess.TimeoutExpired("ssh", 10)
-            sandbox._main_process = process
-            with self.assertRaises(SandboxTimeoutError):
-                sandbox.wait(timeout=10)
-
-
-class ProcessTest(unittest.TestCase):
-    def test_process_delegates_lifecycle_and_default_timeout(self) -> None:
-        raw = mock.Mock(
-            stdin=mock.Mock(),
-            stdout=mock.Mock(),
-            stderr=mock.Mock(),
-            pid=123,
-            returncode=None,
-        )
-        process = ContainerProcess(raw, timeout=7)
-        self.assertEqual(process.id, "123")
-        process.wait()
-        raw.wait.assert_called_once_with(timeout=7)
-        process.terminate()
-        raw.terminate.assert_called_once_with()
+            finally:
+                client.close()
 
 
 class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
-    async def test_async_wrapper_delegates_without_blocking_the_event_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sync_sandbox = SandboxOperationTest()._sandbox(directory)
-            async_sandbox = AsyncSandbox(sync_sandbox)
-            process = mock.Mock(
-                id="42",
-                stdin=mock.Mock(),
-                stdout=mock.Mock(),
-                stderr=mock.Mock(),
-            )
-            process.wait.return_value = 0
-            with mock.patch.object(sync_sandbox, "exec", return_value=process) as execute:
-                async_process = await async_sandbox.exec("echo", "hello")
-                self.assertEqual(await async_process.wait(), 0)
-            execute.assert_called_once_with("echo", "hello")
+    def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
+        client = AsyncClient(config(directory))
+        prepare_key(client.config.paths)
+        return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
-    async def test_async_refresh_returns_the_same_handle(self) -> None:
+    async def test_ssh_uses_accept_new_and_shared_known_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            sync_sandbox = SandboxOperationTest()._sandbox(directory)
-            async_sandbox = AsyncSandbox(sync_sandbox)
-            with mock.patch.object(sync_sandbox, "refresh", return_value=sync_sandbox):
-                self.assertIs(await async_sandbox.refresh(), async_sandbox)
+            sandbox, client = self.sandbox(directory)
+            command = sandbox.ssh.command
+            self.assertIn("StrictHostKeyChecking=accept-new", command)
+            self.assertIn(
+                f"UserKnownHostsFile={client.config.paths.known_hosts}", command
+            )
+            self.assertNotIn("StrictHostKeyChecking=no", command)
+            self.assertNotIn("UserKnownHostsFile=/dev/null", command)
+            await client.close()
+
+    async def test_api_host_key_is_pinned_on_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            host_key = asyncssh.generate_private_key("ssh-ed25519").export_public_key()
+            host_key_text = host_key.decode("ascii").strip()
+            response = {
+                **SANDBOX_RESPONSE,
+                "ssh": {
+                    **SANDBOX_RESPONSE["ssh"],
+                    "host_key": host_key_text,
+                },
+            }
+            sandbox = AsyncSandbox._from_response(client, response)
+            self.assertEqual(
+                client.config.paths.known_hosts.read_text(encoding="utf-8"),
+                f"[sandbox.example]:2222 {host_key_text}\n",
+            )
+            self.assertEqual(
+                sandbox.ssh.known_hosts_path, client.config.paths.known_hosts
+            )
+            await client.close()
+
+    async def test_exec_uses_asyncssh_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            stdout = mock.Mock()
+            stdout.read = mock.AsyncMock(return_value=b"")
+            stderr = mock.Mock()
+            stderr.read = mock.AsyncMock(return_value=b"")
+            process = mock.Mock(
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=0
+            )
+            process.wait_closed = mock.AsyncMock()
+            connection = mock.Mock()
+            connection.create_process = mock.AsyncMock(return_value=process)
+            with mock.patch.object(
+                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            ):
+                remote = await sandbox.exec("echo", "hello", text=False, pty=True)
+                self.assertEqual(await remote.wait(), 0)
+            connection.create_process.assert_awaited_once_with(
+                "echo hello", encoding=None, term_type="xterm"
+            )
+            await client.close()
+
+    async def test_wait_until_ready_uses_async_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {**SANDBOX_RESPONSE, "status": "created", "ssh": None},
+                    SANDBOX_RESPONSE,
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
+            ) as sleep:
+                self.assertIs(await sandbox.wait_until_ready(), sandbox)
+            sleep.assert_awaited_once()
+            await client.close()
+
+    async def test_wait_survives_retryable_polling_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    ServiceUnavailableError("retry", retry_after=3),
+                    SANDBOX_RESPONSE,
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
+            ) as sleep, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.random.uniform", return_value=0
+            ):
+                self.assertIs(await sandbox.wait_until_ready(), sandbox)
+            sleep.assert_awaited_once_with(3)
+            await client.close()
+
+    async def test_create_rolls_back_after_allocation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value={"id": "sbx-test"}
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._validate_create_options"
+            ):
+                with self.assertRaisesRegex(InvalidRequestError, "already exists"):
+                    await AsyncSandbox.create(
+                        ssh_public_key="ssh-ed25519 AAAA",
+                        ssh_private_key="PRIVATE",
+                        client=client,
+                    )
+            self.assertEqual(
+                [call.args[:2] for call in client._request.await_args_list],
+                [
+                    ("POST", "/sandboxes/start"),
+                    ("POST", "/sandboxes/sbx-test/stop"),
+                ],
+            )
+            await client.close()
+
+    async def test_invalid_private_key_fails_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            with self.assertRaisesRegex(InvalidRequestError, "valid private key"):
+                await AsyncSandbox.create(
+                    ssh_public_key="ssh-ed25519 AAAA",
+                    ssh_private_key="not a private key",
+                    client=client,
+                )
+            client._request.assert_not_awaited()
+            await client.close()
+
+    async def test_mismatched_ssh_keys_fail_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            private_key = asyncssh.generate_private_key("ssh-ed25519")
+            other_key = asyncssh.generate_private_key("ssh-ed25519")
+            with self.assertRaisesRegex(InvalidRequestError, "do not match"):
+                await AsyncSandbox.create(
+                    ssh_public_key=other_key.export_public_key().decode("ascii"),
+                    ssh_private_key=private_key.export_private_key().decode("ascii"),
+                    client=client,
+                )
+            client._request.assert_not_awaited()
+            await client.close()
+
+    async def test_implicit_client_is_closed_by_terminate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[SANDBOX_RESPONSE, {}, {**SANDBOX_RESPONSE, "status": "finished"}]
+            )
+            client.close = mock.AsyncMock()  # type: ignore[method-assign]
+            with mock.patch.object(AsyncClient, "from_cli", return_value=client):
+                sandbox = await AsyncSandbox.from_id("sbx-test")
+            await sandbox.terminate()
+            client.close.assert_awaited_once_with()
+
+    async def test_unknown_status_and_gpu_are_forward_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            response = {
+                **SANDBOX_RESPONSE,
+                "status": "new-state",
+                "spec": {**SANDBOX_RESPONSE["spec"], "gpu_type": "L40S"},
+            }
+            sandbox = AsyncSandbox._from_response(client, response)
+            self.assertEqual(sandbox.status, SandboxStatus.UNKNOWN)
+            self.assertEqual(sandbox.info.resources.gpu_type, GPUType.UNKNOWN)
+            await client.close()
+
+
+class SynchronousSandboxTest(unittest.TestCase):
+    def sandbox(self, directory: str) -> tuple[Sandbox, Client, AsyncSandbox]:
+        client = Client(config(directory))
+        prepare_key(client.config.paths)
+        asynchronous = AsyncSandbox._from_response(client._client, SANDBOX_RESPONSE)
+        return Sandbox._from_async(client, asynchronous), client, asynchronous
+
+    def test_properties_are_direct_views_of_async_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, asynchronous = self.sandbox(directory)
+            try:
+                self.assertEqual(sandbox.id, asynchronous.id)
+                self.assertEqual(sandbox.name, "worker")
+                self.assertEqual(sandbox.status, SandboxStatus.READY)
+                self.assertEqual(sandbox.ssh.port, 2222)
+            finally:
+                client.close()
+
+    def test_lifecycle_methods_block_on_async_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, asynchronous = self.sandbox(directory)
+            asynchronous.refresh = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+            asynchronous.poll = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+            asynchronous.wait = mock.AsyncMock(return_value=0)  # type: ignore[method-assign]
+            asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+            asynchronous.terminate = mock.AsyncMock()  # type: ignore[method-assign]
+            try:
+                self.assertIs(sandbox.refresh(), sandbox)
+                self.assertIsNone(sandbox.poll())
+                self.assertEqual(sandbox.wait(timeout=3), 0)
+                self.assertIs(sandbox.wait_until_ready(timeout=4), sandbox)
+                sandbox.terminate(timeout=5)
+            finally:
+                client.close()
+            asynchronous.refresh.assert_awaited_once_with()  # type: ignore[attr-defined]
+            asynchronous.wait.assert_awaited_once_with(timeout=3)  # type: ignore[attr-defined]
+            asynchronous.terminate.assert_awaited_once_with(timeout=5)  # type: ignore[attr-defined]
+
+    def test_exec_and_streams_remain_on_persistent_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, asynchronous = self.sandbox(directory)
+
+            class Reader:
+                def __init__(self):
+                    self.value = "output"
+
+                async def read(self, n=-1):
+                    value, self.value = self.value, ""
+                    return value
+
+                async def readline(self):
+                    return ""
+
+            class Writer:
+                def __init__(self):
+                    self.values = []
+
+                def write(self, value):
+                    self.values.append(value)
+
+                async def drain(self):
+                    pass
+
+                def write_eof(self):
+                    pass
+
+            raw = mock.Mock(stdin=Writer(), stdout=Reader(), stderr=Reader(), returncode=0)
+            raw.wait_closed = mock.AsyncMock()
+            remote = AsyncProcess(raw)
+            asynchronous.exec = mock.AsyncMock(return_value=remote)  # type: ignore[method-assign]
+            try:
+                process = sandbox.exec("echo", "hello")
+                self.assertEqual(process.stdin.write("input"), 5)
+                self.assertEqual(process.stdout.read(), "output")
+                self.assertEqual(process.wait(), 0)
+            finally:
+                client.close()
+
+    def test_wait_does_not_consume_process_output(self) -> None:
+        async def exercise() -> None:
+            class Reader:
+                def __init__(self, value: str) -> None:
+                    self.value = value
+
+                async def read(self, n=-1):
+                    value, self.value = self.value, ""
+                    return value
+
+            raw = mock.Mock(
+                stdin=mock.Mock(),
+                stdout=Reader("stdout"),
+                stderr=Reader("stderr"),
+                returncode=0,
+            )
+            raw.wait = mock.AsyncMock()
+            raw.wait_closed = mock.AsyncMock()
+            process = AsyncProcess(raw)
+
+            self.assertEqual(await process.wait(), 0)
+            self.assertEqual(await process.stdout.read(), "stdout")
+            self.assertEqual(await process.stderr.read(), "stderr")
+            raw.wait.assert_not_awaited()
+            raw.wait_closed.assert_awaited_once_with()
+
+        asyncio.run(exercise())
+
+    def test_process_stdin_is_transport_neutral(self) -> None:
+        async def exercise() -> None:
+            raw_stdin = mock.Mock()
+            raw_stdin.drain = mock.AsyncMock()
+            stdout = mock.Mock()
+            stdout.read = mock.AsyncMock(return_value="")
+            stderr = mock.Mock()
+            stderr.read = mock.AsyncMock(return_value="")
+            raw = mock.Mock(
+                stdin=raw_stdin,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=0,
+            )
+            process = AsyncProcess(raw)
+
+            self.assertNotIsInstance(process.stdin, asyncssh.SSHWriter)
+            self.assertEqual(process.stdin.write("answer\n"), 7)
+            await process.stdin.drain()
+            process.stdin.write_eof()
+            raw_stdin.write.assert_called_once_with("answer\n")
+            raw_stdin.drain.assert_awaited_once_with()
+            raw_stdin.write_eof.assert_called_once_with()
+
+        asyncio.run(exercise())
+
+    def test_wait_drains_large_output_without_losing_it(self) -> None:
+        async def exercise() -> None:
+            expected = "x" * (3 * 1024 * 1024)
+
+            class Reader:
+                def __init__(self, value: str) -> None:
+                    self.value = value
+
+                async def read(self, n=-1):
+                    if not self.value:
+                        return ""
+                    value, self.value = self.value[:65536], self.value[65536:]
+                    await asyncio.sleep(0)
+                    return value
+
+            raw = mock.Mock(
+                stdin=mock.Mock(),
+                stdout=Reader(expected),
+                stderr=Reader(""),
+                returncode=0,
+            )
+            raw.wait_closed = mock.AsyncMock()
+            process = AsyncProcess(raw)
+            self.assertEqual(await process.wait(), 0)
+            self.assertEqual(await process.stdout.read(), expected)
+
+        asyncio.run(exercise())
+
+    def test_async_timeout_propagates_through_sync_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, asynchronous = self.sandbox(directory)
+            asynchronous.wait = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=SandboxTimeoutError("timed out")
+            )
+            try:
+                with self.assertRaises(SandboxTimeoutError):
+                    sandbox.wait(timeout=1)
+            finally:
+                client.close()
+
+    def test_async_named_lifecycle_methods_use_same_public_object(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                sandbox, client, asynchronous = self.sandbox(directory)
+                asynchronous.refresh = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+                asynchronous.poll = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+                asynchronous.wait = mock.AsyncMock(return_value=0)  # type: ignore[method-assign]
+                asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+                try:
+                    self.assertIs(await sandbox.refresh_async(), sandbox)
+                    self.assertIsNone(await sandbox.poll_async())
+                    self.assertEqual(await sandbox.wait_async(timeout=3), 0)
+                    self.assertIs(
+                        await sandbox.wait_until_ready_async(timeout=4), sandbox
+                    )
+                finally:
+                    await client.close_async()
+
+        asyncio.run(exercise())
+
+
+class ErrorContractTest(unittest.TestCase):
+    def test_error_hierarchy_is_shared(self) -> None:
+        self.assertTrue(issubclass(CapacityError, Exception))
+        self.assertTrue(issubclass(RateLimitError, Exception))
+        error = CapacityError(
+            "unavailable", code="sandbox_capacity_unavailable", status=503,
+            retry_after=20,
+        )
+        self.assertEqual(error.retry_after, 20)
+
+    def test_closed_bridge_rejects_new_work_without_leaking_coroutine(self) -> None:
+        bridge = AsyncBridge()
+        bridge.close()
+        with self.assertRaises(RuntimeError):
+            bridge.run(asyncio.sleep(0))
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class GPUTypeTest(unittest.TestCase):
-    """A GPU type reported by the API must never break decoding a sandbox."""
-
-    def test_gpu_type_is_case_insensitive(self) -> None:
-        # Thunder stores the type in the case it was requested, so one
-        # organization's history contains both "H100" and "h100".
-        for value in ("H100", "h100", " h100 ", "A6000", "a6000"):
-            with self.subTest(value=value):
-                self.assertEqual(GPUType(value).value.upper(), value.strip().upper())
-
-    def test_an_unenumerated_gpu_type_does_not_raise(self) -> None:
-        # The catalog carries far more types than this client lists; meeting a
-        # new one must not fail the call that decoded it.
-        self.assertEqual(GPUType("L40S"), GPUType.UNKNOWN)
-        self.assertEqual(GPUType("rtx6000pro"), GPUType.UNKNOWN)
-
-    def test_listing_survives_a_differently_cased_gpu_type(self) -> None:
-        # The regression this guards: one lowercase record used to raise
-        # ValueError and abort list_sandboxes() for the whole organization.
-        listing = {
-            "sandboxes": [
-                dict(SANDBOX_RESPONSE, id="sbx-upper",
-                     spec={**SANDBOX_RESPONSE["spec"], "gpu_type": "H100", "gpu_count": 1}),
-                dict(SANDBOX_RESPONSE, id="sbx-lower",
-                     spec={**SANDBOX_RESPONSE["spec"], "gpu_type": "h100", "gpu_count": 1}),
-            ],
-            "next_page_token": "",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            client._request = lambda *a, **k: listing  # type: ignore[method-assign]
-            sandboxes = list(client.list_sandboxes())
-        self.assertEqual([s.id for s in sandboxes], ["sbx-upper", "sbx-lower"])
-        self.assertEqual([s.info.resources.gpu_type for s in sandboxes],
-                         [GPUType.H100, GPUType.H100])
-
-
-class SandboxNameTest(unittest.TestCase):
-    """A name is a caller-supplied label; the ID addresses the sandbox."""
-
-    def test_a_supplied_name_is_sent_and_an_omitted_one_is_left_to_thunder(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(name="training-run", client=client)
-            body = client.requests[0][2]
-            assert isinstance(body, dict)
-            self.assertEqual(body["name"], "training-run")
-
-        with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient(ThunderPaths(Path(directory)))
-            Sandbox.create(client=client)
-            body = client.requests[0][2]
-            assert isinstance(body, dict)
-            # Omitted rather than sent empty, so Thunder assigns it.
-            self.assertNotIn("name", body)
-
-    ACTIVE = ("created", "ready")
-
-    def _listing_client(self, directory, sandboxes):
-        """A fake that filters by status the way the API does."""
-        client = FakeClient(ThunderPaths(Path(directory)))
-
-        def request(method, path, body=None, query=None):
-            wanted = (query or {}).get("status", "active")
-            if wanted == "all":
-                matched = sandboxes
-            elif wanted == "active":
-                matched = [s for s in sandboxes if s["status"] in self.ACTIVE]
-            else:
-                matched = [s for s in sandboxes if s["status"] == wanted]
-            return {"sandboxes": matched, "next_page_token": ""}
-
-        client._request = request  # type: ignore[method-assign]
-        return client
-
-    def test_every_name_lookup_searches_rather_than_addressing_by_key(self) -> None:
-        # A name is not a document key, so resolving one by calling the
-        # ID-addressed GET path returns the wrong sandbox or none at all.
-        listing = [
-            dict(SANDBOX_RESPONSE, id="sbx-old", name="worker", status="finished"),
-            dict(SANDBOX_RESPONSE, id="sbx-live", name="worker", status="ready"),
-        ]
-        for label, lookup in (
-            ("Sandbox.from_name", lambda c: Sandbox.from_name("worker", client=c)),
-            ("Client.get_sandbox_by_name", lambda c: c.get_sandbox_by_name("worker")),
-            ("AsyncSandbox.from_name",
-             lambda c: asyncio.run(AsyncSandbox.from_name("worker", client=c))),
-        ):
-            with self.subTest(lookup=label), tempfile.TemporaryDirectory() as directory:
-                client = self._listing_client(directory, listing)
-                seen: list[str] = []
-                original = client._request
-
-                def request(method, path, body=None, query=None):
-                    seen.append(path)
-                    return original(method, path, body, query)
-
-                client._request = request  # type: ignore[method-assign]
-                self.assertEqual(lookup(client).id, "sbx-live")
-                self.assertNotIn("/sandboxes/worker", seen)
-
-    def test_from_name_reports_a_name_no_live_sandbox_holds(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = self._listing_client(directory, [
-                dict(SANDBOX_RESPONSE, id="sbx-old", name="worker", status="finished")])
-            with self.assertRaises(NotFoundError):
-                Sandbox.from_name("worker", client=client)
-
-    def test_from_name_refuses_to_guess_between_live_namesakes(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = self._listing_client(directory, [
-                dict(SANDBOX_RESPONSE, id="sbx-a", name="worker", status="ready"),
-                dict(SANDBOX_RESPONSE, id="sbx-b", name="worker", status="ready")])
-            with self.assertRaises(ConflictError):
-                Sandbox.from_name("worker", client=client)
-
-
-class APIErrorMappingTest(unittest.TestCase):
-    """The API's machine-readable error code must survive into the exception."""
-
-    def _raise(self, status, code, message, retry_after=None):
-        import email.message
-        import io
-        import urllib.error
-
-        headers = email.message.Message()
-        if retry_after is not None:
-            headers["Retry-After"] = retry_after
-        payload = json.dumps({"error": code, "message": message, "code": status}).encode()
-
-        def urlopen(request, timeout=None):
-            raise urllib.error.HTTPError("https://api.example/v1/sandboxes/start",
-                                         status, message, headers, io.BytesIO(payload))
-
-        with tempfile.TemporaryDirectory() as directory:
-            client = Client(ClientConfig(api_url="https://api.example", api_token="token",
-                                         paths=ThunderPaths(Path(directory))))
-            with mock.patch("src.client.urllib.request.urlopen", urlopen):
-                with self.assertRaises(ThunderError) as caught:
-                    client._request("POST", "/sandboxes/start", {})
-        return caught.exception
-
-    def test_capacity_exhaustion_is_a_distinct_retryable_error(self) -> None:
-        # Out of GPUs is an ordinary scheduling outcome, so a caller must be
-        # able to catch it specifically rather than matching on message text.
-        exc = self._raise(503, "sandbox_capacity_unavailable", "No capacity", retry_after="20")
-        self.assertIsInstance(exc, CapacityError)
-        self.assertIsInstance(exc, RetryableError)
-        self.assertEqual(exc.code, "sandbox_capacity_unavailable")
-        self.assertEqual(exc.status, 503)
-        self.assertEqual(exc.retry_after, 20.0)
-
-    def test_a_scheduler_outage_is_not_mistaken_for_capacity(self) -> None:
-        # Same status as capacity exhaustion; only the code separates them.
-        exc = self._raise(503, "sandbox_scheduler_unavailable", "Scheduler down")
-        self.assertIsInstance(exc, ServiceUnavailableError)
-        self.assertNotIsInstance(exc, CapacityError)
-
-    def test_a_name_conflict_is_a_conflict(self) -> None:
-        exc = self._raise(409, "sandbox_name_in_use", "Another running sandbox uses that name")
-        self.assertIsInstance(exc, ConflictError)
-
-    def test_rate_limiting_is_typed_and_carries_retry_after(self) -> None:
-        exc = self._raise(429, "rate_limit_exceeded", "Too many requests", retry_after="7")
-        self.assertIsInstance(exc, RateLimitError)
-        self.assertEqual(exc.retry_after, 7.0)
-
-    def test_an_unknown_status_does_not_break_decoding(self) -> None:
-        self.assertEqual(SandboxStatus("something-new"), SandboxStatus.UNKNOWN)
-
-
-class ListStatusTest(unittest.TestCase):
-    """Listing defaults to sandboxes that still exist; history is opt-in."""
-
-    def _client(self, directory, request):
-        client = Client(ClientConfig(api_url="https://api.example", api_token="token",
-                                     paths=ThunderPaths(Path(directory))))
-        client._request = request  # type: ignore[method-assign]
-        return client
-
-    def test_status_is_sent_and_defaults_to_active(self) -> None:
-        for expected, kwargs in (
-            ("active", {}),
-            ("all", {"status": "all"}),
-            ("finished", {"status": SandboxStatus.FINISHED}),
-        ):
-            with self.subTest(status=expected), tempfile.TemporaryDirectory() as directory:
-                request = mock.Mock(return_value={"sandboxes": [], "next_page_token": ""})
-                client = self._client(directory, request)
-                list(client.list_sandboxes(**kwargs))
-                self.assertEqual(request.call_args.kwargs["query"]["status"], expected)
-

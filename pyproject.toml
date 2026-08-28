@@ -13,6 +13,10 @@ authors = [
     { name = "Thunder GPU, Inc.", email = "support@thundercompute.com" },
 ]
 requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "asyncssh>=2.21.1",
+]
 keywords = ["cloud", "gpu", "sandbox", "thunder"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -34,8 +38,12 @@ Repository = "https://github.com/Thunder-Compute/thunder-sandbox"
 Issues = "https://github.com/Thunder-Compute/thunder-sandbox/issues"
 
 [tool.setuptools]
-packages = ["src", "thunder_sandbox"]
+packages = [
+    "thunder_sandbox",
+    "thunder_sandbox._common",
+    "thunder_sandbox.asynchronous",
+    "thunder_sandbox.synchronous",
+]
 
 [tool.setuptools.package-data]
-src = ["py.typed"]
 thunder_sandbox = ["py.typed"]

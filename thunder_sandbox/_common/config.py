@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .exceptions import AuthenticationError, InvalidRequestError
 
@@ -41,15 +42,16 @@ class ClientConfig:
     ) -> None:
         self.paths = paths or ThunderPaths()
         cli = _read_json(self.paths.credentials)
-        project = _read_json(Path.cwd() / ".thunder.json")
         self.api_token = api_token or os.environ.get("TNR_API_TOKEN") or cli.get("token")
         self.api_url = str(
             api_url
             or os.environ.get("TNR_API_URL")
-            or project.get("api_url")
             or cli.get("api_url")
             or DEFAULT_API_URL
         ).rstrip("/")
+        parsed_url = urlsplit(self.api_url)
+        if parsed_url.scheme != "https" or not parsed_url.netloc:
+            raise InvalidRequestError("api_url must be an absolute HTTPS URL")
 
     @classmethod
     def from_cli(cls, *, root: Path | None = None) -> "ClientConfig":
