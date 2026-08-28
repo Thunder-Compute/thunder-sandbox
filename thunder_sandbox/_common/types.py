@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .exceptions import InvalidRequestError
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -73,13 +75,24 @@ class SSHConnection:
     host: str
     port: int
     user: str
-    private_key_path: Path
+    # Where the organization credential is cached, for callers that shell out
+    # to ssh. The SDK's own connections do not read these: it holds the key and
+    # certificate as values, so a client whose cache is unwritable still works.
+    private_key_path: Path | None = None
+    certificate_path: Path | None = None
     known_hosts_path: Path | None = None
 
     @property
     def command(self) -> tuple[str, ...]:
+        if self.private_key_path is None or self.certificate_path is None:
+            raise InvalidRequestError(
+                "no SSH credential is cached on this machine; connect through "
+                "the SDK, which does not require one on disk"
+            )
         command = [
-            "ssh", "-i", str(self.private_key_path), "-p", str(self.port),
+            "ssh", "-i", str(self.private_key_path),
+            "-o", f"CertificateFile={self.certificate_path}",
+            "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
         command.extend(("-o", "StrictHostKeyChecking=accept-new"))

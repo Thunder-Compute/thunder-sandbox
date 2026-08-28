@@ -6,7 +6,6 @@ import asyncio
 import os
 import random
 import shlex
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -68,8 +67,6 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
-        ssh_public_key: str | None = None,
-        ssh_private_key: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         _validate_create_options(
@@ -79,30 +76,10 @@ class Sandbox:
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
-            ssh_public_key=ssh_public_key,
-            ssh_private_key=ssh_private_key,
         )
         owns_client = client is None
         resolved_client = client or Client.from_cli()
-        paths = resolved_client.config.paths
-        temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         try:
-            paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if ssh_public_key is None:
-                temporary_directory = tempfile.TemporaryDirectory(
-                    prefix=".creating-", dir=paths.sandbox_keys
-                )
-                temporary_key = Path(temporary_directory.name) / "key"
-                await _generate_key_pair(temporary_key)
-                public_key = temporary_key.with_suffix(".pub").read_text(
-                    encoding="utf-8"
-                ).strip()
-                private_key_source: Path | None = temporary_key
-                public_key_source: Path | None = temporary_key.with_suffix(".pub")
-            else:
-                public_key = ssh_public_key.strip()
-                private_key_source = public_key_source = None
-
             internet_access, cidrs, domains = _network_policy(
                 block_network,
                 outbound_cidr_allowlist,
@@ -133,39 +110,18 @@ class Sandbox:
                     "cidr_allowlist": cidrs,
                     "domain_allowlist": domains,
                 },
-                "ssh_public_key": public_key,
                 **({"name": name} if name is not None else {}),
             }
         except BaseException:
-            if temporary_directory is not None:
-                temporary_directory.cleanup()
             if owns_client:
                 await resolved_client.close()
             raise
         sandbox_id: str | None = None
-        private_key_created = False
-        public_key_created = False
         try:
             response = await resolved_client._request("POST", "/sandboxes/start", request)
             sandbox_id = str(response.get("id", ""))
             if not sandbox_id:
                 raise SandboxFailedError("Thunder did not return a sandbox ID")
-            private_destination = paths.sandbox_private_key(sandbox_id)
-            public_destination = paths.sandbox_public_key(sandbox_id)
-            if private_destination.exists() or public_destination.exists():
-                raise InvalidRequestError(
-                    f"SSH key already exists for sandbox {sandbox_id}"
-                )
-            if private_key_source is not None and public_key_source is not None:
-                os.replace(private_key_source, private_destination)
-                private_key_created = True
-                os.replace(public_key_source, public_destination)
-                public_key_created = True
-            else:
-                _write_key(private_destination, ssh_private_key or "", 0o600)
-                private_key_created = True
-                _write_key(public_destination, public_key + "\n", 0o644)
-                public_key_created = True
             sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
             sandbox._owns_client = owns_client
             if args:
@@ -180,18 +136,9 @@ class Sandbox:
                         sandbox_id,
                         deadline=time.monotonic() + OUTAGE_GRACE_SECONDS,
                     )
-            if public_key_created:
-                with suppress(OSError):
-                    public_destination.unlink(missing_ok=True)
-            if private_key_created:
-                with suppress(OSError):
-                    private_destination.unlink(missing_ok=True)
             if owns_client:
                 await resolved_client.close()
             raise
-        finally:
-            if temporary_directory is not None:
-                temporary_directory.cleanup()
 
     @staticmethod
     async def from_id(
@@ -263,10 +210,6 @@ class Sandbox:
         if self._info.ssh is None:
             raise SandboxFailedError(
                 "sandbox SSH connection details are not available"
-            )
-        if not self._info.ssh.private_key_path.is_file():
-            raise SandboxFailedError(
-                f"SSH private key does not exist for immutable sandbox {self.id}"
             )
         return self._info.ssh
 
@@ -380,11 +323,15 @@ class Sandbox:
                     if _known_host_is_pinned(ssh)
                     else None
                 )
+                credential = await self._client._credentials.ensure(self._client)
                 connection = await asyncssh.connect(
                     ssh.host,
                     ssh.port,
                     username=ssh.user,
-                    client_keys=[ssh.private_key_path],
+                    # The sandbox trusts the authority that signed this, not
+                    # the key itself, so the same credential opens every
+                    # sandbox the organization owns.
+                    client_keys=[(credential.key, credential.certificate)],
                     known_hosts=known_hosts,
                     agent_path=None,
                     preferred_auth=["publickey"],
@@ -530,25 +477,6 @@ class Sandbox:
                 await self._client.close()
 
 
-async def _generate_key_pair(path: Path) -> None:
-    try:
-        key = asyncssh.generate_private_key("ssh-ed25519", comment="thunder-sandbox")
-        private_key = key.export_private_key().decode("ascii")
-        public_key = key.export_public_key().decode("ascii")
-    except asyncssh.Error as exc:
-        raise SandboxFailedError(f"could not generate sandbox SSH key: {exc}") from exc
-    _write_key(path, private_key, 0o600)
-    _write_key(path.with_suffix(".pub"), public_key, 0o644)
-
-
-def _write_key(path: Path, content: str, mode: int) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    try:
-        os.write(descriptor, content.encode("utf-8"))
-    finally:
-        os.close(descriptor)
-
-
 def _path_segment(value: str) -> str:
     if not value:
         raise InvalidRequestError("sandbox ID cannot be empty")
@@ -588,7 +516,8 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             host=str(ssh_value["host"]),
             port=int(ssh_value.get("port", 22)),
             user=str(ssh_value.get("user", "ubuntu")),
-            private_key_path=paths.sandbox_private_key(sandbox_id),
+            private_key_path=paths.ssh_key,
+            certificate_path=paths.ssh_certificate,
             known_hosts_path=paths.known_hosts,
         )
         host_key = ssh_value.get("host_key")
@@ -686,28 +615,8 @@ def _validate_create_options(
     block_network: bool,
     outbound_cidr_allowlist: Sequence[str] | None,
     outbound_domain_allowlist: Sequence[str] | None,
-    ssh_public_key: str | None,
-    ssh_private_key: str | None,
 ) -> None:
-    if (ssh_public_key is None) != (ssh_private_key is None):
-        raise InvalidRequestError(
-            "ssh_public_key and ssh_private_key must be provided together"
-        )
-    if ssh_public_key is not None and not ssh_public_key.strip():
-        raise InvalidRequestError("ssh_public_key cannot be empty")
-    if ssh_private_key is not None:
-        if not ssh_private_key.strip():
-            raise InvalidRequestError("ssh_private_key cannot be empty")
-        try:
-            private_key = asyncssh.import_private_key(ssh_private_key)
-        except (asyncssh.Error, ValueError) as exc:
-            raise InvalidRequestError("ssh_private_key is not a valid private key") from exc
-        try:
-            public_key = asyncssh.import_public_key(ssh_public_key or "")
-        except (asyncssh.Error, ValueError) as exc:
-            raise InvalidRequestError("ssh_public_key is not a valid public key") from exc
-        if private_key.get_fingerprint() != public_key.get_fingerprint():
-            raise InvalidRequestError("SSH public and private keys do not match")
+
     if timeout is not None and timeout < 0:
         raise InvalidRequestError("timeout cannot be negative")
     if gpu_type is not None and not isinstance(gpu_type, GPUType):

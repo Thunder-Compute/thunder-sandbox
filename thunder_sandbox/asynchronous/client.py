@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from .credentials import CredentialStore
+
 from .._common.config import ClientConfig
 from .._common.exceptions import (
     AuthenticationError,
@@ -74,6 +76,7 @@ class Client:
         if not self.config.api_token:
             raise AuthenticationError("no authentication token found; run 'tnr login'")
         self._session: aiohttp.ClientSession | None = None
+        self._credentials = CredentialStore(self.config.paths)
         self._closed = False
 
     @classmethod

@@ -39,8 +39,6 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
-        ssh_public_key: str | None = None,
-        ssh_private_key: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         owns_client = client is None
@@ -87,8 +85,6 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
-        ssh_public_key: str | None = None,
-        ssh_private_key: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         owns_client = client is None
