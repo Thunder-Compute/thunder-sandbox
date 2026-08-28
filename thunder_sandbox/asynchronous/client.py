@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from .credentials import CredentialStore
+
 from .._common.config import ClientConfig
 from .._common.exceptions import (
     AuthenticationError,
@@ -74,6 +76,7 @@ class Client:
         if not self.config.api_token:
             raise AuthenticationError("no authentication token found; run 'tnr login'")
         self._session: aiohttp.ClientSession | None = None
+        self._credentials = CredentialStore(self.config.paths)
         self._closed = False
 
     @classmethod
@@ -155,8 +158,6 @@ class Client:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
-        ssh_public_key: str | None = None,
-        ssh_private_key: str | None = None,
     ) -> "Sandbox":
         from .sandbox import Sandbox
 
@@ -173,8 +174,6 @@ class Client:
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
-            ssh_public_key=ssh_public_key,
-            ssh_private_key=ssh_private_key,
             client=self,
         )
 

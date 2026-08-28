@@ -20,7 +20,6 @@ class ThunderPaths:
         self.root = Path(root or configured_root or Path.home() / ".thunder").expanduser()
         self.credentials = self.root / "cli_config.json"
         self.sandbox_keys = self.root / "sandbox_keys"
-        self.known_hosts = self.root / "known_hosts"
 
     def sandbox_private_key(self, name: str) -> Path:
         _validate_sandbox_name(name)
@@ -28,6 +27,21 @@ class ThunderPaths:
 
     def sandbox_public_key(self, name: str) -> Path:
         return self.sandbox_private_key(name).with_suffix(".pub")
+
+    # One key and one certificate serve every sandbox in the organization, so
+    # neither is named after a sandbox. The key is generated once on this
+    # machine and kept; only the certificate is renewed.
+    @property
+    def ssh_key(self) -> Path:
+        return self.sandbox_keys / "id_ed25519"
+
+    @property
+    def ssh_certificate(self) -> Path:
+        return self.sandbox_keys / "id_ed25519-cert.pub"
+
+    @property
+    def ssh_certificate_meta(self) -> Path:
+        return self.sandbox_keys / "id_ed25519-cert.json"
 
 
 class ClientConfig:
