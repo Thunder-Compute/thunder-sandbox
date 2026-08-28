@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 RENEWAL_MARGIN_SECONDS = 15 * 60
 
 
+_SAME_BURST_SECONDS = 60.0
+
+
 class SSHCredential:
     """A key and the certificate that authorises it, held in memory."""
 
@@ -117,7 +120,27 @@ class CredentialStore:
         *,
         replace_key: bool,
     ) -> None:
-        """Cache best effort. A client that cannot write still connects."""
+        """Cache best effort. A client that cannot write still connects.
+
+        Opening several sandboxes at once has each one mint its own
+        credential. They are all valid, so the first to arrive is written and
+        the rest are simply used from memory: no caller waits on another's
+        write, and the cache is not rewritten once per sandbox. A genuine
+        renewal, hours later, carries a later expiry and does replace it.
+        """
+        # Skip only when the cache already holds a credential that is itself
+        # usable and just as fresh, which is exactly the case where a sibling
+        # from the same burst got here first. Anything else -- an empty cache, a
+        # corrupt key, a certificate due for renewal -- is written. Asking the
+        # cache what it actually holds keeps this independent of whether some
+        # earlier write landed.
+        persisted = self._load()
+        if (
+            persisted is not None
+            and persisted.is_usable()
+            and expires_at < persisted.expires_at + _SAME_BURST_SECONDS
+        ):
+            return
         try:
             self._paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
             # Written whenever this key is new, which includes the case where a
