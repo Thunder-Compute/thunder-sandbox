@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal, overload
 
 from .client import Client
-from .exceptions import InvalidRequestError, SandboxFailedError, SandboxTimeoutError, UnsupportedFeatureError, ConnectionError
+from .exceptions import InvalidRequestError, RetryableError, SandboxFailedError, SandboxTimeoutError, UnsupportedFeatureError, ConnectionError
 from .process import AsyncContainerProcess, ContainerProcess
 from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus, SSHConnection
 
@@ -23,6 +23,8 @@ from .types import GPUType, NetworkPolicy, Resources, SandboxInfo, SandboxStatus
 # the error. Long enough to absorb a blip, short enough that a real outage does
 # not hide behind a multi-minute timeout.
 OUTAGE_GRACE_SECONDS = 30.0
+WAIT_ENDPOINT_MAX_SECONDS = 30.0
+WAIT_HTTP_GRACE_SECONDS = 5.0
 
 
 class Sandbox:
@@ -276,15 +278,42 @@ class Sandbox:
         deadline = None if timeout is None else time.monotonic() + timeout
         failing_since: float | None = None
         while True:
-            ok, failing_since = self._refresh_while_waiting(deadline, failing_since)
-            if ok:
-                if self.status == SandboxStatus.READY:
-                    return self
-                if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
-                    raise SandboxFailedError(f"sandbox {self.id} did not become ready (status: {self.status.value})")
-            if deadline is not None and time.monotonic() >= deadline:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
                 raise SandboxTimeoutError(f"sandbox {self.id} did not become ready within {timeout} seconds")
-            time.sleep(1)
+            request_wait = WAIT_ENDPOINT_MAX_SECONDS if deadline is None else min(WAIT_ENDPOINT_MAX_SECONDS, deadline - now)
+            try:
+                response = self._client._request(
+                    "GET",
+                    f"/sandboxes/{_path_segment(self.id)}/wait",
+                    query={"timeout_seconds": request_wait},
+                    timeout=request_wait + WAIT_HTTP_GRACE_SECONDS,
+                )
+            except RetryableError:
+                # A completed long poll proves the API is reachable, so any
+                # earlier transport outage is no longer continuous. (by GPT-5)
+                failing_since = None
+                continue
+            except ConnectionError:
+                now = time.monotonic()
+                started = now if failing_since is None else failing_since
+                if now - started >= OUTAGE_GRACE_SECONDS:
+                    raise
+                if deadline is not None and now >= deadline:
+                    raise
+                failing_since = started
+                retry_delay = 1.0 if deadline is None else min(1.0, deadline - now)
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                continue
+
+            failing_since = None
+            self._info = Sandbox._from_response(self._client, response)._info
+            if self.status == SandboxStatus.READY:
+                return self
+            if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
+                raise SandboxFailedError(f"sandbox {self.id} did not become ready (status: {self.status.value})")
+            raise ConnectionError("Thunder wait endpoint returned before the sandbox was ready")
 
     def terminate(self, *, timeout: float | None = 300) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout

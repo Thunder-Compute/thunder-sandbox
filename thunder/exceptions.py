@@ -25,6 +25,10 @@ class ConflictError(ThunderError):
     """The request conflicts with existing state."""
 
 
+class RetryableError(ThunderError):
+    """The API asked the client to retry the request."""
+
+
 class UnsupportedFeatureError(ThunderError):
     """The requested feature is not supported by Thunder sandboxes."""
 

@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from typing import Any, TYPE_CHECKING
 
 from .config import ClientConfig
-from .exceptions import AuthenticationError, ConflictError, ConnectionError, InvalidRequestError, NotFoundError, ThunderError
+from .exceptions import AuthenticationError, ConflictError, ConnectionError, InvalidRequestError, NotFoundError, RetryableError, ThunderError
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
@@ -29,7 +29,15 @@ class Client:
     def from_cli(cls) -> "Client":
         return cls(ClientConfig.from_cli())
 
-    def _request(self, method: str, path: str, body: object | None = None, query: dict[str, object] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        query: dict[str, object] | None = None,
+        *,
+        timeout: float | None = 30,
+    ) -> dict[str, Any]:
         if self._closed:
             raise ConnectionError("client is closed")
         url = f"{self.config.api_url}/v1{path}"
@@ -44,7 +52,7 @@ class Client:
         request.add_header("Thunder-Client", "PYTHON-SDK")
         request.add_header("User-Agent", USER_AGENT)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
             payload = exc.read()
@@ -53,7 +61,7 @@ class Client:
                 message = parsed.get("message") or f"Thunder API returned HTTP {exc.code}"
             except (json.JSONDecodeError, AttributeError):
                 message = f"Thunder API returned HTTP {exc.code}"
-            error_type = {400: InvalidRequestError, 401: AuthenticationError, 403: AuthenticationError, 404: NotFoundError, 409: ConflictError}.get(exc.code, ThunderError)
+            error_type = {400: InvalidRequestError, 401: AuthenticationError, 403: AuthenticationError, 404: NotFoundError, 408: RetryableError, 409: ConflictError}.get(exc.code, ThunderError)
             raise error_type(message) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ConnectionError(f"could not communicate with Thunder: {exc}") from exc

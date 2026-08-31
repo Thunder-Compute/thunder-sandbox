@@ -20,6 +20,7 @@ from thunder.exceptions import (
     ConnectionError as ThunderConnectionError,
     InvalidRequestError,
     NotFoundError,
+    RetryableError,
     SandboxFailedError,
     SandboxTimeoutError,
     ThunderError,
@@ -66,6 +67,8 @@ class FakeClient(Client):
         path: str,
         body: object | None = None,
         query: dict[str, object] | None = None,
+        *,
+        timeout: float | None = 30,
     ) -> dict[str, object]:
         self.requests.append((method, path, body, query))
         if path == "/sandboxes/start":
@@ -230,6 +233,7 @@ class ClientRequestTest(unittest.TestCase):
             401: AuthenticationError,
             403: AuthenticationError,
             404: NotFoundError,
+            408: RetryableError,
             409: ConflictError,
             500: ThunderError,
         }
@@ -640,6 +644,8 @@ class SandboxWaitTest(unittest.TestCase):
             path: str,
             body: object | None = None,
             query: dict[str, object] | None = None,
+            *,
+            timeout: float | None = 30,
         ) -> dict[str, object]:
             client.requests.append((method, path, body, query))
             next_value = responses.pop(0) if responses else "ready"
@@ -662,6 +668,33 @@ class SandboxWaitTest(unittest.TestCase):
             )
             with mock.patch("thunder.sandbox.time.sleep"):
                 self.assertIs(sandbox.wait_until_ready(timeout=30), sandbox)
+
+    def test_wait_until_ready_retries_the_bounded_server_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = self._sandbox(
+                directory,
+                [RetryableError("sandbox is still starting"), "ready"],
+            )
+            self.assertIs(sandbox.wait_until_ready(timeout=65), sandbox)
+            wait_requests = [
+                request
+                for request in sandbox._client.requests
+                if request[:2] == ("GET", "/sandboxes/sbx-test/wait")
+            ]
+            self.assertEqual(len(wait_requests), 2)
+            self.assertTrue(
+                all(
+                    request[3] is not None
+                    and 0 < float(request[3]["timeout_seconds"]) <= 30
+                    for request in wait_requests
+                )
+            )
+            self.assertFalse(
+                any(
+                    request[:2] == ("GET", "/sandboxes/sbx-test")
+                    for request in sandbox._client.requests[1:]
+                )
+            )
 
     def test_terminate_waits_for_ready_before_sending_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -708,9 +741,9 @@ class SandboxWaitTest(unittest.TestCase):
                 directory,
                 [
                     ThunderConnectionError("blip"),
-                    "created",
+                    RetryableError("still starting"),
                     ThunderConnectionError("blip"),
-                    "created",
+                    RetryableError("still starting"),
                     ThunderConnectionError("blip"),
                     "ready",
                 ],
@@ -737,7 +770,7 @@ class SandboxWaitTest(unittest.TestCase):
 
     def test_wait_timeout_is_stable_and_specific(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            sandbox = self._sandbox(directory, ["created"] * 10)
+            sandbox = self._sandbox(directory, [RetryableError("still starting")] * 10)
             clock = iter([0.0, 1.0, 6.0])
             with mock.patch("thunder.sandbox.time.sleep"), mock.patch(
                 "thunder.sandbox.time.monotonic", side_effect=lambda: next(clock)

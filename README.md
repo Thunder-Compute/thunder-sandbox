@@ -4,7 +4,7 @@ Create short-lived GPU sandboxes, run commands over SSH, and move files with a
 small, typed Python API.
 
 Thunder Sandbox uses the same account and credentials as the Thunder CLI. It
-handles sandbox lifecycle, SSH key creation, readiness polling, command
+handles sandbox lifecycle, SSH key creation, server-side readiness waits, command
 execution, uploads, and downloads without adding any runtime Python
 dependencies.
 
