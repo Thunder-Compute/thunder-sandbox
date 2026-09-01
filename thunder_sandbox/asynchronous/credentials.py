@@ -70,6 +70,17 @@ class CredentialStore:
         self._current = await self._mint(client, reuse=cached)
         return self._current
 
+    async def renew(self, client: "Client") -> SSHCredential:
+        """Mint a replacement for a credential the sandbox would not accept.
+
+        A cached certificate can be unexpired and still useless: signed by
+        another environment's authority, or by one that has since rotated.
+        Expiry cannot detect either, so the only evidence is the sandbox
+        refusing it.
+        """
+        self._current = await self._mint(client, reuse=self._load(), replace=True)
+        return self._current
+
     def _load(self) -> SSHCredential | None:
         """Adopt the cached credential. Any damage means mint a fresh one."""
         try:
@@ -90,7 +101,11 @@ class CredentialStore:
         return SSHCredential(key, certificate, expires_at)
 
     async def _mint(
-        self, client: "Client", *, reuse: SSHCredential | None
+        self,
+        client: "Client",
+        *,
+        reuse: SSHCredential | None,
+        replace: bool = False,
     ) -> SSHCredential:
         # Reuse the cached key so this machine keeps one identity; only the
         # certificate authorising it is short lived.
@@ -109,7 +124,9 @@ class CredentialStore:
         except (asyncssh.Error, ValueError) as exc:
             raise SandboxError(f"Thunder returned an unusable SSH certificate: {exc}") from exc
         expires_at = _expiry(response)
-        self._save(key, line, expires_at, replace_key=reuse is None)
+        self._save(
+            key, line, expires_at, replace_key=reuse is None, replace=replace
+        )
         return SSHCredential(key, certificate, expires_at)
 
     def _save(
@@ -119,6 +136,7 @@ class CredentialStore:
         expires_at: float,
         *,
         replace_key: bool,
+        replace: bool = False,
     ) -> None:
         """Cache best effort. A client that cannot write still connects.
 
@@ -127,16 +145,19 @@ class CredentialStore:
         the rest are simply used from memory: no caller waits on another's
         write, and the cache is not rewritten once per sandbox. A genuine
         renewal, hours later, carries a later expiry and does replace it.
+        A replacement for a certificate the sandbox refused is written even
+        when its expiry is no later: the cached one is the one that failed.
         """
         # Skip only when the cache already holds a credential that is itself
         # usable and just as fresh, which is exactly the case where a sibling
         # from the same burst got here first. Anything else -- an empty cache, a
-        # corrupt key, a certificate due for renewal -- is written. Asking the
-        # cache what it actually holds keeps this independent of whether some
-        # earlier write landed.
+        # corrupt key, a certificate due for renewal, a refused certificate --
+        # is written. Asking the cache what it actually holds keeps this
+        # independent of whether some earlier write landed.
         persisted = self._load()
         if (
-            persisted is not None
+            not replace
+            and persisted is not None
             and persisted.is_usable()
             and expires_at < persisted.expires_at + _SAME_BURST_SECONDS
         ):
