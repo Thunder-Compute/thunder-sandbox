@@ -127,8 +127,7 @@ sandbox.download("/home/ubuntu/checkpoints", "checkpoints", recursive=True)
 
 ## Network policies
 
-Sandboxes have unrestricted outbound access by default. Restriction is always
-explicit:
+Sandboxes have unrestricted outbound access by default. Restriction is always explicit:
 
 ```python
 # No outbound internet access.
@@ -141,8 +140,26 @@ restricted = thunder.Sandbox.create(
 )
 ```
 
-CIDR and domain allowlists are independent. Supply both when restricted
-workloads need both direct IP and DNS-based access.
+CIDR and domain allowlists are independent. Supply both when restricted workloads need both direct IP and DNS-based access.
+
+For policy updates, `None` leaves that dimension unrestricted, while an empty sequence blocks it. Each call replaces the complete policy rather than merging with the previous allowlists.
+
+Replace the complete outbound policy of a running sandbox with the same options used at creation:
+
+```python
+# Permit package downloads while blocking other destinations.
+restricted.update_network_policy(
+    outbound_domain_allowlist=["pypi.org", "files.pythonhosted.org"],
+)
+
+# Block all outbound network access.
+restricted.update_network_policy(block_network=True)
+
+# Restore unrestricted outbound access.
+restricted.update_network_policy()
+```
+
+`update_network_policy()` returns after Thunder accepts the desired policy; enforcement on the sandbox's node converges asynchronously. Tightening a policy blocks new connections but does not currently guarantee that already-established connections are terminated.
 
 ## Environment and lifetime
 

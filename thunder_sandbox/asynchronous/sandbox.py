@@ -9,6 +9,7 @@ import shlex
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, overload
@@ -43,7 +44,7 @@ OUTAGE_GRACE_SECONDS = 30.0
 
 
 class Sandbox:
-    """A native asynchronous handle to an immutable Thunder sandbox."""
+    """A native asynchronous handle to a Thunder sandbox."""
 
     def __init__(
         self, client: Client, info: SandboxInfo, *, owns_client: bool = False
@@ -82,7 +83,7 @@ class Sandbox:
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
-            internet_access, cidrs, domains = _network_policy(
+            internet_access, cidrs, domains = _network_policy_request(
                 block_network,
                 outbound_cidr_allowlist,
                 outbound_domain_allowlist,
@@ -310,6 +311,50 @@ class Sandbox:
                 await self._discard_connection(connection)
             raise SandboxFailedError(f"could not download with SCP: {exc}") from exc
 
+    async def update_network_policy(
+        self,
+        *,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+    ) -> None:
+        """Replace this running sandbox's outbound network policy.
+
+        The call returns once Thunder accepts the desired policy. Enforcement on
+        the sandbox's node converges asynchronously. ``None`` leaves an allowlist
+        dimension unrestricted; an empty sequence blocks that dimension.
+        """
+        _validate_network_policy_options(
+            block_network=block_network,
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+        )
+        internet_access, cidrs, domains = _network_policy_request(
+            block_network,
+            outbound_cidr_allowlist,
+            outbound_domain_allowlist,
+        )
+        response = await self._client._request(
+            "PATCH",
+            f"/sandboxes/{_path_segment(self.id)}/network-policy",
+            {
+                "network_policy": {
+                    "internet_access": internet_access,
+                    "cidr_allowlist": cidrs,
+                    "domain_allowlist": domains,
+                }
+            },
+        )
+        policy = response.get("network_policy")
+        if not isinstance(policy, dict) or not policy.get("internet_access"):
+            raise SandboxFailedError(
+                "Thunder did not return the accepted sandbox network policy"
+            )
+        self._info = replace(
+            self._info,
+            network_policy=_network_policy_from_response(policy),
+        )
+
     async def _connect(self) -> asyncssh.SSHClientConnection:
         connection = self._connection
         if connection is not None and not connection.is_closed():
@@ -527,9 +572,6 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     spec_value = response.get("spec")
     spec: dict[str, object] = spec_value if isinstance(spec_value, dict) else {}
     policy_value = response.get("network_policy")
-    policy: dict[str, object] = (
-        policy_value if isinstance(policy_value, dict) else {}
-    )
     gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
     ssh_value = response.get("ssh")
     ssh = None
@@ -555,13 +597,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             gpu_type=gpu_type,
             gpu_count=int(str(spec.get("gpu_count", 0))),
         ),
-        network_policy=NetworkPolicy(
-            internet_access=str(policy.get("internet_access", "closed")),
-            outbound_cidr_allowlist=_string_tuple(policy.get("cidr_allowlist")),
-            outbound_domain_allowlist=_string_tuple(
-                policy.get("domain_allowlist")
-            ),
-        ),
+        network_policy=_network_policy_from_response(policy_value),
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
         ssh=ssh,
@@ -576,6 +612,15 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
+
+
+def _network_policy_from_response(value: object) -> NetworkPolicy:
+    policy: dict[str, object] = value if isinstance(value, dict) else {}
+    return NetworkPolicy(
+        internet_access=str(policy.get("internet_access", "closed")),
+        outbound_cidr_allowlist=_string_tuple(policy.get("cidr_allowlist")),
+        outbound_domain_allowlist=_string_tuple(policy.get("domain_allowlist")),
+    )
 
 
 def _known_host_name(ssh: SSHConnection) -> str:
@@ -634,19 +679,36 @@ def _validate_create_options(
         raise InvalidRequestError("gpu_type and gpu_count must be provided together")
     if gpu_count is not None and gpu_count not in (1, 2, 4, 8):
         raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
-    if block_network and (outbound_cidr_allowlist or outbound_domain_allowlist):
+    _validate_network_policy_options(
+        block_network=block_network,
+        outbound_cidr_allowlist=outbound_cidr_allowlist,
+        outbound_domain_allowlist=outbound_domain_allowlist,
+    )
+
+
+def _validate_network_policy_options(
+    *,
+    block_network: bool,
+    outbound_cidr_allowlist: Sequence[str] | None,
+    outbound_domain_allowlist: Sequence[str] | None,
+) -> None:
+    if block_network and (
+        outbound_cidr_allowlist is not None or outbound_domain_allowlist is not None
+    ):
         raise InvalidRequestError(
             "network allowlists cannot be combined with block_network"
         )
 
 
-def _network_policy(
+def _network_policy_request(
     block_network: bool,
     outbound_cidr_allowlist: Sequence[str] | None,
     outbound_domain_allowlist: Sequence[str] | None,
 ) -> tuple[str, list[str], list[str]]:
     if block_network:
         return "closed", [], []
+    if outbound_cidr_allowlist is None and outbound_domain_allowlist is None:
+        return "open", [], []
     cidrs = (
         list(outbound_cidr_allowlist)
         if outbound_cidr_allowlist is not None

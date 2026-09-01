@@ -93,8 +93,18 @@ class ConfigTest(unittest.TestCase):
                 "get_sandbox_by_name", "list_sandboxes",
             ),
             thunder.Sandbox: (
-                "create", "download", "exec", "from_id", "from_name", "poll",
-                "refresh", "terminate", "upload", "wait", "wait_until_ready",
+                "create",
+                "download",
+                "exec",
+                "from_id",
+                "from_name",
+                "poll",
+                "refresh",
+                "terminate",
+                "update_network_policy",
+                "upload",
+                "wait",
+                "wait_until_ready",
             ),
             thunder.Process: ("poll", "terminate", "wait"),
         }.items():
@@ -407,6 +417,92 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sandbox.info.resources.gpu_type, GPUType.UNKNOWN)
             await client.close()
 
+    async def test_update_network_policy_replaces_the_complete_policy(self) -> None:
+        cases = [
+            ("open", {}, "open", [], [], [], []),
+            ("closed", {"block_network": True}, "closed", [], [], [], []),
+            (
+                "CIDR restricted",
+                {"outbound_cidr_allowlist": ["203.0.113.7/24"]},
+                "restricted",
+                ["203.0.113.7/24"],
+                ["*"],
+                ["203.0.113.0/24"],
+                ["*"],
+            ),
+            (
+                "domain restricted",
+                {"outbound_domain_allowlist": ["PACKAGES.EXAMPLE.COM"]},
+                "restricted",
+                ["0.0.0.0/0"],
+                ["PACKAGES.EXAMPLE.COM"],
+                ["0.0.0.0/0"],
+                ["packages.example.com"],
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            try:
+                for (
+                    name,
+                    options,
+                    access,
+                    cidrs,
+                    domains,
+                    accepted_cidrs,
+                    accepted_domains,
+                ) in cases:
+                    with self.subTest(name=name):
+                        client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                            return_value={
+                                "id": sandbox.id,
+                                "network_policy": {
+                                    "internet_access": access,
+                                    "cidr_allowlist": accepted_cidrs,
+                                    "domain_allowlist": accepted_domains,
+                                },
+                            }
+                        )
+                        await sandbox.update_network_policy(**options)
+                        client._request.assert_awaited_once_with(
+                            "PATCH",
+                            "/sandboxes/sbx-test/network-policy",
+                            {
+                                "network_policy": {
+                                    "internet_access": access,
+                                    "cidr_allowlist": cidrs,
+                                    "domain_allowlist": domains,
+                                }
+                            },
+                        )
+                        self.assertEqual(
+                            sandbox.info.network_policy.internet_access, access
+                        )
+                        self.assertEqual(
+                            sandbox.info.network_policy.outbound_cidr_allowlist,
+                            tuple(accepted_cidrs),
+                        )
+                        self.assertEqual(
+                            sandbox.info.network_policy.outbound_domain_allowlist,
+                            tuple(accepted_domains),
+                        )
+            finally:
+                await client.close()
+
+    async def test_update_network_policy_rejects_closed_with_allowlists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(InvalidRequestError):
+                    await sandbox.update_network_policy(
+                        block_network=True,
+                        outbound_cidr_allowlist=[],
+                    )
+                client._request.assert_not_awaited()
+            finally:
+                await client.close()
+
 
 class SynchronousSandboxTest(unittest.TestCase):
     def sandbox(self, directory: str) -> tuple[Sandbox, Client, AsyncSandbox]:
@@ -433,17 +529,24 @@ class SynchronousSandboxTest(unittest.TestCase):
             asynchronous.poll = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
             asynchronous.wait = mock.AsyncMock(return_value=0)  # type: ignore[method-assign]
             asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+            asynchronous.update_network_policy = mock.AsyncMock()  # type: ignore[method-assign]
             asynchronous.terminate = mock.AsyncMock()  # type: ignore[method-assign]
             try:
                 self.assertIs(sandbox.refresh(), sandbox)
                 self.assertIsNone(sandbox.poll())
                 self.assertEqual(sandbox.wait(timeout=3), 0)
                 self.assertIs(sandbox.wait_until_ready(timeout=4), sandbox)
+                sandbox.update_network_policy(block_network=True)
                 sandbox.terminate(timeout=5)
             finally:
                 client.close()
             asynchronous.refresh.assert_awaited_once_with()  # type: ignore[attr-defined]
             asynchronous.wait.assert_awaited_once_with(timeout=3)  # type: ignore[attr-defined]
+            asynchronous.update_network_policy.assert_awaited_once_with(  # type: ignore[attr-defined]
+                block_network=True,
+                outbound_cidr_allowlist=None,
+                outbound_domain_allowlist=None,
+            )
             asynchronous.terminate.assert_awaited_once_with(timeout=5)  # type: ignore[attr-defined]
 
     def test_exec_and_streams_remain_on_persistent_loop(self) -> None:
@@ -588,6 +691,7 @@ class SynchronousSandboxTest(unittest.TestCase):
                 asynchronous.poll = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
                 asynchronous.wait = mock.AsyncMock(return_value=0)  # type: ignore[method-assign]
                 asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
+                asynchronous.update_network_policy = mock.AsyncMock()  # type: ignore[method-assign]
                 try:
                     self.assertIs(await sandbox.refresh_async(), sandbox)
                     self.assertIsNone(await sandbox.poll_async())
@@ -595,8 +699,16 @@ class SynchronousSandboxTest(unittest.TestCase):
                     self.assertIs(
                         await sandbox.wait_until_ready_async(timeout=4), sandbox
                     )
+                    await sandbox.update_network_policy_async(
+                        outbound_domain_allowlist=["example.com"]
+                    )
                 finally:
                     await client.close_async()
+                asynchronous.update_network_policy.assert_awaited_once_with(  # type: ignore[attr-defined]
+                    block_network=False,
+                    outbound_cidr_allowlist=None,
+                    outbound_domain_allowlist=["example.com"],
+                )
 
         asyncio.run(exercise())
 

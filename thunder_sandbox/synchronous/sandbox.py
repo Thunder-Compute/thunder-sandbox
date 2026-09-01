@@ -321,6 +321,42 @@ class Sandbox:
             self._sandbox.download(remote_path, local_path, recursive=recursive)
         )
 
+    def update_network_policy(
+        self,
+        *,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+    ) -> None:
+        """Replace this running sandbox's outbound network policy.
+
+        The call returns once Thunder accepts the desired policy. Enforcement on
+        the sandbox's node converges asynchronously. ``None`` leaves an allowlist
+        dimension unrestricted; an empty sequence blocks that dimension.
+        """
+        self._client._bridge.run(
+            self._sandbox.update_network_policy(
+                block_network=block_network,
+                outbound_cidr_allowlist=outbound_cidr_allowlist,
+                outbound_domain_allowlist=outbound_domain_allowlist,
+            )
+        )
+
+    async def update_network_policy_async(
+        self,
+        *,
+        block_network: bool = False,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+    ) -> None:
+        await self._client._bridge.run_async(
+            self._sandbox.update_network_policy(
+                block_network=block_network,
+                outbound_cidr_allowlist=outbound_cidr_allowlist,
+                outbound_domain_allowlist=outbound_domain_allowlist,
+            )
+        )
+
     def refresh(self) -> "Sandbox":
         self._client._bridge.run(self._sandbox.refresh())
         return self
