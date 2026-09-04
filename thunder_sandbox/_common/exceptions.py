@@ -79,3 +79,12 @@ class SandboxFailedError(SandboxError):
 
 class SandboxTimeoutError(SandboxError, TimeoutError):
     """A sandbox operation exceeded its timeout."""
+
+
+class _WaitWindowElapsedError(ThunderError):
+    """One bounded server-side readiness wait ended with the sandbox still starting.
+
+    This is the wait endpoint's ordinary "not yet" answer rather than a fault,
+    so it is neither retryable in the backoff sense nor public: the readiness
+    loop opens the next window at once and never lets it escape. (by claude)
+    """

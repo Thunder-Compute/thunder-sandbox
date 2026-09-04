@@ -28,6 +28,7 @@ from .._common.exceptions import (
     RetryableError,
     SandboxFailedError,
     SandboxTimeoutError,
+    _WaitWindowElapsedError,
 )
 from .._common.types import (
     GPUType,
@@ -41,6 +42,11 @@ from .client import Client
 from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
+# The API refuses a readiness wait held open longer than this per request.
+WAIT_WINDOW_MAX_SECONDS = 30.0
+# How much longer than its window one wait request may take to answer before
+# the client gives up on it, covering transit and a server that has stalled.
+WAIT_REPLY_GRACE_SECONDS = 15.0
 
 
 class Sandbox:
@@ -496,45 +502,103 @@ class Sandbox:
         self, *, timeout: float | None = 300
     ) -> "Sandbox":
         deadline = None if timeout is None else time.monotonic() + timeout
-        failing_since: float | None = None
-        poll_delay = 1.0
-        while True:
-            ok, failing_since, retry_after = await self._refresh_while_waiting(
-                deadline, failing_since
+        if not await self._wait_for_startup(deadline):
+            raise SandboxTimeoutError(
+                f"sandbox {self.id} did not become ready within {timeout} seconds"
             )
-            if ok:
-                if self.status == SandboxStatus.READY:
-                    return self
-                if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
-                    raise SandboxFailedError(
-                        f"sandbox {self.id} did not become ready (status: {self.status.value})"
-                    )
-            if deadline is not None and time.monotonic() >= deadline:
-                raise SandboxTimeoutError(
-                    f"sandbox {self.id} did not become ready within {timeout} seconds"
-                )
-            await _sleep_until_next_poll(deadline, poll_delay, retry_after)
-            poll_delay = min(5.0, poll_delay * 2.0)
+        if self.status == SandboxStatus.READY:
+            return self
+        raise SandboxFailedError(
+            f"sandbox {self.id} did not become ready (status: {self.status.value})"
+        )
+
+    async def _wait_for_startup(self, deadline: float | None) -> bool:
+        """Read the sandbox until it has left ``created``.
+
+        Prefers the API's blocking wait, which answers the moment the sandbox
+        is ready, and polls when the API predates it. Every attempt is bounded
+        on this side: each wait request carries its own window and HTTP
+        timeout, faults retry with backoff inside the outage grace period, and
+        ``deadline`` caps the whole. Returns ``False`` when the deadline passes
+        with the sandbox still starting; the caller owns the message. (by claude)
+        """
+
+        def expired() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
+
+        failing_since: float | None = None
+        delay = 1.0
+        while True:
+            try:
+                await self._read_startup_state(deadline)
+            except _WaitWindowElapsedError:
+                # A full server-side window passed with the sandbox still
+                # starting. That is the wait's normal answer, not a fault, so
+                # open the next window at once: a pause here would be the one
+                # place readiness could arrive unnoticed.
+                failing_since = None
+                delay = 1.0
+                if expired():
+                    return False
+            except (ConnectionError, RetryableError) as exc:
+                now = time.monotonic()
+                failing_since = now if failing_since is None else failing_since
+                if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                    raise
+                if deadline is not None and now >= deadline:
+                    raise
+                await _sleep_until_next_poll(deadline, delay, exc.retry_after)
+                delay = min(5.0, delay * 2.0)
+            else:
+                failing_since = None
+                if self.status != SandboxStatus.CREATED:
+                    return True
+                if expired():
+                    return False
+                # Only a poll answers while the sandbox is still starting, so
+                # pace the next one. The sleep stops at the deadline and one
+                # last read follows it, so readiness arriving during the
+                # pause is still seen.
+                await _sleep_until_next_poll(deadline, delay)
+                delay = min(5.0, delay * 2.0)
+
+    async def _read_startup_state(self, deadline: float | None) -> None:
+        """Refresh once, holding the request open server-side where the API allows.
+
+        Raises ``_WaitWindowElapsedError`` when the sandbox is still starting
+        at the end of the window. (by claude)
+        """
+        client = self._client
+        if not client._wait_endpoint_available:
+            await self.refresh()
+            return
+        window = _wait_window(deadline)
+        try:
+            response = await client._request(
+                "GET",
+                f"/sandboxes/{_path_segment(self.id)}/wait",
+                query={"timeout_seconds": window},
+                timeout=window + WAIT_REPLY_GRACE_SECONDS,
+            )
+        except NotFoundError:
+            # An API without the endpoint answers 404 exactly as it does for
+            # a missing sandbox, so let a plain read settle it: that raises
+            # the same NotFoundError if the sandbox is gone, and otherwise
+            # doubles as the first poll of the fallback.
+            await self.refresh()
+            client._wait_endpoint_available = False
+            return
+        self._info = _info_from_response(client.config.paths, response)
 
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            failing_since: float | None = None
-            poll_delay = 1.0
-            while self.status == SandboxStatus.CREATED:
-                ok, failing_since, retry_after = await self._refresh_while_waiting(
-                    deadline, failing_since
-                )
-                if ok and self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
-                    return
-                if deadline is not None and time.monotonic() >= deadline:
+            if self.status == SandboxStatus.CREATED:
+                if not await self._wait_for_startup(deadline):
                     raise SandboxTimeoutError(
                         f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
                     )
-                if self.status == SandboxStatus.CREATED:
-                    await _sleep_until_next_poll(deadline, poll_delay, retry_after)
-                    poll_delay = min(5.0, poll_delay * 2.0)
-            if self.status in {SandboxStatus.FAILED, SandboxStatus.FINISHED}:
+            if self.status.terminal:
                 return
             await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
@@ -720,6 +784,22 @@ def _network_policy_request(
         else ["*"]
     )
     return "restricted", cidrs, domains
+
+
+def _wait_window(deadline: float | None) -> float:
+    """Seconds to ask the API to hold one readiness wait open.
+
+    The client deadline, not the server's maximum, is the binding bound once
+    it is nearer. Rounded to the millisecond so the query string stays plain,
+    and never below one: the API rejects a window of zero, and a deadline that
+    has just passed is reported by the caller, not by a 400. (by claude)
+    """
+    window = WAIT_WINDOW_MAX_SECONDS
+    if deadline is not None:
+        window = min(window, deadline - time.monotonic())
+    window = max(0.001, round(window, 3))
+    assert 0.0 < window <= WAIT_WINDOW_MAX_SECONDS, window
+    return window
 
 
 async def _sleep_until_next_poll(

@@ -22,16 +22,19 @@ from thunder_sandbox._common.exceptions import (
     CapacityError,
     ConnectionError,
     InvalidRequestError,
+    NotFoundError,
     RateLimitError,
     SandboxError,
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
+    _WaitWindowElapsedError,
 )
 from thunder_sandbox._common.types import GPUType, SandboxStatus
-from thunder_sandbox.asynchronous.client import USER_AGENT
+from thunder_sandbox.asynchronous.client import USER_AGENT, _api_error
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
+from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import _pinned_host_key
 from thunder_sandbox.synchronous._bridge import AsyncBridge
@@ -66,6 +69,24 @@ def config(directory: str) -> ClientConfig:
 def prepare_key(paths: ThunderPaths) -> None:
     paths.sandbox_keys.mkdir(parents=True, exist_ok=True)
     paths.sandbox_private_key("sbx-test").write_text("PRIVATE", encoding="utf-8")
+
+
+def still_starting() -> _WaitWindowElapsedError:
+    """What the wait endpoint answers when its window closes on a starting sandbox."""
+    return _WaitWindowElapsedError(
+        "Sandbox is still starting. Retry the wait request.",
+        code="sandbox_wait_timeout",
+        status=408,
+        retry_after=0,
+    )
+
+
+def route_missing() -> NotFoundError:
+    """What an API that predates the wait endpoint answers, indistinguishable
+    from a missing sandbox."""
+    return NotFoundError(
+        "The requested resource was not found", code="not_found", status=404
+    )
 
 
 class ConfigTest(unittest.TestCase):
@@ -337,11 +358,68 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             await client.close()
 
-    async def test_wait_until_ready_uses_async_polling(self) -> None:
+    async def test_wait_until_ready_holds_a_server_side_wait_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[still_starting(), SANDBOX_RESPONSE]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
+            ) as sleep:
+                self.assertIs(await sandbox.wait_until_ready(), sandbox)
+            # A closed window is the wait's normal answer, so the next one
+            # opens at once: a pause is where readiness could go unnoticed.
+            sleep.assert_not_awaited()
+            self.assertEqual(client._request.await_count, 2)
+            for call in client._request.await_args_list:
+                self.assertEqual(call.args, ("GET", "/sandboxes/sbx-test/wait"))
+                window = call.kwargs["query"]["timeout_seconds"]
+                self.assertGreater(window, 0)
+                self.assertLessEqual(window, WAIT_WINDOW_MAX_SECONDS)
+                # The client decides when to give up on a request, and only
+                # after the server has had its whole window to answer.
+                self.assertGreater(call.kwargs["timeout"], window)
+            await client.close()
+
+    async def test_wait_window_is_bounded_by_the_client_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[SANDBOX_RESPONSE]
+            )
+            await sandbox.wait_until_ready(timeout=5)
+            window = client._request.await_args.kwargs["query"]["timeout_seconds"]
+            self.assertGreater(window, 0)
+            self.assertLessEqual(window, 5)
+            await client.close()
+
+    async def test_wait_until_ready_times_out_on_the_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+
+            async def hold_then_close_window(*args: object, **kwargs: object) -> None:
+                await asyncio.sleep(0.02)
+                raise still_starting()
+
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=hold_then_close_window
+            )
+            with self.assertRaisesRegex(SandboxTimeoutError, "did not become ready"):
+                await sandbox.wait_until_ready(timeout=0.1)
+            self.assertGreaterEqual(client._request.await_count, 1)
+            # Bounded by the deadline, not by an endless stream of windows.
+            self.assertLess(client._request.await_count, 20)
+            await client.close()
+
+    async def test_wait_until_ready_falls_back_to_polling_without_the_endpoint(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[
+                    route_missing(),
                     {**SANDBOX_RESPONSE, "status": "created", "ssh": None},
                     SANDBOX_RESPONSE,
                 ]
@@ -351,6 +429,75 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             ) as sleep:
                 self.assertIs(await sandbox.wait_until_ready(), sandbox)
             sleep.assert_awaited_once()
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("GET", "/sandboxes/sbx-test/wait"),
+                    ("GET", "/sandboxes/sbx-test"),
+                    ("GET", "/sandboxes/sbx-test"),
+                ],
+            )
+            # Remembered per client: the next wait polls from the start.
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[SANDBOX_RESPONSE]
+            )
+            await sandbox.wait_until_ready()
+            client._request.assert_awaited_once_with("GET", "/sandboxes/sbx-test")
+            await client.close()
+
+    async def test_wait_until_ready_reports_a_missing_sandbox(self) -> None:
+        # The endpoint's 404 looks the same for a missing route and a missing
+        # sandbox; a plain read tells them apart and is the error to surface.
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[route_missing(), route_missing()]
+            )
+            with self.assertRaises(NotFoundError):
+                await sandbox.wait_until_ready()
+            self.assertEqual(client._request.await_count, 2)
+            self.assertTrue(client._wait_endpoint_available)
+            await client.close()
+
+    async def test_wait_until_ready_fails_on_a_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[{**SANDBOX_RESPONSE, "status": "failed", "ssh": None}]
+            )
+            with self.assertRaisesRegex(SandboxFailedError, "status: failed"):
+                await sandbox.wait_until_ready()
+            await client.close()
+
+    async def test_terminate_waits_for_startup_before_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "status": "created", "ssh": None}
+            )
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    still_starting(),
+                    SANDBOX_RESPONSE,
+                    {},
+                    {**SANDBOX_RESPONSE, "status": "finished"},
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
+            ) as sleep:
+                await sandbox.terminate()
+            sleep.assert_not_awaited()
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("GET", "/sandboxes/sbx-test/wait"),
+                    ("GET", "/sandboxes/sbx-test/wait"),
+                    ("POST", "/sandboxes/sbx-test/stop"),
+                    ("GET", "/sandboxes/sbx-test"),
+                ],
+            )
+            self.assertEqual(sandbox.status, SandboxStatus.FINISHED)
             await client.close()
 
     async def test_wait_survives_retryable_polling_error(self) -> None:
@@ -711,6 +858,51 @@ class SynchronousSandboxTest(unittest.TestCase):
                 )
 
         asyncio.run(exercise())
+
+
+class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_request_timeout_bounds_one_request_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            seen: list[dict[str, object]] = []
+
+            class Response:
+                status = 200
+                headers: dict[str, str] = {}
+
+                async def read(self) -> bytes:
+                    return b"{}"
+
+                async def __aenter__(self) -> "Response":
+                    return self
+
+                async def __aexit__(self, *exc: object) -> None:
+                    return None
+
+            def request(method: str, url: str, **kwargs: object) -> Response:
+                seen.append(kwargs)
+                return Response()
+
+            session = mock.Mock()
+            session.request = request
+            client._get_session = lambda: session  # type: ignore[method-assign]
+            try:
+                await client._request("GET", "/a")
+                await client._request("GET", "/b", timeout=45)
+                await client._request("GET", "/c")
+            finally:
+                await client.close()
+            self.assertNotIn("timeout", seen[0])
+            self.assertEqual(seen[1]["timeout"].total, 45)  # type: ignore[union-attr]
+            self.assertNotIn("timeout", seen[2])
+
+    def test_closed_wait_window_maps_to_its_own_error(self) -> None:
+        error = _api_error(
+            408, "sandbox_wait_timeout", "still starting", {"Retry-After": "0"}
+        )
+        self.assertIsInstance(error, _WaitWindowElapsedError)
+        self.assertEqual(error.retry_after, 0)
+        self.assertNotIn("_WaitWindowElapsedError", thunder.__dict__)
 
 
 class ErrorContractTest(unittest.TestCase):

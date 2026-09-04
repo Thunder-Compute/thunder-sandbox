@@ -22,6 +22,7 @@ from .._common.exceptions import (
     RateLimitError,
     ServiceUnavailableError,
     ThunderError,
+    _WaitWindowElapsedError,
 )
 from .._common.types import GPUType, SandboxStatus
 from .._version import __version__
@@ -38,6 +39,7 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_already_exists": ConflictError,
     "sandbox_name_in_use": ConflictError,
     "sandbox_scheduler_rejected_request": InvalidRequestError,
+    "sandbox_wait_timeout": _WaitWindowElapsedError,
     "rate_limit_exceeded": RateLimitError,
 }
 
@@ -78,6 +80,11 @@ class Client:
         self._session: aiohttp.ClientSession | None = None
         self._credentials = CredentialStore(self.config.paths)
         self._closed = False
+        # Whether the API offers the blocking readiness wait. Assumed until a
+        # request proves otherwise, and remembered here because it is a
+        # property of the API this client talks to: an older API then costs
+        # one extra read per client rather than one per wait. (by claude)
+        self._wait_endpoint_available = True
 
     @classmethod
     def from_cli(cls) -> "Client":
@@ -104,7 +111,14 @@ class Client:
         path: str,
         body: object | None = None,
         query: dict[str, object] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        """Send one API request.
+
+        ``timeout`` bounds this request alone, in seconds, for calls the server
+        deliberately holds open longer than the session default allows. (by claude)
+        """
         session = self._get_session()
         url = f"{self.config.api_url}/v1{path}"
         params = (
@@ -112,8 +126,16 @@ class Client:
             if query
             else None
         )
+        # None means the session default; aiohttp treats an explicit None as
+        # "no timeout at all", which is never what a caller here wants.
+        assert timeout is None or timeout > 0, timeout
+        options = (
+            {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout is not None else {}
+        )
         try:
-            async with session.request(method, url, json=body, params=params) as response:
+            async with session.request(
+                method, url, json=body, params=params, **options
+            ) as response:
                 payload = await response.read()
                 if response.status >= 400:
                     code = None
