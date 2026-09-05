@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import tarfile
 from datetime import datetime, timezone
 import time
 import threading
@@ -27,6 +28,7 @@ from thunder_sandbox._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
+    UnsupportedFeatureError,
 )
 from thunder_sandbox._common.types import GPUType, SandboxStatus
 from thunder_sandbox.asynchronous.client import USER_AGENT
@@ -34,6 +36,7 @@ from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import _pinned_host_key
+from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
 from thunder_sandbox.synchronous._bridge import AsyncBridge
 from thunder_sandbox.synchronous.client import Client
 from thunder_sandbox.synchronous.process import Process
@@ -68,17 +71,27 @@ def prepare_key(paths: ThunderPaths) -> None:
     paths.sandbox_private_key("sbx-test").write_text("PRIVATE", encoding="utf-8")
 
 
+def canonical_context(root: Path):
+    return _create_canonical_build_context(
+        root, root / ".thunder" / "image_build_contexts"
+    )
+
+
 class ConfigTest(unittest.TestCase):
     def test_public_distribution_exports_both_apis(self) -> None:
         self.assertIs(thunder.Client, Client)
         self.assertIs(thunder.Sandbox, Sandbox)
         self.assertIs(thunder.Process, Process)
+        self.assertIs(thunder.Image, Image)
+        self.assertIs(thunder.ResolvedImage, ResolvedImage)
         self.assertIs(synchronous.Client, Client)
         self.assertIs(synchronous.Sandbox, Sandbox)
         self.assertIs(synchronous.Process, Process)
         self.assertIs(asynchronous.Client, AsyncClient)
         self.assertIs(asynchronous.Sandbox, AsyncSandbox)
         self.assertIs(asynchronous.Process, AsyncProcess)
+        self.assertIs(asynchronous.Image, Image)
+        self.assertIs(synchronous.Image, Image)
         self.assertEqual(AsyncClient.__name__, Client.__name__)
         self.assertEqual(AsyncSandbox.__name__, Sandbox.__name__)
         self.assertEqual(AsyncProcess.__name__, Process.__name__)
@@ -90,7 +103,7 @@ class ConfigTest(unittest.TestCase):
         for cls, methods in {
             thunder.Client: (
                 "close", "create_sandbox", "get_sandbox",
-                "get_sandbox_by_name", "list_sandboxes",
+                "get_sandbox_by_name", "list_sandboxes", "resolve_image",
             ),
             thunder.Sandbox: (
                 "create",
@@ -169,6 +182,155 @@ class ConfigTest(unittest.TestCase):
                 paths.sandbox_private_key(value)
 
 
+class ImageTest(unittest.TestCase):
+    def test_registry_image_accepts_public_or_complete_private_credentials(
+        self,
+    ) -> None:
+        public = Image.from_registry("ubuntu:24.04")
+        private = Image.from_registry(
+            "registry.example.com/team/image:latest",
+            username="user",
+            password="secret",
+        )
+
+        self.assertEqual(repr(public), "Image.from_registry('ubuntu:24.04')")
+        self.assertNotIn("secret", repr(private))
+        self.assertIn("<redacted>", repr(private))
+
+    def test_registry_image_rejects_invalid_definitions(self) -> None:
+        for url, username, password in (
+            ("", None, None),
+            ("image with spaces", None, None),
+            ("private.example/image", "user", None),
+            ("private.example/image", None, "password"),
+            ("private.example/image", "", "password"),
+            ("private.example/image", "user", ""),
+        ):
+            with self.subTest(url=url, username=username, password=password):
+                with self.assertRaises(InvalidRequestError):
+                    Image.from_registry(url, username=username, password=password)
+
+    def test_dockerfile_image_requires_a_context_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = Path(directory)
+            with self.assertRaises(InvalidRequestError):
+                Image.from_dockerfile(context)
+
+            (context / "Dockerfile").write_text(
+                "FROM ubuntu:24.04\n",
+                encoding="utf-8",
+            )
+            image = Image.from_dockerfile(context)
+            self.assertEqual(
+                repr(image), f"Image.from_dockerfile({str(context.resolve())!r})"
+            )
+
+    def test_dockerfile_image_rejects_a_missing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(InvalidRequestError):
+                Image.from_dockerfile(Path(directory) / "missing")
+
+    def test_canonical_context_ignores_filesystem_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\nCOPY payload /payload\n")
+            payload = root / "payload"
+            payload.write_bytes(b"same bytes\n")
+            first = canonical_context(root)
+            try:
+                first_bytes = first.archive_path.read_bytes()
+                os.chmod(payload, 0o755)
+                os.utime(payload, (1_000_000_000, 1_100_000_000))
+                second = canonical_context(root)
+                try:
+                    self.assertEqual(first.context_hash, second.context_hash)
+                    self.assertEqual(first.recipe_hash, second.recipe_hash)
+                    self.assertEqual(first_bytes, second.archive_path.read_bytes())
+                    with tarfile.open(second.archive_path, "r:") as archive:
+                        for member in archive.getmembers():
+                            self.assertEqual(member.mtime, 0)
+                            self.assertEqual(member.uid, 0)
+                            self.assertEqual(member.gid, 0)
+                            self.assertEqual(member.mode, 0o644)
+                finally:
+                    second.close()
+            finally:
+                first.close()
+
+    def test_canonical_context_hashes_paths_and_file_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            first_path = root / "first"
+            first_path.write_bytes(b"payload")
+            first = canonical_context(root)
+            try:
+                first_path.rename(root / "second")
+                renamed = canonical_context(root)
+                try:
+                    self.assertNotEqual(first.context_hash, renamed.context_hash)
+                finally:
+                    renamed.close()
+                (root / "second").write_bytes(b"different")
+                changed = canonical_context(root)
+                try:
+                    self.assertNotEqual(first.context_hash, changed.context_hash)
+                finally:
+                    changed.close()
+            finally:
+                first.close()
+
+    def test_canonical_context_applies_dockerignore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / ".dockerignore").write_text("*.log\n!important.log\n")
+            (root / "ignored.log").write_bytes(b"ignored")
+            (root / "important.log").write_bytes(b"included")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "included.log").write_bytes(b"included by Docker semantics")
+            context = canonical_context(root)
+            try:
+                with tarfile.open(context.archive_path, "r:") as archive:
+                    self.assertEqual(
+                        [member.name for member in archive.getmembers()],
+                        [
+                            ".dockerignore",
+                            "Dockerfile",
+                            "important.log",
+                            "nested/included.log",
+                        ],
+                    )
+            finally:
+                context.close()
+
+    def test_canonical_context_rejects_symbolic_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            try:
+                (root / "link").symlink_to(root / "Dockerfile")
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            with self.assertRaisesRegex(InvalidRequestError, "symbolic links"):
+                canonical_context(root)
+
+    def test_recipe_hash_contract_is_versioned_and_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            context = canonical_context(root)
+            try:
+                self.assertRegex(context.recipe_hash, r"^sha256:[0-9a-f]{64}$")
+                self.assertEqual(
+                    context.recipe_hash,
+                    "sha256:73eb98b3b16402cc6f14c2758a2be321366e6abfb6ea6929297fe0e9a700c399",
+                )
+            finally:
+                context.close()
+
+
 class BridgeTest(unittest.TestCase):
     def test_bridge_uses_one_persistent_background_loop(self) -> None:
         bridge = AsyncBridge()
@@ -212,6 +374,22 @@ class BridgeTest(unittest.TestCase):
 
 
 class SynchronousClientTest(unittest.TestCase):
+    def test_resolve_image_delegates_to_async_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client(config(directory))
+            expected = ResolvedImage(
+                "image-id", "registry.example/image@sha256:digest", "sha256:digest"
+            )
+            client._client.resolve_image = mock.AsyncMock(return_value=expected)
+            try:
+                image = Image.from_registry("ubuntu:24.04")
+                self.assertEqual(client.resolve_image(image, timeout=42), expected)
+                client._client.resolve_image.assert_awaited_once_with(
+                    image, timeout=42
+                )
+            finally:
+                client.close()
+
     def test_request_delegates_to_async_client_on_bridge_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = Client(config(directory))
@@ -270,11 +448,229 @@ class SynchronousClientTest(unittest.TestCase):
                 client.close()
 
 
+class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
+    async def test_registry_image_is_imported_and_returned_when_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(
+                return_value={
+                    "id": "image-id",
+                    "state": "READY",
+                    "managed_reference": "managed.example/image@sha256:digest",
+                    "managed_digest": "sha256:digest",
+                }
+            )
+            try:
+                image = Image.from_registry(
+                    "private.example/image:latest", "user", "secret"
+                )
+                resolved = await client.resolve_image(image)
+                self.assertEqual(resolved.id, "image-id")
+                client._request.assert_awaited_once()
+                request = client._request.await_args
+                self.assertEqual(request.args[:2], ("POST", "/sandbox-images/from-registry"))
+                self.assertEqual(
+                    request.kwargs["body"],
+                    {
+                        "reference": "private.example/image:latest",
+                        "username": "user",
+                        "password": "secret",
+                    },
+                )
+            finally:
+                await client.close()
+
+    async def test_dockerfile_image_is_archived_uploaded_and_polled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(
+                side_effect=[
+                    {
+                        "id": "image-id",
+                        "state": "BUILDING",
+                        "upload": {
+                            "host": "203.0.113.10",
+                            "port": 32022,
+                            "username": "image-upload",
+                            "path": "/build-context.tar",
+                            "host_public_key": asyncssh.generate_private_key(
+                                "ssh-ed25519"
+                            ).export_public_key().decode("utf-8").strip(),
+                            "expires_at": "2099-01-01T00:00:00Z",
+                        },
+                    },
+                    {
+                        "id": "image-id",
+                        "state": "READY",
+                        "managed_reference": "managed.example/image@sha256:digest",
+                        "managed_digest": "sha256:digest",
+                    },
+                ]
+            )
+            client._upload_image_context = mock.AsyncMock()
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.client.asyncio.sleep",
+                    new=mock.AsyncMock(),
+                ):
+                    resolved = await client.resolve_image(Image.from_dockerfile(root))
+                self.assertEqual(resolved.id, "image-id")
+                create_call, status_call = client._request.await_args_list
+                self.assertEqual(
+                    create_call.args[:2],
+                    ("POST", "/sandbox-images/from-dockerfile"),
+                )
+                body = create_call.kwargs["body"]
+                self.assertRegex(body["recipe_hash"], r"^sha256:[0-9a-f]{64}$")
+                self.assertRegex(body["context_hash"], r"^sha256:[0-9a-f]{64}$")
+                self.assertGreater(body["archive_bytes"], 0)
+                upload_public_key = asyncssh.import_public_key(body["ssh_public_key"])
+                archived_context = client._upload_image_context.await_args.args[0]
+                upload_private_key = client._upload_image_context.await_args.kwargs[
+                    "private_key"
+                ]
+                self.assertEqual(
+                    upload_private_key.public_data, upload_public_key.public_data
+                )
+                self.assertEqual(
+                    archived_context.archive_path.parent,
+                    client.config.paths.image_build_contexts.resolve(),
+                )
+                self.assertFalse(archived_context.archive_path.exists())
+                self.assertEqual(
+                    status_call.args[:2], ("GET", "/sandbox-images/image-id")
+                )
+                client._upload_image_context.assert_awaited_once()
+            finally:
+                await client.close()
+
+    async def test_dockerfile_context_upload_uses_pinned_sftp(self) -> None:
+        class RemoteFile:
+            def __init__(self) -> None:
+                self.content = bytearray()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def write(self, data: bytes) -> None:
+                self.content.extend(data)
+
+        class SFTPClient:
+            def __init__(self, remote: RemoteFile) -> None:
+                self.remote = remote
+                self.opened: tuple[str, str] | None = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            def open(self, path: str, mode: str) -> RemoteFile:
+                self.opened = (path, mode)
+                return self.remote
+
+        class Connection:
+            def __init__(self, sftp: SFTPClient) -> None:
+                self.sftp = sftp
+                self.closed = False
+
+            def start_sftp_client(self) -> SFTPClient:
+                return self.sftp
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "context.tar"
+            archive.write_bytes(b"canonical build context")
+            context = mock.Mock(
+                archive_path=archive, archive_bytes=archive.stat().st_size
+            )
+            upload_key = asyncssh.generate_private_key("ssh-ed25519")
+            host_key = asyncssh.generate_private_key("ssh-ed25519")
+            remote = RemoteFile()
+            sftp = SFTPClient(remote)
+            connection = Connection(sftp)
+            client = AsyncClient(config(directory))
+            connect = mock.AsyncMock(return_value=connection)
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.client.asyncssh.connect", connect
+                ):
+                    await client._upload_image_context(
+                        context,
+                        {
+                            "host": "203.0.113.10",
+                            "port": 32022,
+                            "username": "image-upload",
+                            "path": "/build-context.tar",
+                            "host_public_key": host_key.export_public_key()
+                            .decode("utf-8")
+                            .strip(),
+                            "expires_at": "2099-01-01T00:00:00Z",
+                        },
+                        private_key=upload_key,
+                        deadline=None,
+                    )
+                self.assertEqual(remote.content, archive.read_bytes())
+                self.assertEqual(sftp.opened, ("/build-context.tar", "wb"))
+                self.assertTrue(connection.closed)
+                call = connect.await_args
+                self.assertEqual(call.args, ("203.0.113.10", 32022))
+                self.assertEqual(call.kwargs["username"], "image-upload")
+                self.assertEqual(call.kwargs["client_keys"], [upload_key])
+                self.assertEqual(
+                    call.kwargs["known_hosts"][0][0].public_data,
+                    host_key.public_data,
+                )
+                self.assertIsNone(call.kwargs["agent_path"])
+            finally:
+                await client.close()
+
+    async def test_failed_image_raises_the_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(
+                return_value={
+                    "id": "image-id",
+                    "state": "FAILED",
+                    "failure_code": "BUILD_FAILED",
+                    "failure": "docker build failed",
+                }
+            )
+            try:
+                with self.assertRaisesRegex(SandboxFailedError, "docker build failed"):
+                    await client.resolve_image(Image.from_registry("ubuntu:24.04"))
+            finally:
+                await client.close()
+
+
 class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
     def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
         client = AsyncClient(config(directory))
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
+
+    async def test_image_is_wired_but_rejected_until_the_api_supports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            with self.assertRaises(UnsupportedFeatureError):
+                await AsyncSandbox.create(
+                    image=Image.from_registry("ubuntu:24.04"),
+                    client=client,
+                )
+            client._request.assert_not_awaited()
+            await client.close()
 
     async def test_ssh_keeps_no_known_hosts_file(self) -> None:
         # The node reuses forwarded ports, so any entry outlives the sandbox

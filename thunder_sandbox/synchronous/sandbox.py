@@ -9,6 +9,7 @@ from typing import Literal, cast, overload
 from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
 from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
+from ..image import Image
 from .client import Client
 from .process import Process
 
@@ -36,6 +37,7 @@ class Sandbox:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: Image | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -55,6 +57,7 @@ class Sandbox:
                     storage=storage,
                     gpu_type=gpu_type,
                     gpu_count=gpu_count,
+                    image=image,
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
@@ -80,6 +83,7 @@ class Sandbox:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: Image | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -99,6 +103,7 @@ class Sandbox:
                     storage=storage,
                     gpu_type=gpu_type,
                     gpu_count=gpu_count,
+                    image=image,
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,

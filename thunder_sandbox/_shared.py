@@ -25,11 +25,12 @@ from ._common.types import (
     SandboxStatus,
     SSHConnection,
 )
+from .image import Image, ResolvedImage
 
 __all__ = [
     "AuthenticationError", "CapacityError", "ClientConfig", "ConflictError",
-    "ConnectionError", "GPUType", "InvalidRequestError", "NetworkPolicy",
-    "NotFoundError", "RateLimitError", "Resources", "RetryableError",
+    "ConnectionError", "GPUType", "Image", "InvalidRequestError", "ResolvedImage",
+    "NetworkPolicy", "NotFoundError", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError",

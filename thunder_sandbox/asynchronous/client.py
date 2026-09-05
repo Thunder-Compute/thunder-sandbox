@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator, Mapping, Sequence
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
-
-from .credentials import CredentialStore
+import asyncssh
 
 from .._common.config import ClientConfig
 from .._common.exceptions import (
@@ -20,13 +21,17 @@ from .._common.exceptions import (
     InvalidRequestError,
     NotFoundError,
     RateLimitError,
+    SandboxFailedError,
+    SandboxTimeoutError,
     ServiceUnavailableError,
     ThunderError,
 )
 from .._common.types import GPUType, SandboxStatus
 from .._version import __version__
+from .credentials import CredentialStore
 
 if TYPE_CHECKING:
+    from ..image import Image, ResolvedImage, _CanonicalBuildContext
     from .sandbox import Sandbox
 
 USER_AGENT = f"thunder-python-sdk/{__version__}"
@@ -39,6 +44,12 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_name_in_use": ConflictError,
     "sandbox_scheduler_rejected_request": InvalidRequestError,
     "rate_limit_exceeded": RateLimitError,
+    "sandbox_image_invalid_source": InvalidRequestError,
+    "sandbox_image_source_collision": ConflictError,
+    "sandbox_image_registry_unavailable": ServiceUnavailableError,
+    "sandbox_image_control_plane_unavailable": ServiceUnavailableError,
+    "sandbox_image_job_creation_failed": ServiceUnavailableError,
+    "sandbox_image_stale_attempt": ConflictError,
 }
 
 _ERROR_STATUSES: dict[int, type[ThunderError]] = {
@@ -104,6 +115,7 @@ class Client:
         path: str,
         body: object | None = None,
         query: dict[str, object] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
     ) -> dict[str, Any]:
         session = self._get_session()
         url = f"{self.config.api_url}/v1{path}"
@@ -113,7 +125,9 @@ class Client:
             else None
         )
         try:
-            async with session.request(method, url, json=body, params=params) as response:
+            async with session.request(
+                method, url, json=body, params=params, timeout=timeout
+            ) as response:
                 payload = await response.read()
                 if response.status >= 400:
                     code = None
@@ -144,6 +158,242 @@ class Client:
             raise ConnectionError("Thunder returned an unexpected response")
         return result
 
+    async def resolve_image(
+        self, image: "Image", *, timeout: float | None = 7200
+    ) -> "ResolvedImage":
+        """Build or import an image and wait until its managed image is ready."""
+        from ..image import Image, _create_canonical_build_context
+
+        if not isinstance(image, Image):
+            raise InvalidRequestError("image must be created with Image.from_*()")
+        if timeout is not None and timeout <= 0:
+            raise InvalidRequestError("image timeout must be positive or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        context = None
+        try:
+            if image._source == "registry":
+                response = await self._request(
+                    "POST",
+                    "/sandbox-images/from-registry",
+                    body={
+                        "reference": image._registry_url,
+                        "username": image._registry_username,
+                        "password": image._registry_password,
+                    },
+                    timeout=self._request_timeout(deadline),
+                )
+            else:
+                if image._context_directory is None:
+                    raise InvalidRequestError("Dockerfile image has no build context")
+                upload_key = asyncssh.generate_private_key(
+                    "ssh-ed25519", comment="thunder-image-upload"
+                )
+                upload_public_key = (
+                    upload_key.export_public_key().decode("utf-8").strip()
+                )
+                context = await asyncio.to_thread(
+                    _create_canonical_build_context,
+                    image._context_directory,
+                    self.config.paths.image_build_contexts,
+                )
+                response = await self._request(
+                    "POST",
+                    "/sandbox-images/from-dockerfile",
+                    body={
+                        "recipe_hash": context.recipe_hash,
+                        "context_hash": context.context_hash,
+                        "dockerfile_hash": context.dockerfile_hash,
+                        "build_options_hash": context.build_options_hash,
+                        "archive_bytes": context.archive_bytes,
+                        "ssh_public_key": upload_public_key,
+                    },
+                    timeout=self._request_timeout(deadline),
+                )
+                upload = response.get("upload")
+                if upload is not None:
+                    if not isinstance(upload, dict):
+                        raise ConnectionError("Thunder returned an invalid image upload")
+                    await self._upload_image_context(
+                        context,
+                        upload,
+                        private_key=upload_key,
+                        deadline=deadline,
+                    )
+                del upload_key
+            return await self._wait_for_image(response, deadline=deadline)
+        finally:
+            if context is not None:
+                await asyncio.to_thread(context.close)
+
+    def _request_timeout(
+        self, deadline: float | None
+    ) -> aiohttp.ClientTimeout | None:
+        if deadline is None:
+            return aiohttp.ClientTimeout(total=60)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SandboxTimeoutError("image preparation timed out")
+        return aiohttp.ClientTimeout(total=min(remaining, 60))
+
+    async def _upload_image_context(
+        self,
+        context: "_CanonicalBuildContext",
+        upload: dict[str, Any],
+        *,
+        private_key: asyncssh.SSHKey,
+        deadline: float | None,
+    ) -> None:
+        try:
+            host = upload["host"]
+            port = upload["port"]
+            username = upload["username"]
+            path = upload["path"]
+            host_public_key = upload["host_public_key"]
+            expires_at = upload["expires_at"]
+        except (KeyError, TypeError) as error:
+            raise ConnectionError("Thunder returned an incomplete image upload") from error
+        if (
+            not isinstance(host, str)
+            or not host
+            or host != host.strip()
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+            or username != "image-upload"
+            or path != "/build-context.tar"
+            or not isinstance(host_public_key, str)
+            or not isinstance(expires_at, str)
+        ):
+            raise ConnectionError("Thunder returned an invalid image upload")
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                raise ValueError
+            expiry_seconds = expiry.astimezone(timezone.utc).timestamp()
+        except ValueError as error:
+            raise ConnectionError("Thunder returned an invalid image upload expiry") from error
+        try:
+            host_key = asyncssh.import_public_key(host_public_key)
+            canonical_host_key = host_key.export_public_key().decode("utf-8").strip()
+        except (asyncssh.Error, UnicodeError, ValueError) as error:
+            raise ConnectionError("Thunder returned an invalid image upload host key") from error
+        if canonical_host_key != host_public_key.strip():
+            raise ConnectionError("Thunder returned an invalid image upload host key")
+
+        while True:
+            remaining = expiry_seconds - datetime.now(timezone.utc).timestamp()
+            if deadline is not None:
+                remaining = min(remaining, deadline - time.monotonic())
+            if remaining <= 0:
+                raise SandboxTimeoutError("image upload expired before it completed")
+            try:
+                await asyncio.wait_for(
+                    self._sftp_image_context(
+                        context,
+                        host=host,
+                        port=port,
+                        username=username,
+                        path=path,
+                        private_key=private_key,
+                        host_key=host_key,
+                    ),
+                    timeout=remaining,
+                )
+                return
+            except asyncio.TimeoutError as error:
+                raise SandboxTimeoutError(
+                    "image upload expired before it completed"
+                ) from error
+            except (
+                asyncssh.PermissionDenied,
+                asyncssh.HostKeyNotVerifiable,
+                asyncssh.SFTPError,
+            ) as error:
+                raise ConnectionError(
+                    f"the image builder rejected the SFTP upload: {error}"
+                ) from error
+            except (OSError, asyncssh.Error) as error:
+                remaining = expiry_seconds - datetime.now(timezone.utc).timestamp()
+                if deadline is not None:
+                    remaining = min(remaining, deadline - time.monotonic())
+                if remaining <= 1:
+                    raise ConnectionError(
+                        f"could not upload the image build context over SFTP: {error}"
+                    ) from error
+                await asyncio.sleep(min(1.0, remaining))
+
+    async def _sftp_image_context(
+        self,
+        context: "_CanonicalBuildContext",
+        *,
+        host: str,
+        port: int,
+        username: str,
+        path: str,
+        private_key: asyncssh.SSHKey,
+        host_key: asyncssh.SSHKey,
+    ) -> None:
+        connection = await asyncssh.connect(
+            host,
+            port,
+            username=username,
+            client_keys=[private_key],
+            known_hosts=([host_key], [], []),
+            agent_path=None,
+            preferred_auth=["publickey"],
+            config=None,
+        )
+        try:
+            async with connection.start_sftp_client() as sftp:
+                async with sftp.open(path, "wb") as remote:
+                    with context.archive_path.open("rb") as archive:
+                        while chunk := archive.read(1024 * 1024):
+                            await remote.write(chunk)
+        finally:
+            connection.close()
+            await connection.wait_closed()
+
+    async def _wait_for_image(
+        self, response: dict[str, Any], *, deadline: float | None
+    ) -> "ResolvedImage":
+        from ..image import ResolvedImage
+
+        while True:
+            state = response.get("state")
+            image_id = response.get("id")
+            if not isinstance(image_id, str) or not image_id:
+                raise ConnectionError("Thunder returned an invalid sandbox image ID")
+            if state == "READY":
+                reference = response.get("managed_reference")
+                digest = response.get("managed_digest")
+                if (
+                    not isinstance(reference, str)
+                    or not reference
+                    or not isinstance(digest, str)
+                    or not digest
+                ):
+                    raise ConnectionError("Thunder returned an incomplete ready image")
+                return ResolvedImage(image_id, reference, digest)
+            if state == "FAILED":
+                code = response.get("failure_code")
+                detail = response.get("failure") or "image preparation failed"
+                prefix = f"[{code}] " if code else ""
+                raise SandboxFailedError(
+                    prefix + str(detail), code=str(code) if code else None
+                )
+            if state != "BUILDING":
+                raise ConnectionError(f"Thunder returned an unknown image state: {state!r}")
+            delay = 1.0
+            if deadline is not None:
+                delay = min(delay, max(0, deadline - time.monotonic()))
+            await asyncio.sleep(delay)
+            response = await self._request(
+                "GET",
+                f"/sandbox-images/{image_id}",
+                timeout=self._request_timeout(deadline),
+            )
+
     async def create_sandbox(
         self,
         *args: str,
@@ -155,6 +405,7 @@ class Client:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: "Image | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -171,6 +422,7 @@ class Client:
             storage=storage,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
+            image=image,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
