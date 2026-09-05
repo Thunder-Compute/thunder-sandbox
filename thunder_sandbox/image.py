@@ -209,6 +209,10 @@ def _normalized_relative_path(root: Path, path: Path) -> str:
     return normalized
 
 
+def _excluded_context_path(dockerignore: _DockerIgnore, path: str) -> bool:
+    return path not in ("Dockerfile", ".dockerignore") and dockerignore.excludes(path)
+
+
 def _context_files(
     root: Path, dockerignore: _DockerIgnore, artifact_directory: Path
 ) -> list[tuple[str, Path]]:
@@ -225,11 +229,16 @@ def _context_files(
                 name
                 for name in directory_names
                 if parent / name != artifact_directory
+                and not _excluded_context_path(
+                    dockerignore, _normalized_relative_path(root, parent / name)
+                )
             ]
             for name in [*directory_names, *file_names]:
                 path = parent / name
-                metadata = path.lstat()
                 normalized = _normalized_relative_path(root, path)
+                if _excluded_context_path(dockerignore, normalized):
+                    continue
+                metadata = path.lstat()
                 existing = normalized_paths.get(normalized)
                 if existing is not None:
                     raise InvalidRequestError(
@@ -247,11 +256,6 @@ def _context_files(
                     raise InvalidRequestError(
                         f"build context can contain only regular files: {normalized}"
                     )
-                if (
-                    normalized not in ("Dockerfile", ".dockerignore")
-                    and dockerignore.excludes(normalized)
-                ):
-                    continue
                 files.append((normalized, path))
     except OSError as error:
         raise InvalidRequestError(f"could not read build context: {error}") from error

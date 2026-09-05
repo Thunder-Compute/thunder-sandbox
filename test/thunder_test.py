@@ -316,6 +316,29 @@ class ImageTest(unittest.TestCase):
             with self.assertRaisesRegex(InvalidRequestError, "symbolic links"):
                 canonical_context(root)
 
+    def test_canonical_context_skips_ignored_symbolic_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / ".dockerignore").write_text("node_modules\n*.tmp\n")
+            modules = root / "node_modules" / ".bin"
+            modules.mkdir(parents=True)
+            try:
+                (modules / "tool").symlink_to("/usr/bin/true")
+                (root / "ignored.tmp").symlink_to(root / "Dockerfile")
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            (root / "keep.txt").write_bytes(b"keep")
+            context = canonical_context(root)
+            try:
+                with tarfile.open(context.archive_path, "r:") as archive:
+                    self.assertEqual(
+                        [member.name for member in archive.getmembers()],
+                        [".dockerignore", "Dockerfile", "keep.txt"],
+                    )
+            finally:
+                context.close()
+
     def test_recipe_hash_contract_is_versioned_and_stable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
