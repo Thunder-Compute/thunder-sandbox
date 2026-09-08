@@ -1,4 +1,0 @@
-{
-  "contract": "phase1",
-  "purpose": "verify canonical context upload and Dockerfile build"
-}

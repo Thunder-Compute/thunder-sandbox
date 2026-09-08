@@ -28,7 +28,6 @@ from thunder_sandbox._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
-    UnsupportedFeatureError,
 )
 from thunder_sandbox._common.types import GPUType, SandboxStatus
 from thunder_sandbox.asynchronous.client import USER_AGENT
@@ -191,6 +190,7 @@ class ImageTest(unittest.TestCase):
             "registry.example.com/team/image:latest",
             username="user",
             password="secret",
+            display_name="Training image",
         )
 
         self.assertEqual(repr(public), "Image.from_registry('ubuntu:24.04')")
@@ -224,6 +224,12 @@ class ImageTest(unittest.TestCase):
             self.assertEqual(
                 repr(image), f"Image.from_dockerfile({str(context.resolve())!r})"
             )
+
+    def test_image_display_name_must_be_trimmed_single_line_and_bounded(self) -> None:
+        for display_name in (" image", "image\nname", "é" * 65):
+            with self.subTest(display_name=display_name):
+                with self.assertRaises(InvalidRequestError):
+                    Image.from_registry("ubuntu:24.04", display_name=display_name)
 
     def test_dockerfile_image_rejects_a_missing_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -462,7 +468,10 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 image = Image.from_registry(
-                    "private.example/image:latest", "user", "secret"
+                    "private.example/image:latest",
+                    "user",
+                    "secret",
+                    display_name="Training image",
                 )
                 resolved = await client.resolve_image(image)
                 self.assertEqual(resolved.id, "image-id")
@@ -475,6 +484,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                         "reference": "private.example/image:latest",
                         "username": "user",
                         "password": "secret",
+                        "display_name": "Training image",
                     },
                 )
             finally:
@@ -515,7 +525,9 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                     "thunder_sandbox.asynchronous.client.asyncio.sleep",
                     new=mock.AsyncMock(),
                 ):
-                    resolved = await client.resolve_image(Image.from_dockerfile(root))
+                    resolved = await client.resolve_image(
+                        Image.from_dockerfile(root, display_name="Training image")
+                    )
                 self.assertEqual(resolved.id, "image-id")
                 create_call, status_call = client._request.await_args_list
                 self.assertEqual(
@@ -526,6 +538,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 self.assertRegex(body["recipe_hash"], r"^sha256:[0-9a-f]{64}$")
                 self.assertRegex(body["context_hash"], r"^sha256:[0-9a-f]{64}$")
                 self.assertGreater(body["archive_bytes"], 0)
+                self.assertEqual(body["display_name"], "Training image")
                 upload_public_key = asyncssh.import_public_key(body["ssh_public_key"])
                 archived_context = client._upload_image_context.await_args.args[0]
                 upload_private_key = client._upload_image_context.await_args.kwargs[
@@ -660,16 +673,84 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
-    async def test_image_is_wired_but_rejected_until_the_api_supports_it(self) -> None:
+    async def test_create_waits_for_image_before_starting_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
+            image = Image.from_registry("ubuntu:24.04")
+            resolved = ResolvedImage(
+                id="a" * 64,
+                managed_reference="registry.example/image@sha256:" + "a" * 64,
+                managed_digest="sha256:" + "a" * 64,
+            )
+            events: list[str] = []
+
+            async def resolve(
+                candidate: Image, *, timeout: float | None = 7200
+            ) -> ResolvedImage:
+                self.assertIs(candidate, image)
+                self.assertEqual(timeout, 7200)
+                events.append("image-ready")
+                return resolved
+
+            async def request(
+                method: str,
+                path: str,
+                body: object | None = None,
+                **_: object,
+            ) -> dict[str, object]:
+                events.append(path)
+                if path == "/sandboxes/start":
+                    self.assertEqual(method, "POST")
+                    assert isinstance(body, dict)
+                    self.assertEqual(body["image_id"], resolved.id)
+                    return {"id": "sbx-test"}
+                return {**SANDBOX_RESPONSE, "image_id": resolved.id}
+
+            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=resolve
+            )
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=request
+            )
+            sandbox = await AsyncSandbox.create(image=image, client=client)
+            self.assertEqual(sandbox.id, "sbx-test")
+            self.assertEqual(sandbox.image_id, resolved.id)
+            self.assertEqual(
+                events,
+                ["image-ready", "/sandboxes/start", "/sandboxes/sbx-test"],
+            )
+            await client.close()
+
+    async def test_create_does_not_start_sandbox_when_image_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=SandboxFailedError("docker build failed")
+            )
             client._request = mock.AsyncMock()  # type: ignore[method-assign]
-            with self.assertRaises(UnsupportedFeatureError):
+
+            with self.assertRaisesRegex(SandboxFailedError, "docker build failed"):
                 await AsyncSandbox.create(
                     image=Image.from_registry("ubuntu:24.04"),
                     client=client,
                 )
+
             client._request.assert_not_awaited()
+            await client.close()
+
+    async def test_create_without_image_does_not_resolve_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.resolve_image = mock.AsyncMock()  # type: ignore[method-assign]
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[{"id": "sbx-test"}, SANDBOX_RESPONSE]
+            )
+
+            sandbox = await AsyncSandbox.create(client=client)
+
+            client.resolve_image.assert_not_awaited()
+            start_body = client._request.await_args_list[0].args[2]
+            self.assertNotIn("image_id", start_body)
             await client.close()
 
     async def test_ssh_keeps_no_known_hosts_file(self) -> None:

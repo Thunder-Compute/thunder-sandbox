@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-from .exceptions import InvalidRequestError
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+
+from .exceptions import InvalidRequestError
 
 
 class SandboxStatus(str, Enum):
@@ -119,3 +119,4 @@ class SandboxInfo:
     ssh: SSHConnection | None = None
     failure_code: str | None = None
     failure: str | None = None
+    image_id: str | None = None

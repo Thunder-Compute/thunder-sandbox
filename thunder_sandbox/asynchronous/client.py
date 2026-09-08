@@ -50,6 +50,8 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_image_control_plane_unavailable": ServiceUnavailableError,
     "sandbox_image_job_creation_failed": ServiceUnavailableError,
     "sandbox_image_stale_attempt": ConflictError,
+    "sandbox_image_not_ready": ConflictError,
+    "sandbox_image_failed": SandboxFailedError,
 }
 
 _ERROR_STATUSES: dict[int, type[ThunderError]] = {
@@ -173,14 +175,17 @@ class Client:
         context = None
         try:
             if image._source == "registry":
+                request_body: dict[str, object] = {
+                    "reference": image._registry_url,
+                    "username": image._registry_username,
+                    "password": image._registry_password,
+                }
+                if image._display_name is not None:
+                    request_body["display_name"] = image._display_name
                 response = await self._request(
                     "POST",
                     "/sandbox-images/from-registry",
-                    body={
-                        "reference": image._registry_url,
-                        "username": image._registry_username,
-                        "password": image._registry_password,
-                    },
+                    body=request_body,
                     timeout=self._request_timeout(deadline),
                 )
             else:
@@ -197,17 +202,20 @@ class Client:
                     image._context_directory,
                     self.config.paths.image_build_contexts,
                 )
+                request_body = {
+                    "recipe_hash": context.recipe_hash,
+                    "context_hash": context.context_hash,
+                    "dockerfile_hash": context.dockerfile_hash,
+                    "build_options_hash": context.build_options_hash,
+                    "archive_bytes": context.archive_bytes,
+                    "ssh_public_key": upload_public_key,
+                }
+                if image._display_name is not None:
+                    request_body["display_name"] = image._display_name
                 response = await self._request(
                     "POST",
                     "/sandbox-images/from-dockerfile",
-                    body={
-                        "recipe_hash": context.recipe_hash,
-                        "context_hash": context.context_hash,
-                        "dockerfile_hash": context.dockerfile_hash,
-                        "build_options_hash": context.build_options_hash,
-                        "archive_bytes": context.archive_bytes,
-                        "ssh_public_key": upload_public_key,
-                    },
+                    body=request_body,
                     timeout=self._request_timeout(deadline),
                 )
                 upload = response.get("upload")

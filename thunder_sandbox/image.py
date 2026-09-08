@@ -29,12 +29,14 @@ class Image:
     _registry_username: str | None = None
     _registry_password: str | None = None
     _context_directory: Path | None = None
+    _display_name: str | None = None
 
     @staticmethod
     def from_registry(
         url: str,
         username: str | None = None,
         password: str | None = None,
+        display_name: str | None = None,
     ) -> "Image":
         """Create an image definition from a public or private registry image."""
         if not isinstance(url, str) or not url.strip():
@@ -47,15 +49,19 @@ class Image:
             )
         if username is not None and (not username or not password):
             raise InvalidRequestError("registry username and password cannot be empty")
+        _validate_display_name(display_name)
         return Image(
             _source="registry",
             _registry_url=url.strip(),
             _registry_username=username,
             _registry_password=password,
+            _display_name=display_name,
         )
 
     @staticmethod
-    def from_dockerfile(directory_path: str | Path) -> "Image":
+    def from_dockerfile(
+        directory_path: str | Path, display_name: str | None = None
+    ) -> "Image":
         """Create an image definition from a directory containing a Dockerfile."""
         if not isinstance(directory_path, (str, Path)):
             raise InvalidRequestError("Dockerfile directory must be a path")
@@ -70,9 +76,11 @@ class Image:
                 "Dockerfile directory does not contain a Dockerfile: "
                 f"{context_directory}"
             )
+        _validate_display_name(display_name)
         return Image(
             _source="dockerfile",
             _context_directory=context_directory,
+            _display_name=display_name,
         )
 
     def __repr__(self) -> str:
@@ -80,6 +88,20 @@ class Image:
             credentials = ", credentials=<redacted>" if self._registry_username else ""
             return f"Image.from_registry({self._registry_url!r}{credentials})"
         return f"Image.from_dockerfile({str(self._context_directory)!r})"
+
+
+def _validate_display_name(display_name: str | None) -> None:
+    if display_name is None:
+        return
+    if (
+        not isinstance(display_name, str)
+        or display_name != display_name.strip()
+        or len(display_name.encode("utf-8")) > 128
+        or any(character in display_name for character in "\x00\r\n")
+    ):
+        raise InvalidRequestError(
+            "display name must be trimmed, single-line, and at most 128 bytes"
+        )
 
 
 @dataclass(frozen=True)

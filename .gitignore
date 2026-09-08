@@ -31,3 +31,10 @@ bazel-thunder-sandbox
 .vscode/
 *.swp
 *~
+
+# Local image smoke tests
+/test/phase1_image_smoke.py
+/test/phase1_image_context/
+
+# Local Modal client checkout
+/modal-client/

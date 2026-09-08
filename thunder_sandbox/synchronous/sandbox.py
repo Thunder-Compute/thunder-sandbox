@@ -43,6 +43,7 @@ class Sandbox:
         outbound_domain_allowlist: Sequence[str] | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
+        """Create a sandbox, resolving an optional image before allocation."""
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
@@ -197,6 +198,10 @@ class Sandbox:
     @property
     def status(self) -> SandboxStatus:
         return self._sandbox.status
+
+    @property
+    def image_id(self) -> str | None:
+        return self._sandbox.image_id
 
     @property
     def info(self) -> SandboxInfo:
