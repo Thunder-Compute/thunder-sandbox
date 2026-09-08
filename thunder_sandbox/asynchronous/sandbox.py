@@ -37,6 +37,7 @@ from .._common.types import (
     SandboxInfo,
     SandboxStatus,
     SSHConnection,
+    SSHCertificateIdentity,
 )
 from .client import Client
 from .process import Process
@@ -378,7 +379,7 @@ class Sandbox:
                 # only from a string path, never a Path.
                 pinned = _pinned_host_key(self.id)
                 known_hosts = ([pinned], [], []) if pinned is not None else None
-                credential = await self._client._credentials.ensure(self._client)
+                credential = await self._client._credentials.ensure(self._client, ssh.certificate_identity)
                 try:
                     connection = await self._open(ssh, credential, known_hosts)
                 except asyncssh.PermissionDenied:
@@ -388,7 +389,7 @@ class Sandbox:
                     # Mint once against the API this client is actually talking
                     # to rather than failing every future connection the same
                     # way.
-                    credential = await self._client._credentials.renew(self._client)
+                    credential = await self._client._credentials.renew(self._client, ssh.certificate_identity)
                     connection = await self._open(ssh, credential, known_hosts)
                 if pinned is None:
                     try:
@@ -520,7 +521,7 @@ class Sandbox:
         on this side: each wait request carries its own window and HTTP
         timeout, faults retry with backoff inside the outage grace period, and
         ``deadline`` caps the whole. Returns ``False`` when the deadline passes
-        with the sandbox still starting; the caller owns the message. (by claude)
+        with the sandbox still starting; the caller owns the message.
         """
 
         def expired() -> bool:
@@ -566,7 +567,7 @@ class Sandbox:
         """Refresh once, holding the request open server-side where the API allows.
 
         Raises ``_WaitWindowElapsedError`` when the sandbox is still starting
-        at the end of the window. (by claude)
+        at the end of the window.
         """
         client = self._client
         if not client._wait_endpoint_available:
@@ -640,12 +641,19 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     ssh_value = response.get("ssh")
     ssh = None
     if isinstance(ssh_value, dict) and ssh_value.get("host"):
+        identity = None
+        if "ca_fingerprint" in ssh_value or "principal" in ssh_value:
+            fingerprint, principal = ssh_value.get("ca_fingerprint"), ssh_value.get("principal")
+            if not isinstance(fingerprint, str) or not isinstance(principal, str):
+                raise SandboxFailedError("incomplete expected SSH certificate identity")
+            identity = SSHCertificateIdentity(fingerprint, principal)
         ssh = SSHConnection(
             host=str(ssh_value["host"]),
             port=int(ssh_value.get("port", 22)),
             user=str(ssh_value.get("user", "ubuntu")),
             private_key_path=paths.ssh_key,
-            certificate_path=paths.ssh_certificate,
+            certificate_path=paths.certificate_for(identity),
+            certificate_identity=identity,
         )
         host_key = ssh_value.get("host_key")
         if host_key:
@@ -792,7 +800,7 @@ def _wait_window(deadline: float | None) -> float:
     The client deadline, not the server's maximum, is the binding bound once
     it is nearer. Rounded to the millisecond so the query string stays plain,
     and never below one: the API rejects a window of zero, and a deadline that
-    has just passed is reported by the caller, not by a 400. (by claude)
+    has just passed is reported by the caller, not by a 400.
     """
     window = WAIT_WINDOW_MAX_SECONDS
     if deadline is not None:

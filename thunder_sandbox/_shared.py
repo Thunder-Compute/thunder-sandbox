@@ -24,6 +24,7 @@ from ._common.types import (
     SandboxInfo,
     SandboxStatus,
     SSHConnection,
+    SSHCertificateIdentity,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "ConnectionError", "GPUType", "InvalidRequestError", "NetworkPolicy",
     "NotFoundError", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
+    "SSHCertificateIdentity",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError",
 ]

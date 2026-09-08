@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from .exceptions import InvalidRequestError
 from datetime import datetime
@@ -71,6 +72,16 @@ class NetworkPolicy:
 
 
 @dataclass(frozen=True)
+class SSHCertificateIdentity:
+    ca_fingerprint: str
+    principal: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", self.ca_fingerprint) or not self.principal:
+            raise InvalidRequestError("invalid expected SSH certificate identity")
+
+
+@dataclass(frozen=True)
 class SSHConnection:
     host: str
     port: int
@@ -80,6 +91,7 @@ class SSHConnection:
     # certificate as values, so a client whose cache is unwritable still works.
     private_key_path: Path | None = None
     certificate_path: Path | None = None
+    certificate_identity: SSHCertificateIdentity | None = None
 
     @property
     def command(self) -> tuple[str, ...]:

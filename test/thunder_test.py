@@ -30,7 +30,7 @@ from thunder_sandbox._common.exceptions import (
     ServiceUnavailableError,
     _WaitWindowElapsedError,
 )
-from thunder_sandbox._common.types import GPUType, SandboxStatus
+from thunder_sandbox._common.types import GPUType, SandboxStatus, SSHCertificateIdentity
 from thunder_sandbox.asynchronous.client import USER_AGENT, _api_error
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
@@ -926,14 +926,14 @@ class ErrorContractTest(unittest.TestCase):
 class CredentialTest(unittest.IsolatedAsyncioTestCase):
     """One key per machine, one certificate per organization, renewed in time."""
 
-    def _client(self, directory: str, expires_in: float = 12 * 3600) -> AsyncClient:
+    def _client(self, directory: str, expires_in: float = 12 * 3600, *, ca=None, principal="thunder-org-org-1") -> AsyncClient:
         client = AsyncClient(config(directory))
-        ca = asyncssh.generate_private_key("ssh-ed25519")
+        ca = ca or asyncssh.generate_private_key("ssh-ed25519")
 
         async def issue(method, path, body=None, query=None):
             signed = ca.generate_user_certificate(
                 asyncssh.import_public_key(body["ssh_public_key"]),
-                "thunder", principals=["thunder-org-org-1"],
+                "thunder", principals=[principal],
                 valid_before=int(time.time() + expires_in),
             )
             return {
@@ -993,8 +993,12 @@ class CredentialTest(unittest.IsolatedAsyncioTestCase):
             first = await client._credentials.ensure(client)
             original = client.config.paths.ssh_key.read_bytes()
             client._credentials._current = None
-            client.config.paths.ssh_certificate_meta.unlink()
+            expired = asyncssh.generate_private_key("ssh-ed25519").generate_user_certificate(
+                first.key, "expired", valid_before=int(time.time()) - 1,
+            )
+            client.config.paths.ssh_certificate.write_bytes(expired.export_certificate())
             second = await client._credentials.ensure(client)
+            self.assertEqual(client._request.await_count, 2)
             self.assertEqual(client.config.paths.ssh_key.read_bytes(), original)
             self.assertEqual(
                 first.key.export_public_key(), second.key.export_public_key()
@@ -1023,6 +1027,105 @@ class CredentialTest(unittest.IsolatedAsyncioTestCase):
             client._request = mock.AsyncMock(return_value={})  # type: ignore[method-assign]
             with self.assertRaises(SandboxError):
                 await client._credentials.ensure(client)
+            await client.close()
+
+    async def test_certificate_selection_is_scoped_by_authority_and_principal(self) -> None:
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        other = asyncssh.generate_private_key("ssh-ed25519")
+        cases = [(ca, "org-one"), (other, "org-one"), (ca, "org-two")]
+        with tempfile.TemporaryDirectory() as directory:
+            public_keys = []
+            for authority, principal in cases:
+                identity = SSHCertificateIdentity(authority.get_fingerprint(), principal)
+                client = self._client(directory, ca=authority, principal=principal)
+                credential = await client._credentials.ensure(client, identity)
+                public_keys.append(credential.key.export_public_key())
+                client._request.assert_awaited_once()
+                await client.close()
+            self.assertTrue(all(key == public_keys[0] for key in public_keys))
+            for authority, principal in cases:
+                identity = SSHCertificateIdentity(authority.get_fingerprint(), principal)
+                client = self._client(directory, ca=authority, principal=principal)
+                credential = await client._credentials.ensure(client, identity)
+                credential.validate(identity)
+                client._request.assert_not_awaited()
+                await client.close()
+
+    async def test_minted_mismatch_is_rejected_before_cache_or_connection(self) -> None:
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        for identity in [
+            SSHCertificateIdentity(asyncssh.generate_private_key("ssh-ed25519").get_fingerprint(), "thunder-org-org-1"),
+            SSHCertificateIdentity(ca.get_fingerprint(), "wrong-principal"),
+        ]:
+            with self.subTest(identity=identity), tempfile.TemporaryDirectory() as directory:
+                client = self._client(directory, ca=ca)
+                response = {**SANDBOX_RESPONSE, "ssh": {**SANDBOX_RESPONSE["ssh"],
+                    "ca_fingerprint": identity.ca_fingerprint, "principal": identity.principal}}
+                sandbox = AsyncSandbox._from_response(client, response)
+                with mock.patch.object(sandbox, "_open", new_callable=mock.AsyncMock) as connect:
+                    with self.assertRaises(SandboxError):
+                        await sandbox._connect()
+                    connect.assert_not_awaited()
+                self.assertFalse(client.config.paths.certificate_for(identity).exists())
+                await client.close()
+
+    async def test_actual_certificate_validity_and_key_are_checked(self) -> None:
+        from thunder_sandbox.asynchronous.credentials import SSHCredential
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        now = int(time.time())
+        for name, cert_key, after, before in [
+            ("expired", key, now - 100, now - 1),
+            ("future", key, now + 100, now + 1000),
+            ("wrong key", asyncssh.generate_private_key("ssh-ed25519"), now - 1, now + 3600),
+        ]:
+            with self.subTest(name=name):
+                cert = ca.generate_user_certificate(cert_key, "test", valid_after=after, valid_before=before)
+                credential = SSHCredential(key, cert, now + 999999)
+                self.assertFalse(credential.is_usable())
+                with self.assertRaises(SandboxError):
+                    credential.validate()
+
+    async def test_scoped_cache_cannot_override_certificate_identity(self) -> None:
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        identity = SSHCertificateIdentity(ca.get_fingerprint(), "thunder-org-org-1")
+        with tempfile.TemporaryDirectory() as directory:
+            wrong = self._client(directory)
+            credential = await wrong._credentials.ensure(wrong)
+            paths = wrong.config.paths
+            paths.certificate_for(identity).write_bytes(credential.certificate.export_certificate())
+            client = self._client(directory, ca=ca)
+            correct = await client._credentials.ensure(client, identity)
+            correct.validate(identity)
+            client._request.assert_awaited_once()
+            await wrong.close()
+            await client.close()
+
+    async def test_concurrent_issuance_keeps_one_private_key(self) -> None:
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        with tempfile.TemporaryDirectory() as directory:
+            clients = [self._client(directory, ca=ca, principal=f"org-{i}") for i in range(3)]
+            credentials = await asyncio.gather(*[
+                client._credentials.ensure(client, SSHCertificateIdentity(ca.get_fingerprint(), f"org-{i}"))
+                for i, client in enumerate(clients)
+            ])
+            self.assertEqual(len({c.key.export_public_key() for c in credentials}), 1)
+            for i, client in enumerate(clients):
+                cached = client._credentials._load(SSHCertificateIdentity(ca.get_fingerprint(), f"org-{i}"))
+                self.assertTrue(cached.is_usable())
+                await client.close()
+
+    async def test_identity_specific_ssh_command_and_partial_response(self) -> None:
+        identity = SSHCertificateIdentity(asyncssh.generate_private_key("ssh-ed25519").get_fingerprint(), "org-one")
+        with tempfile.TemporaryDirectory() as directory:
+            client = self._client(directory)
+            for fields in [{}, {"ca_fingerprint": identity.ca_fingerprint, "principal": identity.principal}]:
+                sandbox = AsyncSandbox._from_response(client, {**SANDBOX_RESPONSE, "ssh": {**SANDBOX_RESPONSE["ssh"], **fields}})
+                expected = client.config.paths.certificate_for(identity if fields else None)
+                self.assertIn(f"CertificateFile={expected}", sandbox.ssh.command)
+            for fields in [{"ca_fingerprint": identity.ca_fingerprint}, {"principal": identity.principal}]:
+                with self.assertRaises(SandboxFailedError):
+                    AsyncSandbox._from_response(client, {**SANDBOX_RESPONSE, "ssh": {**SANDBOX_RESPONSE["ssh"], **fields}})
             await client.close()
 
 
@@ -1077,17 +1180,19 @@ class CertificateAuthenticationTest(unittest.IsolatedAsyncioTestCase):
                     }
 
                 client._request = mock.AsyncMock(side_effect=issue)  # type: ignore[method-assign]
-                credential = await client._credentials.ensure(client)
-
-                for server in servers:
+                for index, server in enumerate(servers):
                     port = server.sockets[0].getsockname()[1]
-                    async with asyncssh.connect(
-                        "127.0.0.1", port=port, username=principal,
-                        client_keys=[(credential.key, credential.certificate)],
-                        known_hosts=None,
-                    ) as connection:
-                        result = await connection.run("ignored", check=True)
-                        self.assertEqual(result.stdout.strip(), "ok")
+                    sandbox = AsyncSandbox._from_response(client, {
+                        **SANDBOX_RESPONSE, "id": f"sbx-auth-{index}",
+                        "ssh": {"host": "127.0.0.1", "port": port, "user": "ubuntu",
+                            "ca_fingerprint": ca.get_fingerprint(), "principal": principal},
+                    })
+                    try:
+                        process = await sandbox.exec("ignored")
+                        self.assertEqual(await process.wait(), 0)
+                        self.assertEqual((await process.stdout.read()).strip(), "ok")
+                    finally:
+                        await sandbox._close_connection()
                 # One certificate, two sandboxes, one call to Thunder.
                 self.assertEqual(client._request.await_count, 1)
                 await client.close()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .exceptions import AuthenticationError, InvalidRequestError
+from .types import SSHCertificateIdentity
 
 DEFAULT_API_URL = "https://api.thundercompute.com:8443"
 
@@ -28,9 +30,6 @@ class ThunderPaths:
     def sandbox_public_key(self, name: str) -> Path:
         return self.sandbox_private_key(name).with_suffix(".pub")
 
-    # One key and one certificate serve every sandbox in the organization, so
-    # neither is named after a sandbox. The key is generated once on this
-    # machine and kept; only the certificate is renewed.
     @property
     def ssh_key(self) -> Path:
         return self.sandbox_keys / "id_ed25519"
@@ -42,6 +41,14 @@ class ThunderPaths:
     @property
     def ssh_certificate_meta(self) -> Path:
         return self.sandbox_keys / "id_ed25519-cert.json"
+
+    def certificate_for(self, identity: SSHCertificateIdentity | None) -> Path:
+        if identity is None:
+            return self.ssh_certificate
+        digest = hashlib.sha256(json.dumps(
+            [identity.ca_fingerprint, identity.principal]
+        ).encode()).hexdigest()
+        return self.sandbox_keys / f"id_ed25519-{digest}-cert.pub"
 
 
 class ClientConfig:
