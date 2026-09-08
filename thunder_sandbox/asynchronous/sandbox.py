@@ -7,6 +7,7 @@ import os
 import random
 import shlex
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
@@ -47,6 +48,8 @@ WAIT_WINDOW_MAX_SECONDS = 30.0
 # How much longer than its window one wait request may take to answer before
 # the client gives up on it, covering transit and a server that has stalled.
 WAIT_REPLY_GRACE_SECONDS = 15.0
+_CONTAINER_NAME = "thunder-sandbox"
+_CONTAINER_BUSYBOX = "/busybox"
 
 
 class Sandbox:
@@ -79,7 +82,12 @@ class Sandbox:
         outbound_domain_allowlist: Sequence[str] | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
-        """Create a sandbox, resolving an optional image before allocation."""
+        """Create a sandbox, resolving an optional image before allocation.
+
+        An image-backed sandbox starts a long-running container without running
+        the image's ENTRYPOINT or CMD. Positional arguments start the first
+        process through ``exec`` after the sandbox becomes ready.
+        """
         _validate_create_options(
             timeout=timeout,
             gpu_type=gpu_type,
@@ -285,8 +293,24 @@ class Sandbox:
     ) -> Process[str] | Process[bytes]:
         if not args:
             raise InvalidRequestError("exec requires a command")
+        command = (
+            _container_remote_command(args, workdir=workdir, env=env, pty=pty)
+            if self.image_id is not None
+            else _remote_command(args, workdir=workdir, env=env)
+        )
+        return await self._create_process(
+            command, timeout=timeout, text=text, pty=pty
+        )
+
+    async def _create_process(
+        self,
+        command: str,
+        *,
+        timeout: float | None,
+        text: bool,
+        pty: bool,
+    ) -> Process[str] | Process[bytes]:
         connection = await self._connect()
-        command = _remote_command(args, workdir=workdir, env=env)
         try:
             process = await connection.create_process(
                 command,
@@ -305,6 +329,9 @@ class Sandbox:
         *,
         recursive: bool = False,
     ) -> None:
+        if self.image_id is not None:
+            await self._upload_to_container(local_path, remote_path, recursive=recursive)
+            return
         connection = await self._connect()
         try:
             await asyncssh.scp(
@@ -322,6 +349,11 @@ class Sandbox:
         *,
         recursive: bool = False,
     ) -> None:
+        if self.image_id is not None:
+            await self._download_from_container(
+                remote_path, local_path, recursive=recursive
+            )
+            return
         connection = await self._connect()
         try:
             await asyncssh.scp(
@@ -331,6 +363,102 @@ class Sandbox:
             if connection.is_closed():
                 await self._discard_connection(connection)
             raise SandboxFailedError(f"could not download with SCP: {exc}") from exc
+
+    async def _upload_to_container(
+        self,
+        local_path: str | os.PathLike[str],
+        remote_path: str,
+        *,
+        recursive: bool,
+    ) -> None:
+        stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
+        await self._run_guest_command("mkdir", "--", stage)
+        try:
+            raw_source = os.fspath(local_path)
+            contents_only = raw_source.endswith(os.sep + ".")
+            connection = await self._connect()
+            if contents_only:
+                source_directory = Path(raw_source[:-2])
+                for child in source_directory.iterdir():
+                    await asyncssh.scp(
+                        os.fspath(child),
+                        (connection, stage + "/"),
+                        recurse=True,
+                    )
+                guest_source = stage + "/."
+            else:
+                await asyncssh.scp(
+                    raw_source,
+                    (connection, stage + "/"),
+                    recurse=recursive,
+                )
+                guest_source = stage + "/" + Path(raw_source).name
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "docker",
+                "cp",
+                guest_source,
+                f"{_CONTAINER_NAME}:{remote_path}",
+            )
+        except (OSError, asyncssh.Error) as exc:
+            raise SandboxFailedError(f"could not upload to sandbox container: {exc}") from exc
+        finally:
+            with suppress(BaseException):
+                await self._run_guest_command("rm", "-rf", "--", stage)
+
+    async def _download_from_container(
+        self,
+        remote_path: str,
+        local_path: str | os.PathLike[str],
+        *,
+        recursive: bool,
+    ) -> None:
+        stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
+        await self._run_guest_command("mkdir", "--", stage)
+        try:
+            contents_only = remote_path.endswith("/.")
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "docker",
+                "cp",
+                f"{_CONTAINER_NAME}:{remote_path}",
+                stage + "/",
+            )
+            guest_source = (
+                stage + "/."
+                if contents_only
+                else stage + "/" + remote_path.rstrip("/").rsplit("/", 1)[-1]
+            )
+            connection = await self._connect()
+            await asyncssh.scp(
+                (connection, guest_source),
+                os.fspath(local_path),
+                recurse=recursive,
+            )
+        except (OSError, asyncssh.Error) as exc:
+            raise SandboxFailedError(
+                f"could not download from sandbox container: {exc}"
+            ) from exc
+        finally:
+            with suppress(BaseException):
+                await self._run_guest_command("rm", "-rf", "--", stage)
+
+    async def _run_guest_command(self, *args: str) -> None:
+        process = await self._create_process(
+            _remote_command(args, workdir=None, env=None),
+            timeout=None,
+            text=True,
+            pty=False,
+        )
+        returncode = await process.wait()
+        if returncode != 0:
+            detail = (await process.stderr.read()).strip()
+            raise SandboxFailedError(
+                f"sandbox guest command failed with exit code {returncode}"
+                + (f": {detail}" if detail else "")
+            )
 
     async def update_network_policy(
         self,
@@ -871,6 +999,33 @@ def _remote_command(
                 parts.append(f"{shlex.quote(key)}={shlex.quote(value)}")
     parts.extend(shlex.quote(arg) for arg in args)
     return " ".join(parts)
+
+
+def _container_remote_command(
+    args: Sequence[str],
+    *,
+    workdir: str | None,
+    env: Mapping[str, str | None] | None,
+    pty: bool,
+) -> str:
+    parts = ["sudo", "--non-interactive", "docker", "exec", "--interactive"]
+    if pty:
+        parts.append("--tty")
+    if workdir is not None:
+        parts.extend(("--workdir", workdir))
+    unset: list[str] = []
+    for key, value in (env or {}).items():
+        if value is None:
+            unset.append(key)
+        else:
+            parts.extend(("--env", f"{key}={value}"))
+    parts.append(_CONTAINER_NAME)
+    if unset:
+        parts.extend((_CONTAINER_BUSYBOX, "env"))
+        for key in unset:
+            parts.extend(("-u", key))
+    parts.extend(args)
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 __all__ = ["Sandbox"]

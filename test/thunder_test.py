@@ -806,6 +806,67 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             await client.close()
 
+    async def test_create_with_image_runs_positional_args_through_exec(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            image = Image.from_registry("ubuntu:24.04")
+            resolved = ResolvedImage(
+                id="a" * 64,
+                managed_reference="registry.example/image@sha256:" + "a" * 64,
+                managed_digest="sha256:" + "a" * 64,
+            )
+            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=resolved
+            )
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {"id": "sbx-test"},
+                    {**SANDBOX_RESPONSE, "image_id": resolved.id},
+                ]
+            )
+
+            process = mock.Mock()
+            with mock.patch.object(
+                AsyncSandbox, "wait_until_ready", new=mock.AsyncMock()
+            ) as wait_until_ready, mock.patch.object(
+                AsyncSandbox, "exec", new=mock.AsyncMock(return_value=process)
+            ) as exec_process:
+                sandbox = await AsyncSandbox.create(
+                    "echo", "hello", image=image, client=client
+                )
+
+            start_body = client._request.await_args_list[0].args[2]
+            self.assertNotIn("command", start_body)
+            wait_until_ready.assert_awaited_once_with(timeout=300)
+            exec_process.assert_awaited_once_with("echo", "hello")
+            self.assertIs(sandbox._main_process, process)
+            await client.close()
+
+    async def test_create_without_image_keeps_positional_args_as_guest_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[{"id": "sbx-test"}, SANDBOX_RESPONSE]
+            )
+            process = mock.Mock()
+            with mock.patch.object(
+                AsyncSandbox, "wait_until_ready", new=mock.AsyncMock()
+            ) as wait_until_ready, mock.patch.object(
+                AsyncSandbox, "exec", new=mock.AsyncMock(return_value=process)
+            ) as exec_process:
+                sandbox = await AsyncSandbox.create("echo", "hello", client=client)
+
+            start_body = client._request.await_args_list[0].args[2]
+            self.assertNotIn("command", start_body)
+            wait_until_ready.assert_awaited_once_with(timeout=300)
+            exec_process.assert_awaited_once_with("echo", "hello")
+            self.assertIs(sandbox._main_process, process)
+            await client.close()
+
     async def test_create_does_not_start_sandbox_when_image_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
@@ -896,6 +957,132 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await remote.wait(), 0)
             connection.create_process.assert_awaited_once_with(
                 "echo hello", encoding=None, term_type="xterm"
+            )
+            await client.close()
+
+    async def test_exec_enters_image_container(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            stdout = mock.Mock(read=mock.AsyncMock(return_value=b""))
+            stderr = mock.Mock(read=mock.AsyncMock(return_value=b""))
+            process = mock.Mock(
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=0
+            )
+            process.wait_closed = mock.AsyncMock()
+            connection = mock.Mock()
+            connection.create_process = mock.AsyncMock(return_value=process)
+            with mock.patch.object(
+                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            ):
+                remote = await sandbox.exec(
+                    "echo",
+                    "hello",
+                    workdir="/work dir",
+                    env={"VALUE": "a b", "REMOVE": None},
+                    text=False,
+                    pty=True,
+                )
+                self.assertEqual(await remote.wait(), 0)
+            connection.create_process.assert_awaited_once_with(
+                "sudo --non-interactive docker exec --interactive --tty "
+                "--workdir '/work dir' --env 'VALUE=a b' thunder-sandbox "
+                "/busybox env -u REMOVE echo hello",
+                encoding=None,
+                term_type="xterm",
+            )
+            await client.close()
+
+    async def test_upload_to_image_container_uses_isolated_guest_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            source = Path(directory) / "payload.txt"
+            source.write_text("payload", encoding="utf-8")
+            connection = mock.Mock()
+            with mock.patch.object(
+                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            ), mock.patch.object(
+                sandbox, "_run_guest_command", new=mock.AsyncMock()
+            ) as guest, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
+                new=mock.AsyncMock(),
+            ) as scp, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.uuid.uuid4",
+                return_value=mock.Mock(hex="transfer"),
+            ):
+                await sandbox.upload(source, "/workspace/payload.txt")
+
+            stage = "/tmp/thunder-sandbox-transfer-transfer"
+            scp.assert_awaited_once_with(
+                str(source), (connection, stage + "/"), recurse=False
+            )
+            self.assertEqual(
+                [call.args for call in guest.await_args_list],
+                [
+                    ("mkdir", "--", stage),
+                    (
+                        "sudo",
+                        "--non-interactive",
+                        "docker",
+                        "cp",
+                        stage + "/payload.txt",
+                        "thunder-sandbox:/workspace/payload.txt",
+                    ),
+                    ("rm", "-rf", "--", stage),
+                ],
+            )
+            await client.close()
+
+    async def test_download_from_image_container_uses_isolated_guest_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            destination = Path(directory) / "result.txt"
+            connection = mock.Mock()
+            with mock.patch.object(
+                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            ), mock.patch.object(
+                sandbox, "_run_guest_command", new=mock.AsyncMock()
+            ) as guest, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
+                new=mock.AsyncMock(),
+            ) as scp, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.uuid.uuid4",
+                return_value=mock.Mock(hex="transfer"),
+            ):
+                await sandbox.download("/workspace/result.txt", destination)
+
+            stage = "/tmp/thunder-sandbox-transfer-transfer"
+            scp.assert_awaited_once_with(
+                (connection, stage + "/result.txt"),
+                str(destination),
+                recurse=False,
+            )
+            self.assertEqual(
+                [call.args for call in guest.await_args_list],
+                [
+                    ("mkdir", "--", stage),
+                    (
+                        "sudo",
+                        "--non-interactive",
+                        "docker",
+                        "cp",
+                        "thunder-sandbox:/workspace/result.txt",
+                        stage + "/",
+                    ),
+                    ("rm", "-rf", "--", stage),
+                ],
             )
             await client.close()
 

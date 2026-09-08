@@ -224,6 +224,19 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+An image-backed sandbox ignores the image's `ENTRYPOINT` and `CMD` and keeps
+the container alive for the sandbox lifetime. Commands run inside that
+container through `sandbox.exec(...)`:
+
+```python
+sandbox = thunder.Sandbox.create(image=thunder.Image.from_registry("ubuntu:24.04"))
+process = sandbox.exec("sh", "-c", "echo hello")
+```
+
+Positional arguments to `Sandbox.create` start the first process through the
+same `exec` path after the sandbox becomes ready. Without an image, `exec`
+runs directly in the guest VM.
+
 ## Configuration
 
 Configuration is resolved from the following sources:
