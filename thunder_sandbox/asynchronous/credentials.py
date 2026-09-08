@@ -112,11 +112,15 @@ class CredentialStore:
                     # Publish a complete key without overwriting a concurrent creator.
                     os.link(temporary.name, self._paths.ssh_key)
                 except FileExistsError:
-                    key = asyncssh.import_private_key(self._paths.ssh_key.read_bytes())
+                    try:
+                        key = asyncssh.import_private_key(self._paths.ssh_key.read_bytes())
+                    except (OSError, asyncssh.Error, ValueError):
+                        # A damaged file is what forced a fresh key. Replace it
+                        # so later processes do not keep tripping over it.
+                        self._paths.ssh_key.write_bytes(key.export_private_key())
+                        self._paths.ssh_key.chmod(0o600)
         except OSError:
             pass
-        except (asyncssh.Error, ValueError) as exc:
-            raise SandboxError("cached SSH private key is corrupt") from exc
         self._key = key
         return key
 
@@ -244,6 +248,13 @@ class CredentialStore:
             return
         try:
             self._paths.sandbox_keys.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Written whenever this key is new, which includes the case where a
+            # damaged file is what forced a fresh one. Skipping on mere
+            # existence would leave the unreadable key in place for every later
+            # process to trip over.
+            if persisted is None:
+                self._paths.ssh_key.write_bytes(key.export_private_key())
+                self._paths.ssh_key.chmod(0o600)
             _atomic_write(self._paths.certificate_for(identity), certificate + "\n")
             if identity is None:
                 _atomic_write(self._paths.ssh_certificate_meta,
