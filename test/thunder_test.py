@@ -311,6 +311,70 @@ class ImageTest(unittest.TestCase):
             finally:
                 context.close()
 
+    def test_canonical_context_does_not_inspect_ignored_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / ".dockerignore").write_text(
+                "node_modules\nignored-link\nignored-pipe\n"
+            )
+            ignored_directory = root / "node_modules"
+            ignored_directory.mkdir()
+            try:
+                (ignored_directory / "link").symlink_to(root / "Dockerfile")
+                (root / "ignored-link").symlink_to(root / "Dockerfile")
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(root / "ignored-pipe")
+
+            scanned_directories: list[Path] = []
+            scandir = os.scandir
+
+            def record_scandir(path: str | os.PathLike[str]):
+                scanned_directories.append(Path(path))
+                return scandir(path)
+
+            with mock.patch(
+                "thunder_sandbox.image.os.scandir", side_effect=record_scandir
+            ):
+                context = canonical_context(root)
+            try:
+                self.assertNotIn(ignored_directory, scanned_directories)
+                with tarfile.open(context.archive_path, "r:") as archive:
+                    self.assertEqual(
+                        [member.name for member in archive.getmembers()],
+                        [".dockerignore", "Dockerfile"],
+                    )
+            finally:
+                context.close()
+
+    def test_canonical_context_descends_for_negated_ignored_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / ".dockerignore").write_text(
+                "generated\n!generated/included.txt\n"
+            )
+            generated = root / "generated"
+            generated.mkdir()
+            (generated / "excluded.txt").write_bytes(b"excluded")
+            (generated / "included.txt").write_bytes(b"included")
+
+            context = canonical_context(root)
+            try:
+                with tarfile.open(context.archive_path, "r:") as archive:
+                    self.assertEqual(
+                        [member.name for member in archive.getmembers()],
+                        [
+                            ".dockerignore",
+                            "Dockerfile",
+                            "generated/included.txt",
+                        ],
+                    )
+            finally:
+                context.close()
+
     def test_canonical_context_rejects_symbolic_links(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

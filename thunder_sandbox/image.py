@@ -135,6 +135,7 @@ class _IgnoreRule:
 class _DockerIgnore:
     def __init__(self, contents: str) -> None:
         rules: list[_IgnoreRule] = []
+        negated_patterns: list[str] = []
         for raw_line in contents.splitlines():
             if raw_line.startswith("#"):
                 continue
@@ -149,7 +150,10 @@ class _DockerIgnore:
             pattern = pattern.strip("/")
             if pattern:
                 rules.append(_IgnoreRule(_compile_ignore_pattern(pattern), negated))
+                if negated:
+                    negated_patterns.append(pattern)
         self._rules = rules
+        self._negated_patterns = negated_patterns
 
     def excludes(self, path: str) -> bool:
         excluded = False
@@ -157,6 +161,10 @@ class _DockerIgnore:
             if rule.expression.fullmatch(path):
                 excluded = not rule.negated
         return excluded
+
+    def could_include_descendant(self, directory: str) -> bool:
+        prefix = directory + "/"
+        return any(pattern.startswith(prefix) for pattern in self._negated_patterns)
 
 
 def _compile_ignore_pattern(pattern: str) -> re.Pattern[str]:
@@ -236,6 +244,28 @@ def _context_files(
 ) -> list[tuple[str, Path]]:
     files: list[tuple[str, Path]] = []
     normalized_paths: dict[str, Path] = {}
+
+    def inspect(path: Path) -> tuple[str, os.stat_result | None]:
+        normalized = _normalized_relative_path(root, path)
+        if (
+            normalized not in ("Dockerfile", ".dockerignore")
+            and dockerignore.excludes(normalized)
+        ):
+            return normalized, None
+        metadata = path.lstat()
+        existing = normalized_paths.get(normalized)
+        if existing is not None:
+            raise InvalidRequestError(
+                f"build context paths normalize to the same name: "
+                f"{existing.relative_to(root)} and {path.relative_to(root)}"
+            )
+        normalized_paths[normalized] = path
+        if stat.S_ISLNK(metadata.st_mode):
+            raise InvalidRequestError(
+                f"build context cannot contain symbolic links: {normalized}"
+            )
+        return normalized, metadata
+
     try:
         for directory, directory_names, file_names in os.walk(
             root, topdown=True, followlinks=False
@@ -243,37 +273,34 @@ def _context_files(
             directory_names.sort()
             file_names.sort()
             parent = Path(directory)
-            directory_names[:] = [
-                name
-                for name in directory_names
-                if parent / name != artifact_directory
-            ]
-            for name in [*directory_names, *file_names]:
+            included_directories: list[str] = []
+            for name in directory_names:
                 path = parent / name
-                metadata = path.lstat()
-                normalized = _normalized_relative_path(root, path)
-                existing = normalized_paths.get(normalized)
-                if existing is not None:
-                    raise InvalidRequestError(
-                        f"build context paths normalize to the same name: "
-                        f"{existing.relative_to(root)} and {path.relative_to(root)}"
-                    )
-                normalized_paths[normalized] = path
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise InvalidRequestError(
-                        f"build context cannot contain symbolic links: {normalized}"
-                    )
+                if path == artifact_directory:
+                    continue
+                normalized, metadata = inspect(path)
+                if metadata is None:
+                    if dockerignore.could_include_descendant(normalized):
+                        included_directories.append(name)
+                    continue
                 if stat.S_ISDIR(metadata.st_mode):
+                    included_directories.append(name)
                     continue
                 if not stat.S_ISREG(metadata.st_mode):
                     raise InvalidRequestError(
                         f"build context can contain only regular files: {normalized}"
                     )
-                if (
-                    normalized not in ("Dockerfile", ".dockerignore")
-                    and dockerignore.excludes(normalized)
-                ):
+                files.append((normalized, path))
+            directory_names[:] = included_directories
+            for name in file_names:
+                path = parent / name
+                normalized, metadata = inspect(path)
+                if metadata is None:
                     continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise InvalidRequestError(
+                        f"build context can contain only regular files: {normalized}"
+                    )
                 files.append((normalized, path))
     except OSError as error:
         raise InvalidRequestError(f"could not read build context: {error}") from error
