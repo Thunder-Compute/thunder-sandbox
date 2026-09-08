@@ -164,7 +164,11 @@ class _DockerIgnore:
 
     def could_include_descendant(self, directory: str) -> bool:
         prefix = directory + "/"
-        return any(pattern.startswith(prefix) for pattern in self._negated_patterns)
+        return any(
+            pattern.startswith(prefix)
+            or any(character in pattern for character in "*?[")
+            for pattern in self._negated_patterns
+        )
 
 
 def _compile_ignore_pattern(pattern: str) -> re.Pattern[str]:
@@ -353,6 +357,7 @@ def _create_canonical_build_context(
     os.close(descriptor)
     archive_path = Path(archive_name)
     try:
+        archived_bytes = 0
         with tarfile.open(archive_path, mode="w", format=tarfile.GNU_FORMAT) as archive:
             for name, path in files:
                 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -368,6 +373,10 @@ def _create_canonical_build_context(
                         raise InvalidRequestError(
                             f"build context file changed while being archived: {name}"
                         )
+                    if archived_bytes + metadata.st_size > MAX_BUILD_CONTEXT_BYTES:
+                        raise InvalidRequestError(
+                            f"canonical build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"
+                        )
                     entry = tarfile.TarInfo(name)
                     entry.size = metadata.st_size
                     entry.mode = 0o644
@@ -377,6 +386,7 @@ def _create_canonical_build_context(
                     entry.gname = ""
                     entry.mtime = 0
                     archive.addfile(entry, source)
+                    archived_bytes += metadata.st_size
         archive_bytes = archive_path.stat().st_size
         if archive_bytes > MAX_BUILD_CONTEXT_BYTES:
             raise InvalidRequestError(

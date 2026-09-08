@@ -396,6 +396,48 @@ class ImageTest(unittest.TestCase):
             finally:
                 context.close()
 
+    def test_canonical_context_descends_for_wildcard_negation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / ".dockerignore").write_text("*\n!**/*.keep\n")
+            nested = root / "subdir"
+            nested.mkdir()
+            (nested / "foo.keep").write_bytes(b"keep")
+            (nested / "foo.txt").write_bytes(b"drop")
+
+            context = canonical_context(root)
+            try:
+                with tarfile.open(context.archive_path, "r:") as archive:
+                    self.assertEqual(
+                        [member.name for member in archive.getmembers()],
+                        [
+                            ".dockerignore",
+                            "Dockerfile",
+                            "subdir/foo.keep",
+                        ],
+                    )
+            finally:
+                context.close()
+
+    def test_canonical_context_rejects_oversized_payload_before_archiving(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_bytes(b"FROM scratch\n")
+            (root / "payload").write_bytes(b"x" * 1000)
+            added: list[str] = []
+            original_addfile = tarfile.TarFile.addfile
+
+            def tracking_addfile(self, tarinfo, fileobj=None):
+                added.append(tarinfo.name)
+                return original_addfile(self, tarinfo, fileobj)
+
+            with mock.patch("thunder_sandbox.image.MAX_BUILD_CONTEXT_BYTES", 100):
+                with mock.patch.object(tarfile.TarFile, "addfile", tracking_addfile):
+                    with self.assertRaisesRegex(InvalidRequestError, "exceeds"):
+                        canonical_context(root)
+            self.assertNotIn("payload", added)
+
     def test_canonical_context_rejects_symbolic_links(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
