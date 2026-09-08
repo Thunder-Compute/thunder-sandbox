@@ -4,7 +4,7 @@ Create short-lived GPU sandboxes, run commands over SSH, and move files with a
 small, typed Python API.
 
 Thunder Sandbox uses the same account and credentials as the Thunder CLI. It
-handles sandbox lifecycle, SSH key creation, readiness polling, command
+handles sandbox lifecycle, SSH key creation, waiting for readiness, command
 execution, uploads, and downloads through one synchronous and asynchronous
 Python API.
 
@@ -57,6 +57,12 @@ try:
 finally:
     sandbox.terminate()
 ```
+
+`wait_until_ready()` asks Thunder to hold the request open until the sandbox
+is ready, so it returns moments after startup finishes rather than on the next
+poll. Its `timeout` is enforced on the client: each held request is bounded
+here and retried until the sandbox is ready, fails, or the timeout passes. An
+API without this endpoint is polled instead.
 
 Sandboxes are addressed by `id`. `Sandbox.create()` generates an Ed25519 key
 pair and stores it under `~/.thunder/sandbox_keys/<sandbox-id>`. The public key

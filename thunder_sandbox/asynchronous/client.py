@@ -25,6 +25,7 @@ from .._common.exceptions import (
     SandboxTimeoutError,
     ServiceUnavailableError,
     ThunderError,
+    _WaitWindowElapsedError,
 )
 from .._common.types import GPUType, SandboxStatus
 from .._version import __version__
@@ -43,6 +44,7 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_already_exists": ConflictError,
     "sandbox_name_in_use": ConflictError,
     "sandbox_scheduler_rejected_request": InvalidRequestError,
+    "sandbox_wait_timeout": _WaitWindowElapsedError,
     "rate_limit_exceeded": RateLimitError,
     "sandbox_image_invalid_source": InvalidRequestError,
     "sandbox_image_source_collision": ConflictError,
@@ -91,6 +93,11 @@ class Client:
         self._session: aiohttp.ClientSession | None = None
         self._credentials = CredentialStore(self.config.paths)
         self._closed = False
+        # Whether the API offers the blocking readiness wait. Assumed until a
+        # request proves otherwise, and remembered here because it is a
+        # property of the API this client talks to: an older API then costs
+        # one extra read per client rather than one per wait. (by claude)
+        self._wait_endpoint_available = True
 
     @classmethod
     def from_cli(cls) -> "Client":
@@ -117,8 +124,14 @@ class Client:
         path: str,
         body: object | None = None,
         query: dict[str, object] | None = None,
-        timeout: aiohttp.ClientTimeout | None = None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        """Send one API request.
+
+        ``timeout`` bounds this request alone, in seconds, for calls the server
+        deliberately holds open longer than the session default allows. (by claude)
+        """
         session = self._get_session()
         url = f"{self.config.api_url}/v1{path}"
         params = (
@@ -126,9 +139,15 @@ class Client:
             if query
             else None
         )
+        # None means the session default; aiohttp treats an explicit None as
+        # "no timeout at all", which is never what a caller here wants.
+        assert timeout is None or timeout > 0, timeout
+        options = (
+            {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout is not None else {}
+        )
         try:
             async with session.request(
-                method, url, json=body, params=params, timeout=timeout
+                method, url, json=body, params=params, **options
             ) as response:
                 payload = await response.read()
                 if response.status >= 400:
@@ -234,15 +253,13 @@ class Client:
             if context is not None:
                 await asyncio.to_thread(context.close)
 
-    def _request_timeout(
-        self, deadline: float | None
-    ) -> aiohttp.ClientTimeout | None:
+    def _request_timeout(self, deadline: float | None) -> float:
         if deadline is None:
-            return aiohttp.ClientTimeout(total=60)
+            return 60
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SandboxTimeoutError("image preparation timed out")
-        return aiohttp.ClientTimeout(total=min(remaining, 60))
+        return min(remaining, 60)
 
     async def _upload_image_context(
         self,
