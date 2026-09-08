@@ -13,6 +13,7 @@ from ._bridge import AsyncBridge
 
 if TYPE_CHECKING:
     from ..asynchronous.sandbox import Sandbox as NativeSandbox
+    from ..image import Image, ResolvedImage
     from .sandbox import Sandbox
 
 
@@ -63,6 +64,7 @@ class Client:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: "Image | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -79,10 +81,27 @@ class Client:
             storage=storage,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
+            image=image,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
             client=self,
+        )
+
+    def resolve_image(
+        self, image: "Image", *, timeout: float | None = 7200
+    ) -> "ResolvedImage":
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return self._bridge.run(self._client.resolve_image(image, timeout=timeout))
+
+    async def resolve_image_async(
+        self, image: "Image", *, timeout: float | None = 7200
+    ) -> "ResolvedImage":
+        if self._closed:
+            raise ConnectionError("client is closed")
+        return await self._bridge.run_async(
+            self._client.resolve_image(image, timeout=timeout)
         )
 
     async def create_sandbox_async(
@@ -96,6 +115,7 @@ class Client:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: "Image | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -112,6 +132,7 @@ class Client:
             storage=storage,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
+            image=image,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,

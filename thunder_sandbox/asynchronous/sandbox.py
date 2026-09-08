@@ -17,8 +17,6 @@ from urllib.parse import quote
 
 import asyncssh
 
-from . import credentials
-
 from .._common.config import ThunderPaths
 from .._common.exceptions import (
     ConflictError,
@@ -38,6 +36,8 @@ from .._common.types import (
     SandboxStatus,
     SSHConnection,
 )
+from ..image import Image
+from . import credentials
 from .client import Client
 from .process import Process
 
@@ -73,15 +73,18 @@ class Sandbox:
         storage: int | None = None,
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
+        image: Image | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
+        """Create a sandbox, resolving an optional image before allocation."""
         _validate_create_options(
             timeout=timeout,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
+            image=image,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -89,6 +92,9 @@ class Sandbox:
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
+            resolved_image = (
+                await resolved_client.resolve_image(image) if image is not None else None
+            )
             internet_access, cidrs, domains = _network_policy_request(
                 block_network,
                 outbound_cidr_allowlist,
@@ -120,6 +126,11 @@ class Sandbox:
                     "domain_allowlist": domains,
                 },
                 **({"name": name} if name is not None else {}),
+                **(
+                    {"image_id": resolved_image.id}
+                    if resolved_image is not None
+                    else {}
+                ),
             }
         except BaseException:
             if owns_client:
@@ -209,6 +220,10 @@ class Sandbox:
     @property
     def status(self) -> SandboxStatus:
         return self._info.status
+
+    @property
+    def image_id(self) -> str | None:
+        return self._info.image_id
 
     @property
     def info(self) -> SandboxInfo:
@@ -669,6 +684,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             str(response["failure_code"]) if response.get("failure_code") else None
         ),
         failure=str(response["failure"]) if response.get("failure") else None,
+        image_id=str(response["image_id"]) if response.get("image_id") else None,
     )
 
 
@@ -730,6 +746,7 @@ def _validate_create_options(
     timeout: int | None,
     gpu_type: GPUType | None,
     gpu_count: int | None,
+    image: Image | None,
     block_network: bool,
     outbound_cidr_allowlist: Sequence[str] | None,
     outbound_domain_allowlist: Sequence[str] | None,
@@ -743,6 +760,8 @@ def _validate_create_options(
         raise InvalidRequestError("gpu_type and gpu_count must be provided together")
     if gpu_count is not None and gpu_count not in (1, 2, 4, 8):
         raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
+    if image is not None and not isinstance(image, Image):
+        raise InvalidRequestError("image must be an Image")
     _validate_network_policy_options(
         block_network=block_network,
         outbound_cidr_allowlist=outbound_cidr_allowlist,
