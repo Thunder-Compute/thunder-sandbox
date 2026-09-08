@@ -1549,14 +1549,13 @@ class CredentialTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory) / "home"
             root.mkdir()
             client = self._client(str(root))
-            os.chmod(root, 0o500)
-            try:
+            with mock.patch.object(
+                Path, "mkdir", side_effect=PermissionError("read-only cache")
+            ):
                 credential = await client._credentials.ensure(client)
-                self.assertTrue(credential.is_usable())
-                self.assertFalse(client.config.paths.ssh_key.exists())
-            finally:
-                os.chmod(root, 0o700)
-                await client.close()
+            self.assertTrue(credential.is_usable())
+            self.assertFalse(client.config.paths.ssh_key.exists())
+            await client.close()
 
     async def test_a_refused_certificate_is_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
