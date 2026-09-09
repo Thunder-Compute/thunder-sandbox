@@ -52,6 +52,10 @@ _CONTAINER_NAME = "thunder-sandbox"
 _CONTAINER_BUSYBOX = "/busybox"
 
 
+SSH_KEEPALIVE_INTERVAL_SECONDS = 15
+SSH_KEEPALIVE_COUNT_MAX = 4
+
+
 class Sandbox:
     """A native asynchronous handle to a Thunder sandbox."""
 
@@ -565,6 +569,13 @@ class Sandbox:
             agent_path=None,
             preferred_auth=["publickey"],
             config=None,
+            # A command that writes to a file rather than the terminal sends
+            # nothing over the channel, so a long build looks idle and is cut
+            # by a NAT or idle timeout. wait() then reports a closed channel
+            # with no exit status. Keep the connection warm and notice a dead
+            # peer within a minute instead of blocking on it forever.
+            keepalive_interval=SSH_KEEPALIVE_INTERVAL_SECONDS,
+            keepalive_count_max=SSH_KEEPALIVE_COUNT_MAX,
         )
 
     async def _discard_connection(
