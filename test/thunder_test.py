@@ -286,7 +286,10 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.state, JobState.FAILED)
             self.assertEqual(status.returncode, 7)
 
-    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    @unittest.skipUnless(
+        hasattr(os, "killpg") and Path("/proc").is_dir(),
+        "requires Linux process groups",
+    )
     async def test_launcher_does_not_finish_while_payload_ignores_term(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -295,7 +298,11 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             Path(paths.directory).mkdir(mode=0o700)
             Path(paths.launcher).write_text(
                 launcher_script(
-                    "trap '' TERM; while :; do sleep 0.05; done", paths
+                    # The intermediate launcher subshell keeps its default
+                    # TERM disposition; only its child ignores TERM. This is
+                    # the hierarchy which previously escaped supervision.
+                    "sh -c 'trap \"\" TERM; while :; do sleep 0.05; done'",
+                    paths,
                 ),
                 encoding="utf-8",
             )
@@ -326,6 +333,49 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, 9)
                 await process.wait()
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg") and Path("/proc").is_dir(),
+        "requires Linux process groups",
+    )
+    async def test_launcher_finishes_after_term_when_process_group_is_empty(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            job_id = "8" * 32
+            paths = RemoteJobPaths(job_id, root=PurePosixPath(directory))
+            Path(paths.directory).mkdir(mode=0o700)
+            Path(paths.launcher).write_text(
+                launcher_script("sleep 30", paths), encoding="utf-8"
+            )
+            Path(paths.status).write_text(
+                JobStatus(JobState.PREPARED).to_json(), encoding="utf-8"
+            )
+
+            process = await asyncio.create_subprocess_exec(
+                "sh", str(paths.launcher), start_new_session=True
+            )
+            try:
+                for _ in range(100):
+                    status = JobStatus.from_json(Path(paths.status).read_bytes())
+                    if status.state == JobState.RUNNING:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("launcher did not enter running state")
+
+                Path(paths.termination_request).touch()
+                os.killpg(process.pid, 15)
+                await asyncio.wait_for(process.wait(), timeout=2)
+
+                status = JobStatus.from_json(Path(paths.status).read_bytes())
+                self.assertEqual(status.state, JobState.TERMINATED)
+                self.assertEqual(status.returncode, 143)
+            finally:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, 9)
+                if process.returncode is None:
+                    await process.wait()
 
     def test_launcher_can_discard_either_output_stream(self) -> None:
         job_id = "3" * 32

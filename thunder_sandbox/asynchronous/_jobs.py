@@ -341,6 +341,20 @@ write_status() {{
     mv -f -- "$temporary" "$status"
 }}
 
+payload_group_running() {{
+    for process_stat in /proc/[0-9]*/stat; do
+        [ -r "$process_stat" ] || continue
+        IFS= read -r process_record <"$process_stat" || continue
+        process_pid=${{process_record%% *}}
+        process_fields=${{process_record##*) }}
+        set -- $process_fields
+        if [ "$process_pid" != "$$" ] && [ "${{3:-}}" = "$$" ]; then
+            return 0
+        fi
+    done
+    return 1
+}}
+
 claim_candidate="$job/.execution.claim.$$"
 printf '%s\n' "$$" >"$claim_candidate"
 if ! ln -- "$claim_candidate" "$job/execution.claim" 2>/dev/null; then
@@ -371,6 +385,12 @@ done
 set -e
 trap - HUP INT TERM
 if [ -f "$job/termination.request" ]; then
+    # The immediate subshell may have died from SIGTERM while one of its
+    # descendants ignored the signal. Do not publish terminal state until the
+    # whole job process group is actually gone; terminate() will escalate it.
+    while payload_group_running; do
+        sleep 0.05
+    done
     write_status terminated 143
 elif [ "$code" -eq 0 ]; then
     write_status succeeded "$code"
