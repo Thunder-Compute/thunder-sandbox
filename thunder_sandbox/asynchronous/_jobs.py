@@ -341,13 +341,6 @@ write_status() {{
     mv -f -- "$temporary" "$status"
 }}
 
-terminate_job() {{
-    code=$1
-    trap - HUP INT TERM
-    write_status terminated "$code"
-    exit "$code"
-}}
-
 claim_candidate="$job/.execution.claim.$$"
 printf '%s\n' "$$" >"$claim_candidate"
 if ! ln -- "$claim_candidate" "$job/execution.claim" 2>/dev/null; then
@@ -357,15 +350,24 @@ fi
 rm -f -- "$claim_candidate"
 
 write_status starting null
-trap 'terminate_job 129' HUP
-trap 'terminate_job 130' INT
-trap 'terminate_job 143' TERM
+# A signal can interrupt the shell's wait even when the payload ignores it.
+# Keep the wrapper alive until the payload really exits so status never gets
+# ahead of the process group and terminate() can enforce its SIGKILL grace.
+trap ':' HUP INT TERM
 write_status running null
 set +e
 (
     {command}
-) </dev/null >{stdout} 2>{stderr}
-code=$?
+) </dev/null >{stdout} 2>{stderr} &
+payload_pid=$!
+while :; do
+    wait "$payload_pid"
+    code=$?
+    if kill -0 "$payload_pid" 2>/dev/null; then
+        continue
+    fi
+    break
+done
 set -e
 trap - HUP INT TERM
 if [ -f "$job/termination.request" ]; then

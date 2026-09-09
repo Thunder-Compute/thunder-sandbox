@@ -1113,7 +1113,7 @@ fi
         recursive: bool,
     ) -> None:
         stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
-        await self._run_guest_command("mkdir", "--", stage)
+        await self._run_guest_command("mkdir", "-p", "--", stage)
         try:
             contents_only = remote_path.endswith("/.")
             await self._run_guest_command(
