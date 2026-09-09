@@ -1476,6 +1476,32 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(sandbox._main_process, process)
             await client.close()
 
+    async def test_a100_variants_use_distinct_api_values(self) -> None:
+        for gpu_type in (GPUType.A100, GPUType.A100XL):
+            with self.subTest(gpu_type=gpu_type):
+                with tempfile.TemporaryDirectory() as directory:
+                    client = AsyncClient(config(directory))
+                    response = {
+                        **SANDBOX_RESPONSE,
+                        "spec": {
+                            **SANDBOX_RESPONSE["spec"],
+                            "gpu_type": gpu_type.value,
+                            "gpu_count": 1,
+                        },
+                    }
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        side_effect=[{"id": "sbx-test"}, response]
+                    )
+
+                    sandbox = await AsyncSandbox.create(
+                        gpu_type=gpu_type, gpu_count=1, client=client
+                    )
+
+                    start_body = client._request.await_args_list[0].args[2]
+                    self.assertEqual(start_body["spec"]["gpu_type"], gpu_type.value)
+                    self.assertIs(sandbox.info.resources.gpu_type, gpu_type)
+                    await client.close()
+
     async def test_create_does_not_start_sandbox_when_image_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
