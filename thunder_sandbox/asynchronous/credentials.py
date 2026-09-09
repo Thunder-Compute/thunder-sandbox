@@ -13,6 +13,7 @@ values rather than paths.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import TYPE_CHECKING
@@ -58,19 +59,25 @@ class CredentialStore:
     def __init__(self, paths: ThunderPaths) -> None:
         self._paths = paths
         self._current: SSHCredential | None = None
+        self._lock = asyncio.Lock()
 
     async def ensure(self, client: "Client") -> SSHCredential:
         """Reuse the process credential, then the cached one, then mint."""
         if self._current is not None and self._current.is_usable():
             return self._current
-        cached = self._load()
-        if cached is not None and cached.is_usable():
-            self._current = cached
-            return cached
-        self._current = await self._mint(client, reuse=cached)
-        return self._current
+        async with self._lock:
+            if self._current is not None and self._current.is_usable():
+                return self._current
+            cached = self._load()
+            if cached is not None and cached.is_usable():
+                self._current = cached
+                return cached
+            self._current = await self._mint(client, reuse=cached)
+            return self._current
 
-    async def renew(self, client: "Client") -> SSHCredential:
+    async def renew(
+        self, client: "Client", *, rejected: SSHCredential | None = None
+    ) -> SSHCredential:
         """Mint a replacement for a credential the sandbox would not accept.
 
         A cached certificate can be unexpired and still useless: signed by
@@ -78,8 +85,20 @@ class CredentialStore:
         Expiry cannot detect either, so the only evidence is the sandbox
         refusing it.
         """
-        self._current = await self._mint(client, reuse=self._load(), replace=True)
-        return self._current
+        async with self._lock:
+            # Another sandbox may have renewed this shared Client's credential
+            # while this connection attempt was waiting for the lock.
+            if (
+                rejected is not None
+                and self._current is not None
+                and self._current is not rejected
+                and self._current.is_usable()
+            ):
+                return self._current
+            self._current = await self._mint(
+                client, reuse=self._load(), replace=True
+            )
+            return self._current
 
     def _load(self) -> SSHCredential | None:
         """Adopt the cached credential. Any damage means mint a fresh one."""

@@ -103,6 +103,10 @@ class Process(Generic[T]):
     def returncode(self) -> int | None:
         return self._process.returncode
 
+    @property
+    def is_durable(self) -> bool:
+        return self._process.is_durable
+
     def poll(self) -> int | None:
         return self._bridge.run(self._process.poll())
 
@@ -114,6 +118,12 @@ class Process(Generic[T]):
 
     async def wait_async(self, *, timeout: float | None = None) -> int:
         return await self._bridge.run_async(self._process.wait(timeout=timeout))
+
+    def cleanup(self) -> None:
+        self._bridge.run(self._process.cleanup())
+
+    async def cleanup_async(self) -> None:
+        await self._bridge.run_async(self._process.cleanup())
 
     def terminate(self) -> None:
         self._bridge.run(self._process.terminate())
