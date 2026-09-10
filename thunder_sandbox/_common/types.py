@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from .exceptions import InvalidRequestError
+
+OutputMode = Literal["capture", "discard"]
 
 
 class SandboxStatus(str, Enum):
@@ -35,7 +38,8 @@ class SandboxStatus(str, Enum):
 
 class GPUType(str, Enum):
     A6000 = "A6000"
-    A100 = "A100"
+    A100 = "A100"       # NVIDIA A100 40 GiB
+    A100XL = "A100XL"   # NVIDIA A100 80 GiB
     H100 = "H100"
     UNKNOWN = "unknown"
 

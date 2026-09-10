@@ -108,6 +108,52 @@ print(process.stdout.read())
 exit_code = process.wait()
 ```
 
+Non-PTY commands are launched as detached durable jobs. Their execution,
+status, and output files do not depend on the SSH channel which submitted them.
+If the connection is lost, the SDK reconnects and resumes observing the same
+job rather than launching it again. Save `process.id` to recover it later:
+
+```python
+process_id = process.id
+recovered = sandbox.get_process(process_id)
+exit_code = recovered.wait()
+```
+
+Durable commands do not accept stdin; stdin operations raise
+`io.UnsupportedOperation`. Pass input through arguments, environment variables,
+or uploaded files. Commands created with `pty=True` retain interactive stdin but
+remain attached to their SSH channel. `process.is_durable` reports which mode a
+handle uses.
+
+PTY commands are intentionally never replayed or recovered: input and terminal
+state cannot be reconstructed safely after their SSH channel disappears. A PTY
+disconnect raises `ConnectionError` and leaves the remote command's final state
+unknown. Use the default `pty=False` mode for unattended or long-running work.
+
+Durable stdout and stderr are reconnectable streams. The SDK reads short SFTP
+chunks by byte offset and advances its cursor only after a complete chunk is in
+client memory, so a lost SSH connection resumes without gaps or duplicates.
+Text mode also preserves UTF-8 characters split across chunks.
+
+Output is captured by default. Long-running commands which do not need one or
+both streams can redirect them directly to `/dev/null` in the durable launcher:
+
+```python
+process = sandbox.exec(
+    "python3", "train.py", stdout="discard", stderr="capture"
+)
+```
+
+Once a job is terminal and both captured streams have reached EOF, its remote
+job directory is removed automatically. Pass `retain=True` to keep it available
+for later `get_process()` recovery, and call `process.cleanup()` when finished.
+Explicit cleanup is idempotent and waits for a running job to finish.
+
+`process.terminate()` is also durable. It records termination intent, signals
+the entire remote process group, and reconnects safely if the SSH
+acknowledgement is lost. Jobs which do not exit after a five-second `SIGTERM`
+grace period are stopped with `SIGKILL`; `wait()` then returns `143` or `137`.
+
 Commands can set a working directory, environment variables, a timeout, or a
 pseudo-terminal:
 
@@ -130,6 +176,13 @@ sandbox.upload("dataset", "/home/ubuntu/dataset", recursive=True)
 sandbox.download("/home/ubuntu/results.json", "results.json")
 sandbox.download("/home/ubuntu/checkpoints", "checkpoints", recursive=True)
 ```
+
+Transfers intentionally restart from the beginning rather than maintaining a
+resumable byte manifest. Uploads first write to an isolated remote staging path;
+downloads first write beside the local destination. If SSH disconnects, the SDK
+reconnects and repeats the complete staged transfer. Completed files are
+published with an atomic rename, so partial data is never presented as the
+destination. Directory merges begin only after the network transfer completes.
 
 ## Network policies
 

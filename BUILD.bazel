@@ -25,6 +25,10 @@ filegroup(
 
 py_test(
     name = "thunder_test",
-    srcs = ["test/thunder_test.py"],
+    srcs = [
+        "test/__init__.py",
+        "test/ssh_faults.py",
+        "test/thunder_test.py",
+    ],
     deps = [":thunder_client"],
 )

@@ -86,5 +86,5 @@ class _WaitWindowElapsedError(ThunderError):
 
     This is the wait endpoint's ordinary "not yet" answer rather than a fault,
     so it is neither retryable in the backoff sense nor public: the readiness
-    loop opens the next window at once and never lets it escape. (by claude)
+    loop opens the next window at once and never lets it escape.
     """

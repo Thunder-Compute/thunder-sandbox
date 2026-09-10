@@ -6,7 +6,13 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Literal, cast, overload
 
-from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
+from .._common.types import (
+    GPUType,
+    OutputMode,
+    SandboxInfo,
+    SandboxStatus,
+    SSHConnection,
+)
 from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
 from ..image import Image
@@ -221,10 +227,66 @@ class Sandbox:
         return self._sandbox.ssh_command
 
     @overload
+    def get_process(
+        self, process_id: str, *, text: Literal[True] = True
+    ) -> Process[str]: ...
+
+    @overload
+    def get_process(
+        self, process_id: str, *, text: Literal[False]
+    ) -> Process[bytes]: ...
+
+    @overload
+    def get_process(
+        self, process_id: str, *, text: bool
+    ) -> Process[str] | Process[bytes]: ...
+
+    def get_process(
+        self, process_id: str, *, text: bool = True
+    ) -> Process[str] | Process[bytes]:
+        process = self._client._bridge.run(
+            self._sandbox.get_process(process_id, text=text)
+        )
+        if text:
+            return Process(
+                self._client._bridge, cast("NativeProcess[str]", process)
+            )
+        return Process(self._client._bridge, cast("NativeProcess[bytes]", process))
+
+    @overload
+    async def get_process_async(
+        self, process_id: str, *, text: Literal[True] = True
+    ) -> Process[str]: ...
+
+    @overload
+    async def get_process_async(
+        self, process_id: str, *, text: Literal[False]
+    ) -> Process[bytes]: ...
+
+    @overload
+    async def get_process_async(
+        self, process_id: str, *, text: bool
+    ) -> Process[str] | Process[bytes]: ...
+
+    async def get_process_async(
+        self, process_id: str, *, text: bool = True
+    ) -> Process[str] | Process[bytes]:
+        process = await self._client._bridge.run_async(
+            self._sandbox.get_process(process_id, text=text)
+        )
+        if text:
+            return Process(
+                self._client._bridge, cast("NativeProcess[str]", process)
+            )
+        return Process(self._client._bridge, cast("NativeProcess[bytes]", process))
+
+    @overload
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str]: ...
 
     @overload
@@ -232,6 +294,8 @@ class Sandbox:
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[bytes]: ...
 
     @overload
@@ -239,12 +303,16 @@ class Sandbox:
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str] | Process[bytes]: ...
 
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool = True, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str] | Process[bytes]:
         process = self._client._bridge.run(
             self._sandbox.exec(
@@ -254,6 +322,9 @@ class Sandbox:
                 env=env,
                 text=text,
                 pty=pty,
+                stdout=stdout,
+                stderr=stderr,
+                retain=retain,
             )
         )
         if text:
@@ -267,6 +338,8 @@ class Sandbox:
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str]: ...
 
     @overload
@@ -274,6 +347,8 @@ class Sandbox:
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[bytes]: ...
 
     @overload
@@ -281,12 +356,16 @@ class Sandbox:
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str] | Process[bytes]: ...
 
     async def exec_async(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool = True, pty: bool = False,
+        stdout: OutputMode = "capture", stderr: OutputMode = "capture",
+        retain: bool = False,
     ) -> Process[str] | Process[bytes]:
         process = await self._client._bridge.run_async(
             self._sandbox.exec(
@@ -296,6 +375,9 @@ class Sandbox:
                 env=env,
                 text=text,
                 pty=pty,
+                stdout=stdout,
+                stderr=stderr,
+                retain=retain,
             )
         )
         if text:

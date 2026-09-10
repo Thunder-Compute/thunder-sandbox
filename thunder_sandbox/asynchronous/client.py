@@ -96,7 +96,7 @@ class Client:
         # Whether the API offers the blocking readiness wait. Assumed until a
         # request proves otherwise, and remembered here because it is a
         # property of the API this client talks to: an older API then costs
-        # one extra read per client rather than one per wait. (by claude)
+        # one extra read per client rather than one per wait.
         self._wait_endpoint_available = True
 
     @classmethod
@@ -130,7 +130,7 @@ class Client:
         """Send one API request.
 
         ``timeout`` bounds this request alone, in seconds, for calls the server
-        deliberately holds open longer than the session default allows. (by claude)
+        deliberately holds open longer than the session default allows.
         """
         session = self._get_session()
         url = f"{self.config.api_url}/v1{path}"
