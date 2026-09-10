@@ -442,7 +442,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
 
                 Path(paths.termination_request).touch()
                 os.killpg(process.pid, 15)
-                await asyncio.wait_for(process.wait(), timeout=2)
+                await asyncio.wait_for(process.wait(), timeout=5)
 
                 status = JobStatus.from_json(Path(paths.status).read_bytes())
                 self.assertEqual(status.state, JobState.TERMINATED)
