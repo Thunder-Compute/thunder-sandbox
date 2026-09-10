@@ -58,7 +58,10 @@ from thunder_sandbox.asynchronous._ssh import (
 )
 from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
-from thunder_sandbox.asynchronous.sandbox import _pinned_host_key
+from thunder_sandbox.asynchronous.sandbox import (
+    _container_session_waiter,
+    _pinned_host_key,
+)
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
 from thunder_sandbox.synchronous._bridge import AsyncBridge
 from thunder_sandbox.synchronous.client import Client
@@ -243,6 +246,47 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
                 ["sh", "-n"], input=script, text=True, capture_output=True
             )
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_container_session_waiter_waits_and_propagates_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_busybox = root / "busybox"
+            fake_busybox.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                "assert sys.argv[1] == 'setsid'\n"
+                "argv = sys.argv[2:]\n"
+                "if os.getpid() == os.getpgrp():\n"
+                "    child = os.fork()\n"
+                "    if child:\n"
+                "        raise SystemExit(0)\n"
+                "os.setsid()\n"
+                "os.execvp(argv[0], argv)\n",
+                encoding="utf-8",
+            )
+            fake_busybox.chmod(0o700)
+            marker = root / "completed"
+            payload = (
+                f"sleep 0.2; printf complete > {shlex.quote(str(marker))}; exit 23"
+            )
+
+            started_at = time.monotonic()
+            completed = subprocess.run(
+                [
+                    "sh",
+                    "-c",
+                    _container_session_waiter(str(fake_busybox)),
+                    "sh",
+                    "sh",
+                    "-c",
+                    payload,
+                ],
+                check=False,
+            )
+
+            self.assertGreaterEqual(time.monotonic() - started_at, 0.18)
+            self.assertEqual(completed.returncode, 23)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "complete")
 
     async def test_launcher_executes_a_payload_at_most_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2139,8 +2183,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 "sudo --non-interactive docker exec --interactive", submitted
             )
-            self.assertIn("thunder-sandbox /busybox setsid /busybox sh", submitted)
-            self.assertIn("/tmp/thunder-sandbox/jobs/11111111111111111111111111111111", submitted)
+            self.assertIn("thunder-sandbox /busybox sh -c", submitted)
+            self.assertIn("/busybox setsid", submitted)
+            self.assertIn("session_pid=$!", submitted)
+            self.assertIn('wait "$session_pid"', submitted)
+            self.assertIn(
+                "/tmp/thunder-sandbox/jobs/11111111111111111111111111111111",
+                submitted,
+            )
             self.assertIn("python train.py", submitted)
             await client.close()
 

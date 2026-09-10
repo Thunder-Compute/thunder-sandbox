@@ -1592,6 +1592,28 @@ def _remote_command(
     return " ".join(parts)
 
 
+def _container_session_waiter(container_busybox: str) -> str:
+    """Start ``setsid`` as a child and wait for the session leader it execs.
+
+    A ``setsid`` process which is already a process-group leader must fork
+    before it can create a new session. Docker may start its exec process in
+    exactly that state. Invoking ``setsid`` directly would then let the parent
+    exit zero while the real command continued unobserved. A background child
+    of this non-interactive shell inherits the shell's process group and cannot
+    itself be its leader, so ``setsid`` can exec the payload in place. Waiting
+    here keeps ``docker exec`` attached to the payload and preserves its code.
+    """
+
+    busybox = shlex.quote(container_busybox)
+    return f"""set +e
+{busybox} setsid "$@" &
+session_pid=$!
+wait "$session_pid"
+code=$?
+exit "$code"
+"""
+
+
 def _container_remote_command(
     args: Sequence[str],
     *,
@@ -1630,9 +1652,26 @@ def _container_remote_command(
             'printf \'%s\\n\' "$$" >"$job/pid"\n'
             'exec "$@"\n'
         )
+        # Do not make setsid the docker-exec process. If that process is already
+        # a process-group leader, BusyBox forks and lets the observed parent
+        # return zero before the payload finishes. The waiter launches setsid
+        # as its non-leader child and propagates the payload's actual status.
         parts.extend(
-            (_CONTAINER_BUSYBOX, "setsid", _CONTAINER_BUSYBOX, "sh", "-c", inner, "sh")
+            (
+                _CONTAINER_BUSYBOX,
+                "sh",
+                "-c",
+                _container_session_waiter(_CONTAINER_BUSYBOX),
+                "sh",
+                _CONTAINER_BUSYBOX,
+                "sh",
+                "-c",
+                inner,
+                "sh",
+            )
         )
         parts.extend(payload)
     return " ".join(shlex.quote(part) for part in parts)
+
+
 __all__ = ["Sandbox"]
