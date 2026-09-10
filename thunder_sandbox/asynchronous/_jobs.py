@@ -415,7 +415,11 @@ payload_group_running() {{
         process_pid=${{process_record%% *}}
         process_fields=${{process_record##*) }}
         set -- $process_fields
-        if [ "$process_pid" != "$$" ] && [ "${{3:-}}" = "$$" ]; then
+        # A zombie has exited and cannot retain resources or receive a signal.
+        # Its parent or init will reap it; do not let that delay terminal state.
+        if [ "$process_pid" != "$$" ] \
+            && [ "${{1:-}}" != "Z" ] \
+            && [ "${{3:-}}" = "$$" ]; then
             return 0
         fi
     done
