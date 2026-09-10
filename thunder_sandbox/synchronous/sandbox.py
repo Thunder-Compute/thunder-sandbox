@@ -6,8 +6,13 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Literal, cast, overload
 
-from .._common.types import GPUType, SandboxInfo, SandboxStatus, SSHConnection
-from ..asynchronous._jobs import OutputMode
+from .._common.types import (
+    GPUType,
+    OutputMode,
+    SandboxInfo,
+    SandboxStatus,
+    SSHConnection,
+)
 from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
 from ..image import Image

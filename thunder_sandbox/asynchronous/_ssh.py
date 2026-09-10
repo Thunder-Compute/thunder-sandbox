@@ -84,6 +84,18 @@ class SSHConnectionManager:
         with suppress(Exception):
             await connection.wait_closed()
 
+    async def connect(
+        self, *, name: str, deadline: float | None = None
+    ) -> asyncssh.SSHClientConnection:
+        """Connect with the manager's retry policy and return the connection."""
+
+        async def connected(
+            connection: asyncssh.SSHClientConnection,
+        ) -> asyncssh.SSHClientConnection:
+            return connection
+
+        return await self.run(connected, name=name, deadline=deadline)
+
     async def run(
         self,
         operation: SSHOperation[T],

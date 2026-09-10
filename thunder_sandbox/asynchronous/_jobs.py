@@ -15,16 +15,15 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Mapping
 
+from .._common.types import OutputMode
 
 JOB_PROTOCOL_VERSION = 1
 JOB_ROOT = PurePosixPath("/var/tmp/thunder-sandbox/jobs")
+CONTAINER_JOB_ROOT = PurePosixPath("/tmp/thunder-sandbox/jobs")
 
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
-OutputMode = Literal["capture", "discard"]
-
-
 class JobState(str, Enum):
     """States persisted by the remote durable-job wrapper."""
 
@@ -94,10 +93,11 @@ def can_transition(previous: JobState, following: JobState) -> bool:
 
 @dataclass(frozen=True)
 class RemoteJobPaths:
-    """All remote paths owned by one job.
+    """Stable host paths owned by one job.
 
     A caller may override ``root`` in tests, but production paths are fixed and
-    never contain user-controlled path components other than a validated id.
+    never contain user-controlled path components other than a validated ID.
+    Ephemeral files whose names contain a shell PID stay launcher-local.
     """
 
     job_id: str
@@ -121,13 +121,12 @@ class RemoteJobPaths:
         return self.directory / "launch.sh"
 
     @property
-    def execution_claim(self) -> PurePosixPath:
-        # A hard link atomically publishes a fully written owner-PID file.
-        return self.directory / "execution.claim"
-
-    @property
     def status(self) -> PurePosixPath:
         return self.directory / "status.json"
+
+    @property
+    def supervisor_pid(self) -> PurePosixPath:
+        return self.directory / "supervisor.pid"
 
     @property
     def stdout(self) -> PurePosixPath:
@@ -140,6 +139,14 @@ class RemoteJobPaths:
     @property
     def launcher_stderr(self) -> PurePosixPath:
         return self.directory / "launcher.stderr"
+
+    @property
+    def submission_lock(self) -> PurePosixPath:
+        return self.directory / "submission.lock"
+
+    @property
+    def run_lock(self) -> PurePosixPath:
+        return self.directory / "run.lock"
 
     @property
     def termination_request(self) -> PurePosixPath:
@@ -155,7 +162,12 @@ def _validate_text(value: str, label: str, *, empty: bool = True) -> None:
 
 @dataclass(frozen=True)
 class JobSpec:
-    """Immutable structured command staged before a job is launched."""
+    """Immutable command metadata staged for recovery and operator debugging.
+
+    Recovery consumes the output, retention, and container fields. The argv,
+    workdir, and environment fields preserve the submitted command's intent for
+    inspection; execution itself uses the separately persisted launch script.
+    """
 
     job_id: str
     argv: tuple[str, ...]
@@ -309,7 +321,36 @@ class JobStatus:
             raise ValueError("invalid durable-job status") from exc
 
 
-def launcher_script(command: str, paths: RemoteJobPaths, spec: JobSpec | None = None) -> str:
+_STATUS_PID_PLACEHOLDER = 987654321
+_STATUS_CODE_PLACEHOLDER = 123
+
+
+def _state_pattern(*states: JobState) -> str:
+    return "|".join(f'"state":"{state.value}"' for state in states)
+
+
+def _status_printf_format(
+    state: JobState, returncode: int | None = None, *, dynamic_code: bool = False
+) -> str:
+    code = _STATUS_CODE_PLACEHOLDER if dynamic_code else returncode
+    encoded = JobStatus(
+        state, pid=_STATUS_PID_PLACEHOLDER, returncode=code
+    ).to_json()
+    encoded = encoded.replace(f'"pid":{_STATUS_PID_PLACEHOLDER}', '"pid":%s')
+    if dynamic_code:
+        encoded = encoded.replace(
+            f'"returncode":{_STATUS_CODE_PLACEHOLDER}', '"returncode":%s'
+        )
+    return encoded
+
+
+def container_job_directory(job_id: str) -> PurePosixPath:
+    """Return the private in-container state directory for a durable job."""
+
+    return CONTAINER_JOB_ROOT / validate_job_id(job_id)
+
+
+def launcher_script(command: str, paths: RemoteJobPaths, spec: JobSpec) -> str:
     """Build the detached wrapper which owns one remote command.
 
     ``command`` is a complete shell fragment produced by the SDK's existing
@@ -318,26 +359,52 @@ def launcher_script(command: str, paths: RemoteJobPaths, spec: JobSpec | None = 
     """
 
     _validate_text(command, "remote command", empty=False)
-    if spec is not None and spec.job_id != paths.job_id:
+    if spec.job_id != paths.job_id:
         raise ValueError("job specification and paths must use the same ID")
     job = shlex.quote(str(paths.directory))
-    stdout = '"$job/stdout"' if spec is None or spec.stdout == "capture" else "/dev/null"
-    stderr = '"$job/stderr"' if spec is None or spec.stderr == "capture" else "/dev/null"
+    status = shlex.quote(str(paths.status))
+    run_lock = shlex.quote(str(paths.run_lock))
+    supervisor_pid = shlex.quote(str(paths.supervisor_pid))
+    termination_request = shlex.quote(str(paths.termination_request))
+    stdout = '"$job/stdout"' if spec.stdout == "capture" else "/dev/null"
+    stderr = '"$job/stderr"' if spec.stderr == "capture" else "/dev/null"
+    prepared_pattern = shlex.quote(_state_pattern(JobState.PREPARED))
+    starting_format = shlex.quote(_status_printf_format(JobState.STARTING))
+    running_format = shlex.quote(_status_printf_format(JobState.RUNNING))
+    succeeded_format = shlex.quote(
+        _status_printf_format(JobState.SUCCEEDED, returncode=0)
+    )
+    failed_format = shlex.quote(
+        _status_printf_format(JobState.FAILED, dynamic_code=True)
+    )
+    terminated_format = shlex.quote(
+        _status_printf_format(JobState.TERMINATED, returncode=143)
+    )
     return f"""#!/bin/sh
 set -u
 umask 077
 job={job}
-status="$job/status.json"
+status={status}
+exec 8>{run_lock}
+if ! flock -n 8; then
+    exit 0
+fi
+if ! grep -Eq {prepared_pattern} "$status"; then
+    exit 0
+fi
 
 write_status() {{
     state=$1
     code=$2
     temporary="$job/.status.$$"
-    if [ "$code" = null ]; then
-        printf '{{"pid":%s,"protocol":{JOB_PROTOCOL_VERSION},"returncode":null,"state":"%s"}}' "$$" "$state" >"$temporary"
-    else
-        printf '{{"pid":%s,"protocol":{JOB_PROTOCOL_VERSION},"returncode":%s,"state":"%s"}}' "$$" "$code" "$state" >"$temporary"
-    fi
+    case "$state" in
+        starting) printf {starting_format} "$$" >"$temporary" ;;
+        running) printf {running_format} "$$" >"$temporary" ;;
+        succeeded) printf {succeeded_format} "$$" >"$temporary" ;;
+        failed) printf {failed_format} "$$" "$code" >"$temporary" ;;
+        terminated) printf {terminated_format} "$$" >"$temporary" ;;
+        *) exit 64 ;;
+    esac
     mv -f -- "$temporary" "$status"
 }}
 
@@ -355,14 +422,9 @@ payload_group_running() {{
     return 1
 }}
 
-claim_candidate="$job/.execution.claim.$$"
-printf '%s\n' "$$" >"$claim_candidate"
-if ! ln -- "$claim_candidate" "$job/execution.claim" 2>/dev/null; then
-    rm -f -- "$claim_candidate"
-    exit 0
-fi
-rm -f -- "$claim_candidate"
-
+pid_temporary="$job/.supervisor.pid.$$"
+printf '%s\n' "$$" >"$pid_temporary"
+mv -f -- "$pid_temporary" {supervisor_pid}
 write_status starting null
 # A signal can interrupt the shell's wait even when the payload ignores it.
 # Keep the wrapper alive until the payload really exits so status never gets
@@ -384,7 +446,7 @@ while :; do
 done
 set -e
 trap - HUP INT TERM
-if [ -f "$job/termination.request" ]; then
+if [ -f {termination_request} ]; then
     # The immediate subshell may have died from SIGTERM while one of its
     # descendants ignored the signal. Do not publish terminal state until the
     # whole job process group is actually gone; terminate() will escalate it.
@@ -412,7 +474,7 @@ def submission_command(
 
     Linux ``mv -T`` atomically publishes the staged directory without nesting
     it when another submission of the same job won the race. Every retry stages
-    identical content and the atomic execution-claim link admits one wrapper.
+    identical content and the lifetime run lock admits one wrapper.
     """
 
     if paths.job_id != spec.job_id:
@@ -425,6 +487,9 @@ def submission_command(
     encoded_spec = shlex.quote(spec.to_json())
     encoded_launcher = shlex.quote(launcher_script(command, paths, spec))
     prepared = shlex.quote(JobStatus(JobState.PREPARED).to_json())
+    prepared_pattern = shlex.quote(_state_pattern(JobState.PREPARED))
+    submission_lock = shlex.quote(str(paths.submission_lock))
+    status = shlex.quote(str(paths.status))
     return f"""set -eu
 umask 077
 root={root}
@@ -449,47 +514,192 @@ else
     cmp -s -- "$stage/launch.sh" "$job/launch.sh"
 fi
 command -v flock >/dev/null
-exec 9>"$job/submission.lock"
+exec 9>{submission_lock}
 if ! flock -w 15 9; then
     echo 'durable job submission lock timed out' >&2
     exit 70
 fi
 start_launcher() {{
-    if [ -e "$job/execution.claim" ]; then
-        return
-    fi
     command -v nohup >/dev/null
     command -v setsid >/dev/null
     nohup setsid sh "$job/launch.sh" </dev/null >/dev/null 2>"$job/launcher.stderr" &
 }}
 
 launch_round=0
-while grep -q '\"state\":\"prepared\"' "$job/status.json"; do
+while grep -Eq {prepared_pattern} {status}; do
     start_launcher
     attempt=0
-    while grep -q '\"state\":\"prepared\"' "$job/status.json"; do
+    while grep -Eq {prepared_pattern} {status}; do
         if [ "$attempt" -ge 100 ]; then
             break
         fi
         attempt=$((attempt + 1))
         sleep 0.05
     done
-    if ! grep -q '\"state\":\"prepared\"' "$job/status.json"; then
+    if ! grep -Eq {prepared_pattern} {status}; then
         break
     fi
-    claim_pid=$(cat -- "$job/execution.claim" 2>/dev/null || true)
-    case "$claim_pid" in
-        ''|*[!0-9]*) claim_live=false ;;
-        *) if kill -0 "$claim_pid" 2>/dev/null; then claim_live=true; else claim_live=false; fi ;;
-    esac
-    if [ "$claim_live" = true ] || [ "$launch_round" -ge 1 ]; then
+    if [ "$launch_round" -ge 1 ]; then
         echo 'durable job launcher did not acknowledge execution' >&2
         exit 70
     fi
-    rm -rf -- "$job/execution.claim"
     launch_round=$((launch_round + 1))
 done
-cat -- "$job/status.json"
+cat -- {status}
+"""
+
+
+def cleanup_command(
+    paths: RemoteJobPaths,
+    *,
+    container: str | None = None,
+    container_busybox: str = "/busybox",
+) -> str:
+    """Build an idempotent command which removes every durable-job artifact."""
+
+    container_cleanup = ""
+    if container is not None:
+        container_cleanup = (
+            "sudo --non-interactive docker exec "
+            f"{shlex.quote(container)} {shlex.quote(container_busybox)} rm -rf -- "
+            f"{shlex.quote(str(container_job_directory(paths.job_id)))} "
+            "2>/dev/null || true\n"
+        )
+    return container_cleanup + f"rm -rf -- {shlex.quote(str(paths.directory))}"
+
+
+@dataclass(frozen=True)
+class _ProcessGroupTarget:
+    prepare: str
+    send_signal: str
+    is_alive: str
+
+
+def _host_process_group(signal: str) -> _ProcessGroupTarget:
+    return _ProcessGroupTarget(
+        prepare="",
+        send_signal=f'kill -{signal} -- "-$expected_pid" 2>/dev/null || true',
+        is_alive='kill -0 -- "-$expected_pid" 2>/dev/null',
+    )
+
+
+def _container_process_group(
+    paths: RemoteJobPaths,
+    *,
+    signal: str,
+    container: str,
+    container_busybox: str,
+    terminal_pattern: str,
+) -> _ProcessGroupTarget:
+    quoted_container = shlex.quote(container)
+    quoted_busybox = shlex.quote(container_busybox)
+    quoted_pid_file = shlex.quote(
+        str(container_job_directory(paths.job_id) / "pid")
+    )
+    prepare = f"""
+container_pid=''
+attempt=0
+while [ -z "$container_pid" ]; do
+    container_pid=$(sudo --non-interactive docker exec {quoted_container} {quoted_busybox} cat -- {quoted_pid_file} 2>/dev/null || true)
+    if [ -n "$container_pid" ] || grep -Eq {terminal_pattern} "$status"; then
+        break
+    fi
+    if [ "$attempt" -ge 40 ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+if grep -Eq {terminal_pattern} "$status"; then
+    cat -- "$status"
+    exit 0
+fi
+case "$container_pid" in
+    ''|*[!0-9]*)
+        echo 'durable container job PID is unavailable' >&2
+        exit 70
+        ;;
+esac
+"""
+    prefix = (
+        f"sudo --non-interactive docker exec {quoted_container} {quoted_busybox} kill"
+    )
+    return _ProcessGroupTarget(
+        prepare=prepare,
+        send_signal=f'{prefix} -{signal} -- "-$container_pid" 2>/dev/null || true',
+        is_alive=f'{prefix} -0 -- "-$container_pid" 2>/dev/null',
+    )
+
+
+def signal_command(
+    paths: RemoteJobPaths,
+    *,
+    signal: str,
+    pid: int,
+    container: str | None = None,
+    container_busybox: str = "/busybox",
+) -> str:
+    """Build an idempotent process-group signal and status reconciliation."""
+
+    if signal not in {"TERM", "KILL"}:
+        raise ValueError(f"invalid durable job signal: {signal!r}")
+    if pid <= 0:
+        raise ValueError("durable job PID must be positive")
+    job = shlex.quote(str(paths.directory))
+    terminal_pattern = shlex.quote(
+        _state_pattern(*(state for state in JobState if state.terminal))
+    )
+    terminated_status = shlex.quote(
+        JobStatus(JobState.TERMINATED, pid=pid, returncode=137).to_json()
+    )
+    target = (
+        _host_process_group(signal)
+        if container is None
+        else _container_process_group(
+            paths,
+            signal=signal,
+            container=container,
+            container_busybox=container_busybox,
+            terminal_pattern=terminal_pattern,
+        )
+    )
+    kill_completion = ""
+    if signal == "KILL":
+        kill_completion = f"""
+attempt=0
+while {target.is_alive}; do
+    if [ "$attempt" -ge 40 ]; then
+        exit 70
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+if grep -Eq {terminal_pattern} "$status"; then
+    cat -- "$status"
+    exit 0
+fi
+temporary="$job/.status.terminate.$$"
+printf '%s' {terminated_status} >"$temporary"
+mv -f -- "$temporary" "$status"
+"""
+    return f"""set -eu
+job={job}
+status={shlex.quote(str(paths.status))}
+touch -- {shlex.quote(str(paths.termination_request))}
+if grep -Eq {terminal_pattern} "$status"; then
+    cat -- "$status"
+    exit 0
+fi
+expected_pid={pid}
+recorded_pid=$(cat -- {shlex.quote(str(paths.supervisor_pid))} 2>/dev/null || true)
+if [ "$recorded_pid" != "$expected_pid" ]; then
+    echo 'durable job PID does not match its supervisor record' >&2
+    exit 64
+fi
+{target.prepare}
+{target.send_signal}
+{kill_completion}
+cat -- "$status"
 """
 
 
@@ -502,8 +712,11 @@ __all__ = [
     "OutputMode",
     "RemoteJobPaths",
     "can_transition",
+    "cleanup_command",
+    "container_job_directory",
     "launcher_script",
     "new_job_id",
+    "signal_command",
     "submission_command",
     "validate_job_id",
 ]

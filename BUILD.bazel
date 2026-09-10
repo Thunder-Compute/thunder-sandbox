@@ -15,7 +15,6 @@ py_library(
 filegroup(
     name = "package_metadata",
     srcs = [
-        "CHANGELOG.md",
         "LICENSE",
         "NOTICE",
         "README.md",

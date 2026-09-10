@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from .exceptions import InvalidRequestError
+
+OutputMode = Literal["capture", "discard"]
 
 
 class SandboxStatus(str, Enum):

@@ -5,7 +5,9 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 from contextlib import suppress
@@ -118,6 +120,27 @@ def route_missing() -> NotFoundError:
 
 
 class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def launcher_environment(root: Path) -> dict[str, str] | None:
+        """Provide the Linux flock CLI contract on platforms without it."""
+
+        if shutil.which("flock") is not None:
+            return None
+        binary_directory = root / "bin"
+        binary_directory.mkdir()
+        flock = binary_directory / "flock"
+        flock.write_text(
+            f"#!{sys.executable}\n"
+            "import fcntl, sys\n"
+            "try:\n"
+            "    fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except BlockingIOError:\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        flock.chmod(0o700)
+        return {**os.environ, "PATH": f"{binary_directory}{os.pathsep}{os.environ['PATH']}"}
+
     def test_job_ids_are_random_and_safe_remote_path_components(self) -> None:
         first = new_job_id()
         second = new_job_id()
@@ -203,7 +226,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(faults.hits("status"), 3)
         self.assertEqual(faults.hits("stdout"), 1)
 
-    def test_submission_is_detached_and_reuses_one_execution_claim(self) -> None:
+    def test_submission_is_detached_and_has_valid_shell_syntax(self) -> None:
         job_id = "c" * 32
         paths = RemoteJobPaths(job_id)
         spec = JobSpec(job_id, ("echo", "hello"))
@@ -215,24 +238,11 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('nohup setsid sh "$job/launch.sh"', command)
         self.assertIn("</dev/null >/dev/null", command)
-        self.assertIn(
-            'ln -- "$claim_candidate" "$job/execution.claim"',
-            launcher_script("echo hello", paths),
-        )
-        self.assertIn('claim_pid=$(cat -- "$job/execution.claim"', command)
-        self.assertIn('kill -0 "$claim_pid"', command)
-        self.assertIn('rm -rf -- "$job/execution.claim"', command)
-        self.assertIn('flock -w 15 9', command)
-        self.assertIn("exit 70", command)
-        self.assertNotIn("exit 75", command)
-        self.assertIn("trap ':' HUP INT TERM", launcher_script("echo hello", paths))
-        self.assertIn('wait "$payload_pid"', launcher_script("echo hello", paths))
-        self.assertIn('if [ -f "$job/termination.request" ]', launcher_script("echo hello", paths))
-        self.assertEqual(command.count("nohup setsid"), 1)
-        syntax = subprocess.run(
-            ["sh", "-n"], input=command, text=True, capture_output=True
-        )
-        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        for script in (command, launcher_script("echo hello", paths, spec)):
+            syntax = subprocess.run(
+                ["sh", "-n"], input=script, text=True, capture_output=True
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     async def test_launcher_executes_a_payload_at_most_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -243,15 +253,23 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             side_effect = root / "side-effect"
             command = f"printf x >> {shlex.quote(str(side_effect))}"
             script = Path(paths.launcher)
-            script.write_text(launcher_script(command, paths), encoding="utf-8")
+            spec = JobSpec(job_id, ("sh", "-c", command))
+            script.write_text(
+                launcher_script(command, paths, spec), encoding="utf-8"
+            )
             Path(paths.status).write_text(
                 JobStatus(JobState.PREPARED).to_json(), encoding="utf-8"
             )
             Path(paths.stdout).touch()
             Path(paths.stderr).touch()
 
-            first = await asyncio.create_subprocess_exec("sh", str(script))
-            second = await asyncio.create_subprocess_exec("sh", str(script))
+            environment = self.launcher_environment(root)
+            first = await asyncio.create_subprocess_exec(
+                "sh", str(script), env=environment
+            )
+            second = await asyncio.create_subprocess_exec(
+                "sh", str(script), env=environment
+            )
             self.assertEqual(await first.wait(), 0)
             self.assertEqual(await second.wait(), 0)
 
@@ -262,12 +280,14 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_launcher_redirects_output_and_records_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             job_id = "2" * 32
             paths = RemoteJobPaths(job_id, root=PurePosixPath(directory))
             Path(paths.directory).mkdir(mode=0o700)
+            spec = JobSpec(job_id, ("sh", "-c", "payload"))
             Path(paths.launcher).write_text(
                 launcher_script(
-                    "printf output; printf error >&2; exit 7", paths
+                    "printf output; printf error >&2; exit 7", paths, spec
                 ),
                 encoding="utf-8",
             )
@@ -276,7 +296,9 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             )
 
             process = await asyncio.create_subprocess_exec(
-                "sh", str(paths.launcher)
+                "sh",
+                str(paths.launcher),
+                env=self.launcher_environment(root),
             )
             self.assertEqual(await process.wait(), 0)
 
@@ -296,6 +318,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             job_id = "7" * 32
             paths = RemoteJobPaths(job_id, root=PurePosixPath(directory))
             Path(paths.directory).mkdir(mode=0o700)
+            spec = JobSpec(job_id, ("sh", "-c", "payload"))
             Path(paths.launcher).write_text(
                 launcher_script(
                     # The intermediate launcher subshell keeps its default
@@ -303,6 +326,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
                     # the hierarchy which previously escaped supervision.
                     "sh -c 'trap \"\" TERM; while :; do sleep 0.05; done'",
                     paths,
+                    spec,
                 ),
                 encoding="utf-8",
             )
@@ -311,7 +335,10 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             )
 
             process = await asyncio.create_subprocess_exec(
-                "sh", str(paths.launcher), start_new_session=True
+                "sh",
+                str(paths.launcher),
+                start_new_session=True,
+                env=self.launcher_environment(root),
             )
             try:
                 for _ in range(100):
@@ -342,18 +369,23 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             job_id = "8" * 32
             paths = RemoteJobPaths(job_id, root=PurePosixPath(directory))
             Path(paths.directory).mkdir(mode=0o700)
+            spec = JobSpec(job_id, ("sleep", "30"))
             Path(paths.launcher).write_text(
-                launcher_script("sleep 30", paths), encoding="utf-8"
+                launcher_script("sleep 30", paths, spec), encoding="utf-8"
             )
             Path(paths.status).write_text(
                 JobStatus(JobState.PREPARED).to_json(), encoding="utf-8"
             )
 
             process = await asyncio.create_subprocess_exec(
-                "sh", str(paths.launcher), start_new_session=True
+                "sh",
+                str(paths.launcher),
+                start_new_session=True,
+                env=self.launcher_environment(root),
             )
             try:
                 for _ in range(100):
@@ -1949,7 +1981,6 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             first_command = first.run.await_args.args[0]  # type: ignore[attr-defined]
             second_command = second.run.await_args.args[0]  # type: ignore[attr-defined]
             self.assertEqual(first_command, second_command)
-            self.assertIn('touch -- "$job/termination.request"', first_command)
             self.assertIn('kill -TERM -- "-$expected_pid"', first_command)
             await sandbox._close_connection()
             await client.close()

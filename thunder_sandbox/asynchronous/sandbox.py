@@ -11,11 +11,11 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Literal, cast, overload
 from urllib.parse import quote
 
@@ -35,6 +35,7 @@ from .._common.exceptions import (
 from .._common.types import (
     GPUType,
     NetworkPolicy,
+    OutputMode,
     Resources,
     SandboxInfo,
     SandboxStatus,
@@ -46,9 +47,11 @@ from ._jobs import (
     JobSpec,
     JobState,
     JobStatus,
-    OutputMode,
     RemoteJobPaths,
+    cleanup_command,
+    container_job_directory,
     new_job_id,
+    signal_command,
     submission_command,
     validate_job_id,
 )
@@ -56,6 +59,12 @@ from ._ssh import (
     RetryableSSHOperationError,
     SSHConnectionManager,
     SSH_CONNECT_TIMEOUT_SECONDS,
+)
+from ._transfer import (
+    parse_transfer_path as _parse_transfer_path,
+    publish_local_contents as _publish_local_contents,
+    publish_local_transfer as _publish_local_transfer,
+    remove_local_transfer_path as _remove_local_transfer_path,
 )
 from .client import Client
 from .process import Process
@@ -73,7 +82,6 @@ _CONTAINER_BUSYBOX = "/busybox"
 SSH_KEEPALIVE_INTERVAL_SECONDS = 15
 SSH_KEEPALIVE_COUNT_MAX = 4
 PROCESS_CLEANUP_GRACE_SECONDS = 5.0
-_CONTAINER_JOB_ROOT = "/tmp/thunder-sandbox/jobs"
 
 
 class Sandbox:
@@ -477,12 +485,10 @@ class Sandbox:
                 f"could not submit durable sandbox job (exit code {result.returncode})"
                 + (f": {detail}" if detail else "")
             )
-        try:
-            status = JobStatus.from_json(str(result.stdout or "").strip())
-        except ValueError as exc:
-            raise SandboxFailedError(
-                "durable sandbox job returned an invalid launch acknowledgement"
-            ) from exc
+        status = _decode_status(
+            str(result.stdout or ""),
+            context="durable sandbox job returned an invalid launch acknowledgement",
+        )
         return spec, status
 
     def _durable_process(
@@ -531,16 +537,11 @@ class Sandbox:
         paths = RemoteJobPaths(job_id)
         command = f"cat -- {shlex.quote(str(paths.status))}"
 
-        async def read(
-            connection: asyncssh.SSHClientConnection,
-        ) -> asyncssh.SSHCompletedProcess[str]:
-            result = await connection.run(command, check=False, encoding="utf-8")
-            if result.returncode is None:
-                raise RetryableSSHOperationError("durable job status read was lost")
-            return result
-
-        result = await self._ssh_manager.run(
-            read, name=f"durable sandbox job {job_id} status", deadline=deadline
+        result = await self._run_idempotent_command(
+            command,
+            name=f"durable sandbox job {job_id} status",
+            deadline=deadline,
+            check=False,
         )
         if result.returncode != 0:
             detail = str(result.stderr or "").strip()
@@ -548,12 +549,10 @@ class Sandbox:
                 f"durable sandbox job {job_id} was not found"
                 + (f": {detail}" if detail else "")
             )
-        try:
-            return JobStatus.from_json(str(result.stdout or "").strip())
-        except ValueError as exc:
-            raise SandboxFailedError(
-                f"durable sandbox job {job_id} has an invalid status"
-            ) from exc
+        return _decode_status(
+            str(result.stdout or ""),
+            context=f"durable sandbox job {job_id} has an invalid status",
+        )
 
     async def _read_job_spec(
         self, job_id: str, *, deadline: float | None
@@ -561,16 +560,11 @@ class Sandbox:
         paths = RemoteJobPaths(job_id)
         command = f"cat -- {shlex.quote(str(paths.specification))}"
 
-        async def read(
-            connection: asyncssh.SSHClientConnection,
-        ) -> asyncssh.SSHCompletedProcess[str]:
-            result = await connection.run(command, check=False, encoding="utf-8")
-            if result.returncode is None:
-                raise RetryableSSHOperationError("durable job spec read was lost")
-            return result
-
-        result = await self._ssh_manager.run(
-            read, name=f"durable sandbox job {job_id} specification", deadline=deadline
+        result = await self._run_idempotent_command(
+            command,
+            name=f"durable sandbox job {job_id} specification",
+            deadline=deadline,
+            check=False,
         )
         if result.returncode != 0:
             raise NotFoundError(f"durable sandbox job {job_id} was not found")
@@ -615,28 +609,15 @@ class Sandbox:
 
     async def _cleanup_job(self, job_id: str, *, container: str | None = None) -> None:
         paths = RemoteJobPaths(job_id)
-        job = shlex.quote(str(paths.directory))
-        container_cleanup = ""
-        if container is not None:
-            container_cleanup = (
-                "sudo --non-interactive docker exec "
-                f"{shlex.quote(container)} {_CONTAINER_BUSYBOX} rm -rf -- "
-                f"{shlex.quote(_container_job_directory(job_id))} 2>/dev/null || true\n"
-            )
-        command = f"{container_cleanup}rm -rf -- {job}"
+        command = cleanup_command(
+            paths, container=container, container_busybox=_CONTAINER_BUSYBOX
+        )
 
-        async def cleanup(
-            connection: asyncssh.SSHClientConnection,
-        ) -> asyncssh.SSHCompletedProcess[str]:
-            result = await connection.run(command, check=False, encoding="utf-8")
-            if result.returncode is None:
-                raise RetryableSSHOperationError("durable job cleanup was lost")
-            return result
-
-        result = await self._ssh_manager.run(
-            cleanup,
+        result = await self._run_idempotent_command(
+            command,
             name=f"durable sandbox job {job_id} cleanup",
             deadline=self._ssh_deadline(),
+            check=False,
         )
         if result.returncode != 0:
             detail = str(result.stderr or "").strip()
@@ -658,108 +639,20 @@ class Sandbox:
         if pid <= 0:
             raise InvalidRequestError("durable job PID must be positive")
         paths = RemoteJobPaths(job_id)
-        job = shlex.quote(str(paths.directory))
-        terminal_pattern = shlex.quote(
-            '"state":"succeeded"|"state":"failed"|"state":"terminated"'
+        command = signal_command(
+            paths,
+            signal=signal,
+            pid=pid,
+            container=container,
+            container_busybox=_CONTAINER_BUSYBOX,
         )
-        terminated_status = shlex.quote(
-            JobStatus(JobState.TERMINATED, pid=pid, returncode=137).to_json()
-        )
-        container_signal = ""
-        host_signal = f'kill -{signal} -- "-$expected_pid" 2>/dev/null || true'
-        workload_alive = 'kill -0 -- "-$expected_pid" 2>/dev/null'
-        if container is not None:
-            quoted_container = shlex.quote(container)
-            quoted_pid_file = shlex.quote(
-                f"{_container_job_directory(job_id)}/pid"
-            )
-            container_signal = f"""
-container_pid=''
-attempt=0
-while [ -z "$container_pid" ]; do
-    container_pid=$(sudo --non-interactive docker exec {quoted_container} {_CONTAINER_BUSYBOX} cat -- {quoted_pid_file} 2>/dev/null || true)
-    if [ -n "$container_pid" ] || grep -Eq {terminal_pattern} "$status"; then
-        break
-    fi
-    if [ "$attempt" -ge 40 ]; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.05
-done
-if grep -Eq {terminal_pattern} "$status"; then
-    cat -- "$status"
-    exit 0
-fi
-case "$container_pid" in
-    ''|*[!0-9]*)
-        echo 'durable container job PID is unavailable' >&2
-        exit 70
-        ;;
-esac
-"""
-            host_signal = (
-                f"sudo --non-interactive docker exec {quoted_container} "
-                f'{_CONTAINER_BUSYBOX} kill -{signal} -- "-$container_pid" '
-                "2>/dev/null || true"
-            )
-            workload_alive = (
-                f"sudo --non-interactive docker exec {quoted_container} "
-                f'{_CONTAINER_BUSYBOX} kill -0 -- "-$container_pid" 2>/dev/null'
-            )
-        kill_completion = ""
-        if signal == "KILL":
-            kill_completion = f"""
-attempt=0
-while {workload_alive}; do
-    if [ "$attempt" -ge 40 ]; then
-        exit 70
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.05
-done
-if grep -Eq {terminal_pattern} "$status"; then
-    cat -- "$status"
-    exit 0
-fi
-temporary="$job/.status.terminate.$$"
-printf '%s' {terminated_status} >"$temporary"
-mv -f -- "$temporary" "$status"
-"""
-        command = f"""set -eu
-job={job}
-status="$job/status.json"
-touch -- "$job/termination.request"
-if grep -Eq {terminal_pattern} "$status"; then
-    cat -- "$status"
-    exit 0
-fi
-expected_pid={pid}
-recorded_pid=$(sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p' "$status")
-if [ "$recorded_pid" != "$expected_pid" ]; then
-    echo 'durable job PID does not match its status' >&2
-    exit 64
-fi
-{container_signal}
-{host_signal}
-{kill_completion}
-cat -- "$status"
-"""
 
-        async def send_signal(
-            connection: asyncssh.SSHClientConnection,
-        ) -> asyncssh.SSHCompletedProcess[str]:
-            result = await connection.run(command, check=False, encoding="utf-8")
-            if result.returncode is None or result.returncode == 75:
-                raise RetryableSSHOperationError(
-                    f"durable job SIG{signal} acknowledgement was lost"
-                )
-            return result
-
-        result = await self._ssh_manager.run(
-            send_signal,
+        result = await self._run_idempotent_command(
+            command,
             name=f"durable sandbox job {job_id} SIG{signal}",
             deadline=self._ssh_deadline(),
+            retry_exit_codes={75},
+            check=False,
         )
         if result.returncode != 0:
             detail = str(result.stderr or "").strip()
@@ -767,12 +660,13 @@ cat -- "$status"
                 f"could not send SIG{signal} to durable sandbox job {job_id}"
                 + (f": {detail}" if detail else "")
             )
-        try:
-            return JobStatus.from_json(str(result.stdout or "").strip())
-        except ValueError as exc:
-            raise SandboxFailedError(
-                f"durable sandbox job {job_id} returned invalid status after SIG{signal}"
-            ) from exc
+        return _decode_status(
+            str(result.stdout or ""),
+            context=(
+                f"durable sandbox job {job_id} returned invalid status after "
+                f"SIG{signal}"
+            ),
+        )
 
     def _ssh_deadline(self) -> float | None:
         expires_at = self._info.expires_at
@@ -789,7 +683,8 @@ cat -- "$status"
         recursive: bool = False,
     ) -> None:
         source = os.fspath(local_path)
-        source_path = Path(source[:-2] if source.endswith(os.sep + ".") else source)
+        parsed_source = _parse_transfer_path(source, separator=os.sep)
+        source_path = Path(parsed_source.path)
         if not source_path.exists():
             raise InvalidRequestError(f"upload source does not exist: {source}")
         if source_path.is_dir() and not recursive:
@@ -797,10 +692,10 @@ cat -- "$status"
         if self.image_id is not None:
             await self._upload_to_container(local_path, remote_path, recursive=recursive)
             return
-        if source.endswith(os.sep + "."):
+        if parsed_source.contents_only:
             await self._upload_guest_contents(source_path, remote_path)
             return
-        source_name = Path(source.rstrip(os.sep)).name
+        source_name = parsed_source.name
         if not source_name:
             raise InvalidRequestError("upload source must have a file or directory name")
         target = await self._resolve_remote_upload_target(remote_path, source_name)
@@ -843,12 +738,9 @@ cat -- "$status"
     ) -> None:
         if not remote_path or "\x00" in remote_path:
             raise InvalidRequestError("download source must be a non-empty remote path")
-        contents_only = remote_path.endswith("/.")
-        source_name = (
-            "contents"
-            if contents_only
-            else PurePosixPath(remote_path.rstrip("/")).name
-        )
+        parsed_source = _parse_transfer_path(remote_path, separator="/")
+        contents_only = parsed_source.contents_only
+        source_name = parsed_source.name
         if not source_name:
             raise InvalidRequestError("download source must have a file or directory name")
         destination = Path(local_path)
@@ -959,16 +851,11 @@ cat -- "$status"
         destination = remote_path.rstrip("/") or "/"
         stage = f"{destination}.thunder-transfer-{transfer_id}.stage"
 
-        async def transfer(connection: asyncssh.SSHClientConnection) -> None:
-            await self._reset_remote_transfer_path(connection, stage, directory=True)
-            for child in source_directory.iterdir():
-                await asyncssh.scp(
-                    os.fspath(child), (connection, stage + "/"), recurse=True
-                )
-
         try:
-            await self._retry_scp(
-                transfer, name=f"upload directory contents to sandbox {self.id}"
+            await self._upload_directory_entries(
+                source_directory,
+                stage,
+                name=f"upload directory contents to sandbox {self.id}",
             )
             command = (
                 f"mkdir -p -- {shlex.quote(remote_path)} && "
@@ -979,6 +866,18 @@ cat -- "$status"
             )
         finally:
             await self._cleanup_remote_transfer_paths(stage)
+
+    async def _upload_directory_entries(
+        self, source_directory: Path, stage: str, *, name: str
+    ) -> None:
+        async def transfer(connection: asyncssh.SSHClientConnection) -> None:
+            await self._reset_remote_transfer_path(connection, stage, directory=True)
+            for child in source_directory.iterdir():
+                await asyncssh.scp(
+                    os.fspath(child), (connection, stage + "/"), recurse=True
+                )
+
+        await self._retry_scp(transfer, name=name)
 
     async def _publish_remote_transfer(
         self, stage: str, target: str, backup: str
@@ -1019,13 +918,22 @@ fi
             )
 
     async def _run_idempotent_command(
-        self, command: str, *, name: str, deadline: float | None = None
+        self,
+        command: str,
+        *,
+        name: str,
+        deadline: float | None = None,
+        retry_exit_codes: Container[int] = (),
+        check: bool = True,
     ) -> asyncssh.SSHCompletedProcess[str]:
         async def run(
             connection: asyncssh.SSHClientConnection,
         ) -> asyncssh.SSHCompletedProcess[str]:
             result = await connection.run(command, check=False, encoding="utf-8")
-            if result.returncode is None:
+            if (
+                result.returncode is None
+                or result.returncode in retry_exit_codes
+            ):
                 raise RetryableSSHOperationError(f"{name} acknowledgement was lost")
             return result
 
@@ -1034,7 +942,7 @@ fi
             name=name,
             deadline=self._ssh_deadline() if deadline is None else deadline,
         )
-        if result.returncode != 0:
+        if check and result.returncode != 0:
             detail = str(result.stderr or "").strip()
             raise SandboxFailedError(
                 f"{name} failed with exit code {result.returncode}"
@@ -1052,25 +960,13 @@ fi
         stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
         try:
             raw_source = os.fspath(local_path)
-            contents_only = raw_source.endswith(os.sep + ".")
+            parsed_source = _parse_transfer_path(raw_source, separator=os.sep)
+            contents_only = parsed_source.contents_only
             if contents_only:
-                source_directory = Path(raw_source[:-2])
-
-                async def transfer_contents(
-                    connection: asyncssh.SSHClientConnection,
-                ) -> None:
-                    await self._reset_remote_transfer_path(
-                        connection, stage, directory=True
-                    )
-                    for child in source_directory.iterdir():
-                        await asyncssh.scp(
-                            os.fspath(child),
-                            (connection, stage + "/"),
-                            recurse=True,
-                        )
-
-                await self._retry_scp(
-                    transfer_contents,
+                source_directory = Path(parsed_source.path)
+                await self._upload_directory_entries(
+                    source_directory,
+                    stage,
                     name=f"upload directory contents to sandbox {self.id}",
                 )
                 guest_source = stage + "/."
@@ -1089,9 +985,9 @@ fi
 
                 await self._retry_scp(
                     transfer_path,
-                    name=f"upload {Path(raw_source).name} to sandbox {self.id}",
+                    name=f"upload {parsed_source.name} to sandbox {self.id}",
                 )
-                guest_source = stage + "/" + Path(raw_source).name
+                guest_source = stage + "/" + parsed_source.name
             await self._run_guest_command(
                 "sudo",
                 "--non-interactive",
@@ -1115,7 +1011,8 @@ fi
         stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
         await self._run_guest_command("mkdir", "-p", "--", stage)
         try:
-            contents_only = remote_path.endswith("/.")
+            parsed_source = _parse_transfer_path(remote_path, separator="/")
+            contents_only = parsed_source.contents_only
             await self._run_guest_command(
                 "sudo",
                 "--non-interactive",
@@ -1127,7 +1024,7 @@ fi
             guest_source = (
                 stage + "/."
                 if contents_only
-                else stage + "/" + remote_path.rstrip("/").rsplit("/", 1)[-1]
+                else stage + "/" + parsed_source.name
             )
             await self._download_from_guest(
                 guest_source, local_path, recursive=recursive
@@ -1190,14 +1087,9 @@ fi
         )
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
-        async def connected(
-            connection: asyncssh.SSHClientConnection,
-        ) -> asyncssh.SSHClientConnection:
-            return connection
-
         try:
-            return await self._ssh_manager.run(
-                connected, name=f"sandbox {self.id} SSH connection"
+            return await self._ssh_manager.connect(
+                name=f"sandbox {self.id} SSH connection"
             )
         except (OSError, asyncssh.Error) as exc:
             raise ConnectionError(
@@ -1347,7 +1239,7 @@ fi
         on this side: each wait request carries its own window and HTTP
         timeout, faults retry with backoff inside the outage grace period, and
         ``deadline`` caps the whole. Returns ``False`` when the deadline passes
-        with the sandbox still starting; the caller owns the message. (by claude)
+        with the sandbox still starting; the caller owns the message.
         """
 
         def expired() -> bool:
@@ -1393,7 +1285,7 @@ fi
         """Refresh once, holding the request open server-side where the API allows.
 
         Raises ``_WaitWindowElapsedError`` when the sandbox is still starting
-        at the end of the window. (by claude)
+        at the end of the window.
         """
         client = self._client
         if not client._wait_endpoint_available:
@@ -1449,57 +1341,11 @@ def _earliest_deadline(first: float | None, second: float | None) -> float | Non
     return min(first, second)
 
 
-def _remove_local_transfer_path(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif path.exists() or path.is_symlink():
-        path.unlink()
-
-
-def _publish_local_transfer(stage: Path, target: Path) -> None:
-    """Publish a complete local download without exposing its staging path."""
-
-    if not stage.exists() and not stage.is_symlink():
-        raise SandboxFailedError("download completed without producing its staged path")
-    if stage.is_dir() and target.is_dir():
-        _publish_local_contents(stage, target)
-        return
-    _replace_local_transfer(stage, target)
-
-
-def _replace_local_transfer(stage: Path, target: Path) -> None:
-    backup = target.parent / f".{target.name}.thunder-backup-{uuid.uuid4().hex}"
-    if target.is_dir() and not target.is_symlink():
-        os.replace(target, backup)
-        try:
-            os.replace(stage, target)
-        except BaseException:
-            os.replace(backup, target)
-            raise
-        _remove_local_transfer_path(backup)
-    else:
-        os.replace(stage, target)
-
-
-def _publish_local_contents(stage: Path, target: Path) -> None:
-    """Atomically overlay staged directory contents on a local destination."""
-
-    if not stage.is_dir():
-        raise SandboxFailedError("directory download produced an invalid staged path")
-    combined = target.parent / f".{target.name}.thunder-combined-{uuid.uuid4().hex}"
+def _decode_status(value: str, *, context: str) -> JobStatus:
     try:
-        if target.exists() or target.is_symlink():
-            if not target.is_dir():
-                raise SandboxFailedError(
-                    "cannot download directory contents into a non-directory"
-                )
-            shutil.copytree(target, combined)
-        else:
-            combined.mkdir()
-        shutil.copytree(stage, combined, dirs_exist_ok=True)
-        _replace_local_transfer(combined, target)
-    finally:
-        _remove_local_transfer_path(combined)
+        return JobStatus.from_json(value.strip())
+    except ValueError as exc:
+        raise SandboxFailedError(context) from exc
 
 
 @overload
@@ -1684,7 +1530,7 @@ def _wait_window(deadline: float | None) -> float:
     The client deadline, not the server's maximum, is the binding bound once
     it is nearer. Rounded to the millisecond so the query string stays plain,
     and never below one: the API rejects a window of zero, and a deadline that
-    has just passed is reported by the caller, not by a 400. (by claude)
+    has just passed is reported by the caller, not by a 400.
     """
     window = WAIT_WINDOW_MAX_SECONDS
     if deadline is not None:
@@ -1776,7 +1622,7 @@ def _container_remote_command(
         parts.extend(payload)
     else:
         validate_job_id(job_id)
-        container_job = _container_job_directory(job_id)
+        container_job = str(container_job_directory(job_id))
         inner = (
             "set -eu\n"
             f"job={shlex.quote(container_job)}\n"
@@ -1789,10 +1635,4 @@ def _container_remote_command(
         )
         parts.extend(payload)
     return " ".join(shlex.quote(part) for part in parts)
-
-
-def _container_job_directory(job_id: str) -> str:
-    return posixpath.join(_CONTAINER_JOB_ROOT, validate_job_id(job_id))
-
-
 __all__ = ["Sandbox"]
