@@ -129,13 +129,21 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
         binary_directory = root / "bin"
         binary_directory.mkdir()
         flock = binary_directory / "flock"
+        lock_dir = binary_directory / "flock.lockd"
         flock.write_text(
             f"#!{sys.executable}\n"
-            "import fcntl, sys\n"
+            "import sys\n"
             "try:\n"
+            "    import fcntl\n"
             "    fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
             "except BlockingIOError:\n"
-            "    raise SystemExit(1)\n",
+            "    raise SystemExit(1)\n"
+            "except ImportError:\n"
+            "    import os\n"
+            "    try:\n"
+            f"        os.mkdir({str(lock_dir)!r})\n"
+            "    except FileExistsError:\n"
+            "        raise SystemExit(1)\n",
             encoding="utf-8",
         )
         flock.chmod(0o700)

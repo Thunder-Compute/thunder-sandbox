@@ -26,7 +26,7 @@ def parse_transfer_path(path: str, *, separator: str) -> ParsedTransferPath:
     name = (
         "contents"
         if contents_only
-        else stripped.rstrip(separator).rsplit(separator, 1)[-1]
+        else Path(stripped.rstrip(separator)).name
     )
     return ParsedTransferPath(stripped, contents_only, name)
 
