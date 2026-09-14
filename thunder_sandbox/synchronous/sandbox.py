@@ -454,6 +454,14 @@ class Sandbox:
             )
         )
 
+    def get_hourly_price(self) -> float:
+        """Return the configured resources' USD/hour at current published rates."""
+        return self._client._bridge.run(self._sandbox.get_hourly_price())
+
+    async def get_hourly_price_async(self) -> float:
+        """Return the configured resources' USD/hour through the async adapter."""
+        return await self._client._bridge.run_async(self._sandbox.get_hourly_price())
+
     def refresh(self) -> "Sandbox":
         self._client._bridge.run(self._sandbox.refresh())
         return self

@@ -30,6 +30,7 @@ from .._common.exceptions import (
     RetryableError,
     SandboxFailedError,
     SandboxTimeoutError,
+    ThunderError,
     _WaitWindowElapsedError,
 )
 from .._common.types import (
@@ -1157,6 +1158,28 @@ fi
 
     async def _close_connection(self) -> None:
         await self._ssh_manager.close()
+
+    async def get_hourly_price(self) -> float:
+        """Return the configured resources' aggregate USD/hour at current rates.
+
+        Uses stored resource quantities regardless of lifecycle status; this is
+        an hourly rate, not accrued charges. No SDK pricing cache is used.
+        """
+        pricing = await self._client.get_pricing()
+        resources = self.info.resources
+        total = (
+            resources.cpu * pricing.vcpu
+            + resources.memory * pricing.memory_gb
+            + resources.storage * pricing.storage_gb
+        )
+        if resources.gpu_count:
+            if resources.gpu_type is None or resources.gpu_type not in pricing.gpu:
+                raise ThunderError(
+                    f"no published rate for GPU type: {resources.gpu_type}",
+                    code="pricing_unavailable",
+                )
+            total += resources.gpu_count * pricing.gpu[resources.gpu_type]
+        return total
 
     async def refresh(self) -> "Sandbox":
         response = await self._client._request(

@@ -20,6 +20,7 @@ from ._common.exceptions import (
 from ._common.types import (
     GPUType,
     NetworkPolicy,
+    Pricing,
     Resources,
     SandboxInfo,
     SandboxStatus,
@@ -30,7 +31,7 @@ from .image import Image, ResolvedImage
 __all__ = [
     "AuthenticationError", "CapacityError", "ClientConfig", "ConflictError",
     "ConnectionError", "GPUType", "Image", "InvalidRequestError", "ResolvedImage",
-    "NetworkPolicy", "NotFoundError", "RateLimitError", "Resources", "RetryableError",
+    "NetworkPolicy", "NotFoundError", "Pricing", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError",

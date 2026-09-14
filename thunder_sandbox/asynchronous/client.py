@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from .._common.exceptions import (
     ThunderError,
     _WaitWindowElapsedError,
 )
-from .._common.types import GPUType, SandboxStatus
+from .._common.types import GPUType, Pricing, SandboxStatus
 from .._version import __version__
 from .credentials import CredentialStore
 
@@ -178,6 +179,39 @@ class Client:
         if not isinstance(result, dict):
             raise ConnectionError("Thunder returned an unexpected response")
         return result
+
+    async def get_pricing(self) -> Pricing:
+        """Fetch current USD/hour resource rates, subject to API-side caching.
+
+        Memory and storage rates are per GiB. Unpublished GPU rates are omitted.
+        """
+        response = await self._request("GET", "/pricing")
+        rates = response.get("pricing")
+        if not isinstance(rates, dict):
+            raise ThunderError("invalid pricing catalog", code="invalid_pricing")
+
+        def rate(key: str) -> float:
+            value = rates.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ThunderError(f"invalid or missing rate: {key}", code="invalid_pricing")
+            try:
+                result = float(value)
+            except OverflowError as exc:
+                raise ThunderError(f"invalid rate: {key}", code="invalid_pricing") from exc
+            if not math.isfinite(result) or result < 0:
+                raise ThunderError(f"invalid rate: {key}", code="invalid_pricing")
+            return result
+
+        return Pricing(
+            vcpu=rate("sandbox_vcpu"),
+            storage_gb=rate("sandbox_storage_gb"),
+            memory_gb=rate("sandbox_memory_gb"),
+            gpu={
+                gpu: rate(f"sandbox_{gpu.value.lower()}")
+                for gpu in GPUType
+                if gpu != GPUType.UNKNOWN and f"sandbox_{gpu.value.lower()}" in rates
+            },
+        )
 
     async def resolve_image(
         self, image: "Image", *, timeout: float | None = 7200

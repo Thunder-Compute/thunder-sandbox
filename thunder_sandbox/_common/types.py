@@ -55,6 +55,16 @@ class GPUType(str, Enum):
 
 
 @dataclass(frozen=True)
+class Pricing:
+    """USD per resource-hour; memory_gb and storage_gb are per GiB."""
+
+    vcpu: float
+    storage_gb: float
+    memory_gb: float
+    gpu: dict[GPUType, float]
+
+
+@dataclass(frozen=True)
 class Resources:
     cpu: int
     memory: int
