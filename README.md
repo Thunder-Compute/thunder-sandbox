@@ -81,6 +81,28 @@ print(sandbox.id, sandbox.name)
 same = thunder.Sandbox.from_name("training-run")
 ```
 
+## Live pricing
+
+Fetch current resource rates as a `thunder.Pricing` object, or get a sandbox's aggregate hourly rate:
+
+```python
+with thunder.Client.from_cli() as client:
+    pricing = client.get_pricing()
+    print(pricing.vcpu, pricing.memory_gb, pricing.storage_gb)
+    print(pricing.gpu[thunder.GPUType.H100])
+
+    sandbox = client.get_sandbox("sbx-your-id")
+    print(sandbox.get_hourly_price())
+```
+
+All rates are USD per resource-hour. `memory_gb` and `storage_gb` are per **GiB**, matching sandbox resource quantities. The GPU dictionary contains only published rates, keyed by `GPUType`; A100XL is distinct from A100.
+
+Each call fetches pricing from the API without SDK caching; the API's own caching still applies. The sandbox total includes every configured vCPU, GiB of memory, GiB of storage, and GPU, with no included-resource allowance or rounding. It uses the sandbox object's stored resources regardless of lifecycle status and reports an hourly rate, not accrued charges.
+
+Invalid or missing base rates raise `ThunderError` with code `invalid_pricing`. A sandbox using an unpriced GPU raises `ThunderError` with code `pricing_unavailable` rather than returning a partial total.
+
+The native asynchronous API supports `await client.get_pricing()` and `await sandbox.get_hourly_price()`. Blocking objects also expose `await client.get_pricing_async()` and `await sandbox.get_hourly_price_async()`.
+
 ## Handling errors
 
 Conditions worth retrying are typed, so they can be caught without matching on

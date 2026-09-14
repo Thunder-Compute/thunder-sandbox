@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common.config import ClientConfig
 from .._common.exceptions import ConnectionError
-from .._common.types import GPUType, SandboxStatus
+from .._common.types import GPUType, Pricing, SandboxStatus
 from ..asynchronous.client import Client as NativeClient
 from ._bridge import AsyncBridge
 
@@ -87,6 +87,14 @@ class Client:
             outbound_domain_allowlist=outbound_domain_allowlist,
             client=self,
         )
+
+    def get_pricing(self) -> Pricing:
+        """Fetch current USD/hour rates; memory and storage are priced per GiB."""
+        return self._bridge.run(self._client.get_pricing())
+
+    async def get_pricing_async(self) -> Pricing:
+        """Fetch current resource rates through the asynchronous adapter."""
+        return await self._bridge.run_async(self._client.get_pricing())
 
     def resolve_image(
         self, image: "Image", *, timeout: float | None = 7200
