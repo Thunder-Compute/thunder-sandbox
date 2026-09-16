@@ -2785,6 +2785,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
+            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
             try:
                 for (
                     name,
@@ -2831,6 +2832,49 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         )
             finally:
                 await client.close()
+
+    async def test_update_network_policy_flushes_dns_with_nonzero_exits(self) -> None:
+        cases = [
+            (None, [0]),
+            (None, [127]),
+            ("image-id", [0, 0]),
+            ("image-id", [1, 0, 0]),
+            ("image-id", [127, 127, 1]),
+        ]
+        for image_id, exit_codes in cases:
+            with self.subTest(image_id=image_id, exit_codes=exit_codes):
+                with tempfile.TemporaryDirectory() as directory:
+                    sandbox, client = self.sandbox(directory)
+                    sandbox = AsyncSandbox._from_response(
+                        client, {**SANDBOX_RESPONSE, "image_id": image_id}
+                    )
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        return_value={"network_policy": {"internet_access": "closed"}}
+                    )
+                    connection = mock.Mock()
+
+                    async def run(command: str, **kwargs: object) -> mock.Mock:
+                        client._request.assert_awaited_once()
+                        self.assertEqual(sandbox.info.network_policy.internet_access, "closed")
+                        return mock.Mock(returncode=exit_codes[connection.run.await_count - 1])
+
+                    connection.run = mock.AsyncMock(side_effect=run)
+                    try:
+                        with mock.patch.object(
+                            sandbox._ssh_manager, "get", new=mock.AsyncMock(return_value=connection)
+                        ):
+                            await sandbox.update_network_policy(block_network=True)
+                        commands = [call.args[0] for call in connection.run.await_args_list]
+                        expected = []
+                        if image_id is not None:
+                            prefix = "sudo --non-interactive docker exec --interactive thunder-sandbox "
+                            expected.append(prefix + "resolvectl flush-caches")
+                            if exit_codes[0] != 0:
+                                expected.append(prefix + "sudo --non-interactive resolvectl flush-caches")
+                        expected.append("sudo --non-interactive resolvectl flush-caches")
+                        self.assertEqual(commands, expected)
+                    finally:
+                        await client.close()
 
     async def test_update_network_policy_rejects_closed_with_allowlists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

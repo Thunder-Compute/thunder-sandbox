@@ -1086,6 +1086,25 @@ fi
             self._info,
             network_policy=_network_policy_from_response(policy),
         )
+        if self.image_id is not None:
+            for args in (
+                ("resolvectl", "flush-caches"),
+                ("sudo", "--non-interactive", "resolvectl", "flush-caches"),
+            ):
+                result = await self._run_idempotent_command(
+                    _container_remote_command(args, workdir=None, env=None, pty=False),
+                    name=f"sandbox {self.id} container DNS cache flush",
+                    check=False,
+                )
+                if result.returncode == 0:
+                    break
+        # Always flush the VM resolver, even if the container lacks resolvectl
+        # or permission to flush its own cache. Nonzero exits are best-effort.
+        await self._run_idempotent_command(
+            "sudo --non-interactive resolvectl flush-caches",
+            name=f"sandbox {self.id} VM DNS cache flush",
+            check=False,
+        )
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         try:

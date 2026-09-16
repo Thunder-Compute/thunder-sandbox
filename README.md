@@ -242,6 +242,8 @@ restricted.update_network_policy()
 
 `update_network_policy()` returns after Thunder accepts the desired policy; enforcement on the sandbox's node converges asynchronously. Tightening a policy blocks new connections but does not currently guarantee that already-established connections are terminated.
 
+After the policy is accepted, the SDK attempts to flush DNS caches using `resolvectl flush-caches`: inside image-backed containers first (retrying with non-interactive `sudo` if needed), then on the VM with non-interactive `sudo` for all sandbox types. Nonzero flush exit codes are ignored; SSH transport errors still follow the normal retry and error behavior.
+
 ## Environment and lifetime
 
 ```python
