@@ -1106,7 +1106,7 @@ fi
                 archive.finish()
                 extraction_error = await _settled(extraction)
             if failed_early and extraction_error is not None:
-                raise extraction_error
+                _raise_local_transfer_error(extraction_error, connection, name)
             if completed is None or completed.returncode is None:
                 raise RetryableSSHOperationError(f"{name} stream was lost")
             if completed.returncode != 0:
@@ -1117,7 +1117,7 @@ fi
                     f"{completed.returncode}" + (f": {detail}" if detail else "")
                 )
             if extraction_error is not None:
-                raise extraction_error
+                _raise_local_transfer_error(extraction_error, connection, name)
 
         try:
             try:
@@ -1722,6 +1722,18 @@ async def _settled(task: "asyncio.Future[None]") -> BaseException | None:
     except BaseException as exc:
         return exc
     return None
+
+
+def _raise_local_transfer_error(
+    error: BaseException,
+    connection: asyncssh.SSHClientConnection,
+    name: str,
+) -> None:
+    """Re-raise a local write failure so SSH retries do not hide it."""
+
+    if isinstance(error, OSError) and not connection.is_closed():
+        raise SandboxFailedError(f"could not complete {name}: {error}") from error
+    raise error
 
 
 def _remote_command(

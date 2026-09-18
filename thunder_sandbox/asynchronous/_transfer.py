@@ -185,6 +185,10 @@ def extract_container_archive(
                         f"download archive has an unsafe member path: {member.name!r}"
                     )
                 destination = stage.joinpath(*relative)
+                if not _path_stays_in_stage(destination, stage):
+                    raise SandboxFailedError(
+                        f"download archive has an unsafe member path: {member.name!r}"
+                    )
                 if member.isdir():
                     if not recursive:
                         raise SandboxFailedError(
@@ -211,12 +215,26 @@ def extract_container_archive(
     finally:
         if isinstance(archive, ArchiveStream):
             archive.abandon()
-    # A stream can only be read forwards, and a link may precede its target.
-    for destination, target in links:
-        if target.is_file() and not destination.exists():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(target, destination)
-            produced = True
+    # A stream can only be read forwards, and a link may precede its target
+    # or another payload link. Repeat until a pass makes no progress so a
+    # chain such as link1 -> link2 -> file is copied in full.
+    pending = links
+    while pending:
+        remaining: list[tuple[Path, Path]] = []
+        progressed = False
+        for destination, target in pending:
+            if destination.exists():
+                continue
+            if target.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(target, destination)
+                produced = True
+                progressed = True
+            else:
+                remaining.append((destination, target))
+        if not progressed:
+            break
+        pending = remaining
     if not produced:
         raise SandboxFailedError("download archive was empty")
 
@@ -224,14 +242,31 @@ def extract_container_archive(
 def _archive_member_path(name: str, *, contents_only: bool) -> tuple[str, ...] | None:
     """Return ``name`` relative to the stage, or None if it could escape it."""
 
-    if name.startswith("/"):
+    if name.startswith(("/", "\\")) or "\x00" in name:
         return None
-    parts = [part for part in name.split("/") if part not in ("", ".")]
+    # Normalize separators so ``..\\`` and drive-prefixed names cannot slip
+    # past a POSIX ``/`` split and later escape on Windows via joinpath.
+    parts = [
+        part for part in name.replace("\\", "/").split("/") if part not in ("", ".")
+    ]
     if ".." in parts:
+        return None
+    if any(_is_windows_drive(part) for part in parts):
         return None
     # Outside the contents form, the first component is the source's own name,
     # which the stage already stands for.
     return tuple(parts if contents_only else parts[1:])
+
+
+def _is_windows_drive(part: str) -> bool:
+    return len(part) >= 2 and part[0].isalpha() and part[1] == ":"
+
+
+def _path_stays_in_stage(path: Path, stage: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(stage.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _archive_link_target(
@@ -247,17 +282,19 @@ def _archive_link_target(
             member.linkname, contents_only=contents_only
         )
         return None if target_parts is None else stage.joinpath(*target_parts)
-    if member.linkname.startswith("/"):
+    if member.linkname.startswith(("/", "\\")):
         return None
     # Symlink targets are relative to the link's own directory.
     resolved: list[str] = list(relative[:-1])
-    for part in member.linkname.split("/"):
+    for part in member.linkname.replace("\\", "/").split("/"):
         if part in ("", "."):
             continue
         if part == "..":
             if not resolved:
                 return None
             resolved.pop()
+        elif _is_windows_drive(part):
+            return None
         else:
             resolved.append(part)
     return stage.joinpath(*resolved)

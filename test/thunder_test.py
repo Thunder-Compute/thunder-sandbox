@@ -573,6 +573,7 @@ class ContainerArchiveExtractionTest(unittest.TestCase):
             archive = docker_archive(
                 {
                     "./": None,
+                    "./chain": ("sym", "early_link"),  # Precedes another payload link.
                     "./early_link": ("sym", "a.txt"),  # Precedes its target.
                     "./a.txt": (b"data", 0o600),
                     "./hard": ("hard", "./a.txt"),
@@ -583,7 +584,7 @@ class ContainerArchiveExtractionTest(unittest.TestCase):
                 }
             )
             self.extract(archive, stage, contents_only=True)
-            for copied in ("early_link", "hard", "sub/up"):
+            for copied in ("early_link", "chain", "hard", "sub/up"):
                 self.assertEqual((stage / copied).read_bytes(), b"data")
                 self.assertFalse((stage / copied).is_symlink())
             # A container-absolute or escaping target means nothing locally.
@@ -591,7 +592,14 @@ class ContainerArchiveExtractionTest(unittest.TestCase):
             self.assertFalse(os.path.lexists(stage / "escape"))
 
     def test_member_paths_cannot_leave_the_stage(self) -> None:
-        for name in ("../evil.txt", "/abs/evil.txt", "./ok/../../evil.txt"):
+        for name in (
+            "../evil.txt",
+            "/abs/evil.txt",
+            "./ok/../../evil.txt",
+            "..\\..\\evil.txt",
+            "C:\\evil.txt",
+            "C:/evil.txt",
+        ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 stage = Path(directory) / "stage" / "contents"
                 with self.assertRaisesRegex(SandboxFailedError, "unsafe member path"):
@@ -2776,6 +2784,44 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 await sandbox.download("/nope.txt", destination)
 
             self.assertFalse(destination.exists())
+            await client.close()
+
+    async def test_download_from_image_container_does_not_retry_local_write_errors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            destination = Path(directory) / "result.txt"
+            connection = ArchiveSSHConnection(
+                [ArchiveProcess(docker_archive({"result.txt": (b"score", 0o600)}))]
+            )
+            opened = mock.AsyncMock()
+            sandbox._ssh_manager = SSHConnectionManager(
+                opened,  # type: ignore[arg-type]
+                sleep=mock.AsyncMock(),
+                jitter=lambda _start, _end: 0.0,
+            )
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+
+            def fail_extract(archive: object, *_args: object, **_kwargs: object) -> None:
+                abandon = getattr(archive, "abandon", None)
+                if callable(abandon):
+                    abandon()
+                raise OSError(28, "No space left on device")
+
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._extract_container_archive",
+                side_effect=fail_extract,
+            ):
+                with self.assertRaisesRegex(SandboxFailedError, "No space left on device"):
+                    await sandbox.download("/workspace/result.txt", destination)
+
+            opened.assert_not_awaited()
+            self.assertFalse(destination.exists())
+            await sandbox._close_connection()
             await client.close()
 
     async def test_download_from_image_container_restarts_a_lost_stream(self) -> None:
