@@ -2550,8 +2550,66 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         "thunder-sandbox:/workspace/result.txt",
                         stage + "/",
                     ),
+                    (
+                        "sudo",
+                        "--non-interactive",
+                        "chown",
+                        "-R",
+                        "-h",
+                        "--",
+                        "ubuntu:",
+                        stage,
+                    ),
+                    (
+                        "sudo",
+                        "--non-interactive",
+                        "chmod",
+                        "-R",
+                        "u+rwX",
+                        "--",
+                        stage,
+                    ),
                 ],
             )
+            await client.close()
+
+    async def test_download_from_image_container_hands_stage_to_ssh_user_before_scp(
+        self,
+    ) -> None:
+        # docker cp preserves container ownership, so a root-owned 0600 file
+        # (a verifier's locked-down output, say) is unreadable to the SSH user
+        # that scp runs as. The stage must change hands between the two legs.
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "b" * 64}
+            )
+            destination = Path(directory) / "frozen.sha256"
+            sandbox._ssh_manager._connection = FakeSSHConnection()  # type: ignore[assignment]
+            order: list[str] = []
+
+            async def record_guest(*args: str) -> None:
+                order.append(next(a for a in args if a in {"mkdir", "docker", "chown", "chmod"}))
+
+            async def record_scp(*args: object, **kwargs: object) -> None:
+                order.append("scp")
+
+            with mock.patch.object(
+                sandbox, "_run_guest_command", new=mock.AsyncMock(side_effect=record_guest)
+            ) as guest, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
+                new=mock.AsyncMock(side_effect=record_scp),
+            ), mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._publish_local_transfer"
+            ):
+                await sandbox.download("/logs/verifier/frozen.sha256", destination)
+
+            self.assertEqual(order, ["mkdir", "docker", "chown", "chmod", "scp"])
+            chown = next(c.args for c in guest.await_args_list if "chown" in c.args)
+            # Under sudo, a symlink in the payload must never redirect the
+            # ownership change to a guest file outside the stage.
+            self.assertIn("-h", chown)
+            self.assertEqual(chown[:2], ("sudo", "--non-interactive"))
             await client.close()
 
     async def test_wait_until_ready_holds_a_server_side_wait_open(self) -> None:
