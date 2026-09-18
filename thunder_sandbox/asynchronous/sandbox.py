@@ -1022,6 +1022,34 @@ fi
                 f"{_CONTAINER_NAME}:{remote_path}",
                 stage + "/",
             )
+            # docker cp keeps each file's container owner and mode, but the
+            # next leg reads the stage over SSH as an unprivileged user. A
+            # payload that is root-owned and owner-only (0600 files, 0700
+            # directories) would fail that leg with "Permission denied" and
+            # could not be cleaned up afterwards. Hand the staged copy to the
+            # SSH user. -h changes a symlink itself, never its target: this
+            # runs under sudo, and the payload must not be able to point the
+            # chown at a guest file outside the stage. chmod -R skips
+            # symlinks on its own.
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "chown",
+                "-R",
+                "-h",
+                "--",
+                f"{self.ssh.user}:",
+                stage,
+            )
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "chmod",
+                "-R",
+                "u+rwX",
+                "--",
+                stage,
+            )
             guest_source = (
                 stage + "/."
                 if contents_only
