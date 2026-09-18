@@ -62,6 +62,8 @@ from ._ssh import (
     SSH_CONNECT_TIMEOUT_SECONDS,
 )
 from ._transfer import (
+    ArchiveStream as _ArchiveStream,
+    extract_container_archive as _extract_container_archive,
     parse_transfer_path as _parse_transfer_path,
     publish_local_contents as _publish_local_contents,
     publish_local_transfer as _publish_local_transfer,
@@ -77,6 +79,7 @@ WAIT_WINDOW_MAX_SECONDS = 30.0
 # the client gives up on it, covering transit and a server that has stalled.
 WAIT_REPLY_GRACE_SECONDS = 15.0
 _CONTAINER_NAME = "thunder-sandbox"
+_ARCHIVE_CHUNK_BYTES = 1 << 20
 _CONTAINER_BUSYBOX = "/busybox"
 
 
@@ -1009,33 +1012,128 @@ fi
         *,
         recursive: bool,
     ) -> None:
-        stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
-        await self._run_guest_command("mkdir", "-p", "--", stage)
-        try:
-            parsed_source = _parse_transfer_path(remote_path, separator="/")
-            contents_only = parsed_source.contents_only
-            await self._run_guest_command(
+        """Stream the payload out of the container as a tar archive.
+
+        ``docker cp CONTAINER:PATH -`` writes a tar stream to stdout. Running
+        it under sudo and unpacking on this side means the payload is never
+        staged on the guest, so nothing there has to be readable by the
+        unprivileged SSH user. Owner-only files that root wrote inside the
+        container (0600 files, 0700 directories) download like any others, and
+        there is no guest staging directory to fill the disk or clean up.
+        """
+
+        if not remote_path or "\x00" in remote_path:
+            raise InvalidRequestError("download source must be a non-empty remote path")
+        parsed_source = _parse_transfer_path(remote_path, separator="/")
+        contents_only = parsed_source.contents_only
+        source_name = parsed_source.name
+        if not source_name:
+            raise InvalidRequestError("download source must have a file or directory name")
+        destination = Path(local_path)
+        target = (
+            destination
+            if contents_only
+            else destination / source_name if destination.is_dir() else destination
+        )
+        transfer_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target.name}.thunder-transfer-",
+                dir=os.fspath(target.parent),
+            )
+        )
+        stage = transfer_root / ("contents" if contents_only else source_name)
+        name = f"download {remote_path} from sandbox {self.id} container"
+        command = _remote_command(
+            (
                 "sudo",
                 "--non-interactive",
                 "docker",
                 "cp",
                 f"{_CONTAINER_NAME}:{remote_path}",
-                stage + "/",
+                "-",
+            ),
+            workdir=None,
+            env=None,
+        )
+
+        async def attempt(connection: asyncssh.SSHClientConnection) -> None:
+            # Every attempt restarts the archive from its first byte.
+            await asyncio.to_thread(_remove_local_transfer_path, stage)
+            archive = _ArchiveStream()
+            extraction = asyncio.ensure_future(
+                asyncio.to_thread(
+                    _extract_container_archive,
+                    archive,
+                    stage,
+                    contents_only=contents_only,
+                    recursive=recursive,
+                )
             )
-            guest_source = (
-                stage + "/."
-                if contents_only
-                else stage + "/" + parsed_source.name
+            completed: asyncssh.SSHCompletedProcess[bytes] | None = None
+            detail = ""
+            failed_early = False
+            try:
+                process = await connection.create_process(command, encoding=None)
+                try:
+                    reader_gone = False
+                    while True:
+                        chunk = await process.stdout.read(_ARCHIVE_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        if reader_gone:
+                            continue  # Padding after the end-of-archive marker.
+                        if not await asyncio.to_thread(archive.feed, chunk):
+                            reader_gone = True
+                            if await _settled(extraction) is not None:
+                                # The archive is unusable. Stop here instead of
+                                # draining what could be gigabytes; closing the
+                                # channel unblocks the remote docker cp.
+                                failed_early = True
+                                break
+                    if not failed_early:
+                        archive.finish()
+                        detail = (
+                            (await process.stderr.read())
+                            .decode("utf-8", "replace")
+                            .strip()
+                        )
+                        completed = await process.wait(check=False)
+                finally:
+                    process.close()
+            finally:
+                # finish() never blocks, so cancellation cannot strand the
+                # extractor thread on a stream that will never end.
+                archive.finish()
+                extraction_error = await _settled(extraction)
+            if failed_early and extraction_error is not None:
+                raise extraction_error
+            if completed is None or completed.returncode is None:
+                raise RetryableSSHOperationError(f"{name} stream was lost")
+            if completed.returncode != 0:
+                # docker cp explains itself (a missing path, say) better than
+                # the empty archive it leaves behind.
+                raise SandboxFailedError(
+                    f"could not complete {name}: docker cp exited with "
+                    f"{completed.returncode}" + (f": {detail}" if detail else "")
+                )
+            if extraction_error is not None:
+                raise extraction_error
+
+        try:
+            try:
+                await self._ssh_manager.run(
+                    attempt, name=name, deadline=self._ssh_deadline()
+                )
+            except ConnectionError:
+                raise
+            except (OSError, asyncssh.Error) as exc:
+                raise SandboxFailedError(f"could not complete {name}: {exc}") from exc
+            publisher = (
+                _publish_local_contents if contents_only else _publish_local_transfer
             )
-            await self._download_from_guest(
-                guest_source, local_path, recursive=recursive
-            )
-        except (OSError, asyncssh.Error) as exc:
-            raise SandboxFailedError(
-                f"could not download from sandbox container: {exc}"
-            ) from exc
+            await asyncio.to_thread(publisher, stage, target)
         finally:
-            await self._cleanup_remote_transfer_paths(stage)
+            await asyncio.to_thread(shutil.rmtree, transfer_root, True)
 
     async def _run_guest_command(self, *args: str) -> None:
         await self._run_idempotent_command(
@@ -1612,6 +1710,18 @@ async def _stop_sandbox(
                 raise
             await _sleep_until_next_poll(deadline, delay, exc.retry_after)
             delay = min(5.0, delay * 2.0)
+
+
+async def _settled(task: "asyncio.Future[None]") -> BaseException | None:
+    """Wait for ``task`` and return its failure instead of raising it."""
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        return exc
+    return None
 
 
 def _remote_command(
