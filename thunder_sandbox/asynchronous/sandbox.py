@@ -906,8 +906,12 @@ fi
             command, name=f"publish upload in sandbox {self.id}"
         )
 
-    async def _cleanup_remote_transfer_paths(self, *paths: str) -> None:
+    async def _cleanup_remote_transfer_paths(
+        self, *paths: str, privileged: bool = False
+    ) -> None:
         command = "rm -rf -- " + " ".join(shlex.quote(path) for path in paths)
+        if privileged:
+            command = "sudo --non-interactive " + command
         deadline = _earliest_deadline(
             time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS, self._ssh_deadline()
         )
@@ -989,6 +993,25 @@ fi
                     name=f"upload {parsed_source.name} to sandbox {self.id}",
                 )
                 guest_source = stage + "/" + parsed_source.name
+            # docker cp keeps each file's numeric owner, and the stage belongs
+            # to the SSH user (uid 1000 on the guest). In an image whose own
+            # non-root user is also uid 1000 the upload would land owned by
+            # that user: a verifier that sweeps that user's files would delete
+            # its own tests, and a root-only lockdown would not keep the user
+            # out. Hand the stage to root first, as other container backends
+            # deliver uploads. Only the stage changes hands, never files
+            # already at the destination. -h keeps a symlink in the payload
+            # from redirecting the sudo chown outside the stage.
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "chown",
+                "-R",
+                "-h",
+                "--",
+                "0:0",
+                stage,
+            )
             await self._run_guest_command(
                 "sudo",
                 "--non-interactive",
@@ -1000,7 +1023,9 @@ fi
         except (OSError, asyncssh.Error) as exc:
             raise SandboxFailedError(f"could not upload to sandbox container: {exc}") from exc
         finally:
-            await self._cleanup_remote_transfer_paths(stage)
+            # The stage is root-owned once it has changed hands above, which
+            # the SSH user could not remove.
+            await self._cleanup_remote_transfer_paths(stage, privileged=True)
 
     async def _download_from_container(
         self,
