@@ -69,7 +69,7 @@ from ._transfer import (
     remove_local_transfer_path as _remove_local_transfer_path,
 )
 from .client import Client
-from .port_forward import PortForward
+from .tunnel import Tunnel
 from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
@@ -97,7 +97,7 @@ class Sandbox:
         self._owns_client = owns_client
         self._info = info
         self._main_process: Process[str] | None = None
-        self._port_forwards: set[PortForward] = set()
+        self._tunnels: set[Tunnel] = set()
         self._ssh_manager = SSHConnectionManager(self._open_connection)
 
     @staticmethod
@@ -298,10 +298,10 @@ class Sandbox:
                 self.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
             ))
 
-    async def forward_port(
+    async def tunnel(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
-    ) -> PortForward:
-        """Forward a listening sandbox loopback port over a dedicated SSH connection.
+    ) -> Tunnel:
+        """Tunnel one sandbox loopback service over a dedicated SSH connection.
 
         Both ends bind to IPv4 loopback. Local port zero allocates a free port.
         Requires TCP forwarding permission in the SSH certificate and daemon.
@@ -310,7 +310,7 @@ class Sandbox:
         _validate_port(remote_port)
         _validate_port(local_port, allow_zero=True)
 
-        async def open_forward() -> PortForward:
+        async def open_tunnel() -> Tunnel:
             connection = await self._open_connection()
             try:
                 # Permission is checked when a TCP channel opens, not when a listener binds.
@@ -320,16 +320,16 @@ class Sandbox:
                 listener = await connection.forward_local_port(
                     "127.0.0.1", local_port, "127.0.0.1", remote_port,
                 )
-                forward = PortForward(connection, listener, self._port_forwards.discard)
-                self._port_forwards.add(forward)
-                return forward
+                tunnel = Tunnel(connection, listener, self._tunnels.discard)
+                self._tunnels.add(tunnel)
+                return tunnel
             except BaseException:
                 connection.close()
                 await finish_cleanup(asyncio.wait_for(connection.wait_closed(), timeout=5))
                 raise
 
         try:
-            return await asyncio.wait_for(open_forward(), timeout=timeout)
+            return await asyncio.wait_for(open_tunnel(), timeout=timeout)
         except asyncssh.ChannelOpenError as exc:
             if exc.code == asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED:
                 raise UnsupportedFeatureError(
@@ -345,7 +345,7 @@ class Sandbox:
                 f"opening sandbox {self.id} port {remote_port} exceeded {timeout} seconds"
             ) from exc
         except (OSError, asyncssh.Error) as exc:
-            raise ConnectionError(f"could not forward sandbox {self.id} port: {exc}") from exc
+            raise ConnectionError(f"could not open sandbox {self.id} tunnel: {exc}") from exc
 
     async def start_service(
         self, *args: str, port: int, ready_timeout: float = 30,
@@ -1333,9 +1333,9 @@ fi
 
     async def _close_connection(self) -> None:
         try:
-            if self._port_forwards:
+            if self._tunnels:
                 await asyncio.gather(*(
-                    forward.close() for forward in tuple(self._port_forwards)
+                    tunnel.close() for tunnel in tuple(self._tunnels)
                 ))
         finally:
             await self._ssh_manager.close()

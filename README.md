@@ -290,21 +290,21 @@ with thunder.Sandbox.create(image=image, timeout=900).ephemeral() as sandbox:
 
 Read output incrementally with `for line in service.stdout:` (native async: `async for line in service.stdout:`). A whole-stream `.read()` waits for EOF and is unsuitable for a service that keeps running. Standard output buffering still applies; use unbuffered application output when needed.
 
-## Connect to sandbox services
+## Tunnel to sandbox services
 
 ```python
-with sandbox.forward_port(50051) as endpoint:
+with sandbox.tunnel(50051) as endpoint:
     remote_executor = f"grpc://{endpoint.address}"
     # Run Bazel using this remote executor while the context is open.
 ```
 
-`forward_port(remote_port, local_port=0, timeout=30)` binds only to `127.0.0.1` on your machine and connects to `127.0.0.1:remote_port` in the sandbox. Zero selects an available local port. Start the service first: opening the forward checks that it accepts a TCP connection. The returned `PortForward` exposes `host`, `port`, `address`, and `closed`, and supports explicit `close()` as well as context management.
+`tunnel(remote_port, local_port=0, timeout=30)` binds only to `127.0.0.1` on your machine and connects to `127.0.0.1:remote_port` in the sandbox. Zero selects an available local port. The API exposes one sandbox service locally; it does not accept arbitrary destination hosts, bind publicly, create a remote listener, or expose the sandbox’s whole network. Start the service first: opening the tunnel checks that it accepts a TCP connection. The returned `Tunnel` exposes `host`, `port`, `address`, and `closed`, and supports explicit `close()` as well as context management.
 
-Forwarding uses standard SSH TCP channels on a dedicated authenticated connection, without `socat`, shell relays, or a public service port. Closing a forward closes its accepted connections too, without disconnecting other sandbox commands. Terminating the sandbox or closing its SDK connection closes its forwards. An interrupted tunnel does not reconnect or replay application traffic; create a new forward and let the application reconnect.
+The tunnel uses standard SSH TCP channels on a dedicated authenticated connection, without `socat`, shell relays, or a public service port. Closing a tunnel closes its accepted connections too, without disconnecting other sandbox commands. Terminating the sandbox or closing its SDK connection closes its tunnels. An interrupted tunnel does not reconnect or replay application traffic; create a new tunnel and let the application reconnect.
 
 **Infrastructure prerequisite:** the sandbox SSH certificate must grant `permit-port-forwarding`; guest sshd must allow local TCP forwarding, restricted to loopback destinations (for example `AllowTcpForwarding local` and `PermitOpen 127.0.0.1:*`). Older deployments that disallow forwarding raise `UnsupportedFeatureError` with `code="ssh_forwarding_disabled"`. This SDK change does not modify deployed certificate authorities or VM images.
 
-The native async API uses `async with await sandbox.forward_port(50051) as endpoint:`. Blocking objects support `async with await sandbox.forward_port_async(50051) as endpoint:`.
+The native async API uses `async with await sandbox.tunnel(50051) as endpoint:`. Blocking objects support `async with await sandbox.tunnel_async(50051) as endpoint:`.
 
 ## Native async usage
 
@@ -327,7 +327,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Top-level objects provide the equivalent `async with sandbox.ephemeral_async():`, `start_service_async()`, and `forward_port_async()` methods. No existing methods were renamed or removed.
+Top-level objects provide the equivalent `async with sandbox.ephemeral_async():`, `start_service_async()`, and `tunnel_async()` methods. No existing methods were renamed or removed.
 
 ## Timeout meanings
 
@@ -338,7 +338,7 @@ Top-level objects provide the equivalent `async with sandbox.ephemeral_async():`
 | `exec(timeout=...)` / `Process.wait(timeout=...)` | How long to wait for command completion; expiry does not kill the command |
 | `start_service(ready_timeout=...)` | How long to wait for the service port after command submission; failure attempts to terminate the process |
 | `ephemeral(cleanup_timeout=...)` | Bound on scope-exit termination |
-| `forward_port(timeout=...)` | Bound on establishing and probing the tunnel, not its lifetime |
+| `tunnel(timeout=...)` | Bound on establishing and probing the tunnel, not its lifetime |
 
 ## Configuration
 

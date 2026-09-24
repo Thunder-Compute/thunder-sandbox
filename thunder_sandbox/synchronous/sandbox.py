@@ -20,7 +20,7 @@ from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
 from ..image import Image
 from .client import Client
-from .port_forward import PortForward
+from .tunnel import Tunnel
 from .process import Process
 
 
@@ -262,22 +262,22 @@ class Sandbox:
                 self.terminate_async(timeout=cleanup_timeout), timeout=cleanup_timeout,
             ))
 
-    def forward_port(
+    def tunnel(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
-    ) -> PortForward:
-        """Forward a listening sandbox TCP port to local IPv4 loopback over SSH."""
-        forward = self._client._bridge.run(
-            self._sandbox.forward_port(remote_port, local_port=local_port, timeout=timeout)
+    ) -> Tunnel:
+        """Tunnel one sandbox TCP service to local IPv4 loopback over SSH."""
+        tunnel = self._client._bridge.run(
+            self._sandbox.tunnel(remote_port, local_port=local_port, timeout=timeout)
         )
-        return PortForward(self._client._bridge, forward)
+        return Tunnel(self._client._bridge, tunnel)
 
-    async def forward_port_async(
+    async def tunnel_async(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
-    ) -> PortForward:
-        forward = await self._client._bridge.run_async(
-            self._sandbox.forward_port(remote_port, local_port=local_port, timeout=timeout)
+    ) -> Tunnel:
+        tunnel = await self._client._bridge.run_async(
+            self._sandbox.tunnel(remote_port, local_port=local_port, timeout=timeout)
         )
-        return PortForward(self._client._bridge, forward)
+        return Tunnel(self._client._bridge, tunnel)
 
     def start_service(
         self, *args: str, port: int, ready_timeout: float = 30,

@@ -1,4 +1,4 @@
-"""An owned SSH connection forwarding one sandbox service to loopback."""
+"""An owned SSH connection tunneling one sandbox service to loopback."""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ import asyncssh
 from .._common.lifecycle import finish_cleanup
 
 
-class PortForward:
+class Tunnel:
     def __init__(
         self,
         connection: asyncssh.SSHClientConnection,
         listener: asyncssh.SSHListener,
-        on_close: Callable[[PortForward], None],
+        on_close: Callable[[Tunnel], None],
     ) -> None:
         self._connection = connection
         self._listener = listener
@@ -43,9 +43,9 @@ class PortForward:
         finally:
             self._on_close(self)
 
-    async def __aenter__(self) -> PortForward:
+    async def __aenter__(self) -> Tunnel:
         if self.closed:
-            raise RuntimeError("port forward is closed")
+            raise RuntimeError("tunnel is closed")
         return self
 
     async def __aexit__(
