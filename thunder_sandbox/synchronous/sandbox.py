@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from typing import Literal, cast, overload
 
+from .._common.lifecycle import finish_cleanup
 from .._common.types import (
     GPUType,
     OutputMode,
@@ -17,6 +20,7 @@ from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
 from ..image import Image
 from .client import Client
+from .port_forward import PortForward
 from .process import Process
 
 
@@ -226,6 +230,74 @@ class Sandbox:
     def ssh_command(self) -> tuple[str, ...]:
         return self._sandbox.ssh_command
 
+    @contextmanager
+    def ephemeral(
+        self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> Iterator[Sandbox]:
+        """Wait for readiness and terminate this sandbox when the scope exits."""
+        try:
+            self.wait_until_ready(timeout=ready_timeout, on_status=on_status)
+            yield self
+        finally:
+            try:
+                self._client._bridge.run(asyncio.wait_for(
+                    self._sandbox.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
+                ))
+            finally:
+                if self._owns_client:
+                    self._client.close()
+
+    @asynccontextmanager
+    async def ephemeral_async(
+        self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> AsyncIterator[Sandbox]:
+        """Await readiness and finish bounded cleanup before propagating cancellation."""
+        try:
+            await self.wait_until_ready_async(timeout=ready_timeout, on_status=on_status)
+            yield self
+        finally:
+            await finish_cleanup(asyncio.wait_for(
+                self.terminate_async(timeout=cleanup_timeout), timeout=cleanup_timeout,
+            ))
+
+    def forward_port(
+        self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
+    ) -> PortForward:
+        """Forward a listening sandbox TCP port to local IPv4 loopback over SSH."""
+        forward = self._client._bridge.run(
+            self._sandbox.forward_port(remote_port, local_port=local_port, timeout=timeout)
+        )
+        return PortForward(self._client._bridge, forward)
+
+    async def forward_port_async(
+        self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
+    ) -> PortForward:
+        forward = await self._client._bridge.run_async(
+            self._sandbox.forward_port(remote_port, local_port=local_port, timeout=timeout)
+        )
+        return PortForward(self._client._bridge, forward)
+
+    def start_service(
+        self, *args: str, port: int, ready_timeout: float = 30,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+    ) -> Process[str]:
+        """Start a durable foreground command, retain logs, and await its TCP port."""
+        process = self._client._bridge.run(self._sandbox.start_service(
+            *args, port=port, ready_timeout=ready_timeout, workdir=workdir, env=env,
+        ))
+        return Process(self._client._bridge, process)
+
+    async def start_service_async(
+        self, *args: str, port: int, ready_timeout: float = 30,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+    ) -> Process[str]:
+        process = await self._client._bridge.run_async(self._sandbox.start_service(
+            *args, port=port, ready_timeout=ready_timeout, workdir=workdir, env=env,
+        ))
+        return Process(self._client._bridge, process)
+
     @overload
     def get_process(
         self, process_id: str, *, text: Literal[True] = True
@@ -284,7 +356,7 @@ class Sandbox:
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: Literal[True] = True, pty: bool = False,
+        text: Literal[True] = True, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str]: ...
@@ -293,7 +365,7 @@ class Sandbox:
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: Literal[False] = False, pty: bool = False,
+        text: Literal[False] = False, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[bytes]: ...
@@ -302,7 +374,7 @@ class Sandbox:
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: bool, pty: bool = False,
+        text: bool, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]: ...
@@ -310,7 +382,7 @@ class Sandbox:
     def exec(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: bool = True, pty: bool = False,
+        text: bool = True, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
@@ -322,6 +394,7 @@ class Sandbox:
                 env=env,
                 text=text,
                 pty=pty,
+                durable=durable,
                 stdout=stdout,
                 stderr=stderr,
                 retain=retain,
@@ -337,7 +410,7 @@ class Sandbox:
     async def exec_async(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: Literal[True] = True, pty: bool = False,
+        text: Literal[True] = True, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str]: ...
@@ -346,7 +419,7 @@ class Sandbox:
     async def exec_async(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: Literal[False] = False, pty: bool = False,
+        text: Literal[False] = False, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[bytes]: ...
@@ -355,7 +428,7 @@ class Sandbox:
     async def exec_async(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: bool, pty: bool = False,
+        text: bool, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]: ...
@@ -363,7 +436,7 @@ class Sandbox:
     async def exec_async(
         self, *args: str, timeout: float | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
-        text: bool = True, pty: bool = False,
+        text: bool = True, pty: bool = False, durable: bool | None = None,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
@@ -375,6 +448,7 @@ class Sandbox:
                 env=env,
                 text=text,
                 pty=pty,
+                durable=durable,
                 stdout=stdout,
                 stderr=stderr,
                 retain=retain,
@@ -484,15 +558,21 @@ class Sandbox:
             self._sandbox.wait(timeout=timeout)
         )
 
-    def wait_until_ready(self, *, timeout: float | None = 300) -> "Sandbox":
-        self._client._bridge.run(self._sandbox.wait_until_ready(timeout=timeout))
+    def wait_until_ready(
+        self, *, timeout: float | None = 300,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> "Sandbox":
+        self._client._bridge.run(
+            self._sandbox.wait_until_ready(timeout=timeout, on_status=on_status)
+        )
         return self
 
     async def wait_until_ready_async(
-        self, *, timeout: float | None = 300
+        self, *, timeout: float | None = 300,
+        on_status: Callable[[SandboxInfo], None] | None = None,
     ) -> "Sandbox":
         await self._client._bridge.run_async(
-            self._sandbox.wait_until_ready(timeout=timeout)
+            self._sandbox.wait_until_ready(timeout=timeout, on_status=on_status)
         )
         return self
 

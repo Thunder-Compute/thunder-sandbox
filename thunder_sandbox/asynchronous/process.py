@@ -60,7 +60,7 @@ class _UnsupportedWriter(Generic[T]):
     def _unsupported() -> io.UnsupportedOperation:
         return io.UnsupportedOperation(
             "stdin is unavailable for durable commands; use files, arguments, "
-            "environment variables, or pty=True"
+            "environment variables, or durable=False"
         )
 
     def write(self, data: T) -> int:

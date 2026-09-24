@@ -11,8 +11,8 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Container, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -31,8 +31,10 @@ from .._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ThunderError,
+    UnsupportedFeatureError,
     _WaitWindowElapsedError,
 )
+from .._common.lifecycle import finish_cleanup
 from .._common.types import (
     GPUType,
     NetworkPolicy,
@@ -46,7 +48,6 @@ from ..image import Image
 from . import credentials
 from ._jobs import (
     JobSpec,
-    JobState,
     JobStatus,
     RemoteJobPaths,
     cleanup_command,
@@ -68,6 +69,7 @@ from ._transfer import (
     remove_local_transfer_path as _remove_local_transfer_path,
 )
 from .client import Client
+from .port_forward import PortForward
 from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
@@ -95,6 +97,7 @@ class Sandbox:
         self._owns_client = owns_client
         self._info = info
         self._main_process: Process[str] | None = None
+        self._port_forwards: set[PortForward] = set()
         self._ssh_manager = SSHConnectionManager(self._open_connection)
 
     @staticmethod
@@ -281,6 +284,114 @@ class Sandbox:
     def ssh_command(self) -> tuple[str, ...]:
         return self.ssh.command
 
+    @asynccontextmanager
+    async def ephemeral(
+        self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> AsyncIterator[Sandbox]:
+        """Take ownership, wait for readiness, and terminate on scope exit."""
+        try:
+            await self.wait_until_ready(timeout=ready_timeout, on_status=on_status)
+            yield self
+        finally:
+            await finish_cleanup(asyncio.wait_for(
+                self.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
+            ))
+
+    async def forward_port(
+        self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
+    ) -> PortForward:
+        """Forward a listening sandbox loopback port over a dedicated SSH connection.
+
+        Both ends bind to IPv4 loopback. Local port zero allocates a free port.
+        Requires TCP forwarding permission in the SSH certificate and daemon.
+        Existing streams cannot resume after a connection loss.
+        """
+        _validate_port(remote_port)
+        _validate_port(local_port, allow_zero=True)
+
+        async def open_forward() -> PortForward:
+            connection = await self._open_connection()
+            try:
+                # Permission is checked when a TCP channel opens, not when a listener binds.
+                _, writer = await connection.open_connection("127.0.0.1", remote_port)
+                writer.close()
+                await writer.wait_closed()
+                listener = await connection.forward_local_port(
+                    "127.0.0.1", local_port, "127.0.0.1", remote_port,
+                )
+                forward = PortForward(connection, listener, self._port_forwards.discard)
+                self._port_forwards.add(forward)
+                return forward
+            except BaseException:
+                connection.close()
+                await finish_cleanup(asyncio.wait_for(connection.wait_closed(), timeout=5))
+                raise
+
+        try:
+            return await asyncio.wait_for(open_forward(), timeout=timeout)
+        except asyncssh.ChannelOpenError as exc:
+            if exc.code == asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED:
+                raise UnsupportedFeatureError(
+                    "sandbox SSH forwarding is disabled; the platform must grant "
+                    "permit-port-forwarding and allow local TCP forwarding to loopback",
+                    code="ssh_forwarding_disabled",
+                ) from exc
+            raise ConnectionError(
+                f"cannot reach sandbox {self.id} port {remote_port}: {exc}"
+            ) from exc
+        except asyncio.TimeoutError as exc:
+            raise SandboxTimeoutError(
+                f"opening sandbox {self.id} port {remote_port} exceeded {timeout} seconds"
+            ) from exc
+        except (OSError, asyncssh.Error) as exc:
+            raise ConnectionError(f"could not forward sandbox {self.id} port: {exc}") from exc
+
+    async def start_service(
+        self, *args: str, port: int, ready_timeout: float = 30,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+    ) -> Process[str]:
+        """Start a durable foreground command and wait for its loopback TCP port.
+
+        Logs are retained for diagnosis, including after startup failure. Call
+        Process.cleanup() when finished. TCP readiness is not an application
+        health check. The command must keep running in the foreground.
+        """
+        _validate_port(port)
+        process = await self.exec(*args, workdir=workdir, env=env, durable=True, retain=True)
+
+        async def wait_listening() -> None:
+            command = _remote_command(
+                ["python3", "-c", "import socket; "
+                 f"socket.create_connection(('127.0.0.1', {port}), 1).close()"],
+                workdir=None, env=None,
+            )
+            while True:
+                result = await self._run_idempotent_command(
+                    command, name=f"service {process.id} readiness", check=False,
+                )
+                code = await process.poll()
+                if code is not None:
+                    raise SandboxFailedError(
+                        f"service {process.id} exited with status {code}; "
+                        "recover its logs with sandbox.get_process(process_id)"
+                    )
+                if result.exit_status == 0:
+                    return
+                await asyncio.sleep(0.1)
+
+        try:
+            await asyncio.wait_for(wait_listening(), timeout=ready_timeout)
+        except BaseException as exc:
+            await finish_cleanup(asyncio.wait_for(process.terminate(), timeout=30))
+            if isinstance(exc, asyncio.TimeoutError):
+                raise SandboxTimeoutError(
+                    f"service {process.id} did not listen on port {port} within "
+                    f"{ready_timeout} seconds; recover its logs with sandbox.get_process(process_id)"
+                ) from exc
+            raise
+        return process
+
     @overload
     async def exec(
         self,
@@ -290,6 +401,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -304,6 +416,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -318,6 +431,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: bool,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -331,10 +445,17 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: bool = True,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
+        """Run argv, with durable jobs or attached stdin/stdout/stderr.
+
+        durable=None preserves legacy behavior (durable unless pty=True).
+        durable=False allows stdin without a terminal. timeout limits wait(),
+        not the remote process lifetime; terminate explicitly when needed.
+        """
         if not args:
             raise InvalidRequestError("exec requires a command")
         if stdout not in {"capture", "discard"}:
@@ -345,7 +466,14 @@ class Sandbox:
             raise InvalidRequestError(
                 "stdout, stderr, and retain durable-job options require pty=False"
             )
-        if not pty:
+        if durable is not None and not isinstance(durable, bool):
+            raise InvalidRequestError("durable must be True, False, or None")
+        resolved_durable = not pty if durable is None else durable
+        if resolved_durable and pty:
+            raise InvalidRequestError("durable=True cannot be combined with pty=True")
+        if not resolved_durable and (stdout != "capture" or stderr != "capture" or retain):
+            raise InvalidRequestError("output discard and retain require durable=True")
+        if resolved_durable:
             spec, status = await self._launch_detached_job(
                 args,
                 workdir=workdir,
@@ -1204,7 +1332,13 @@ fi
         await self._ssh_manager.discard(connection)
 
     async def _close_connection(self) -> None:
-        await self._ssh_manager.close()
+        try:
+            if self._port_forwards:
+                await asyncio.gather(*(
+                    forward.close() for forward in tuple(self._port_forwards)
+                ))
+        finally:
+            await self._ssh_manager.close()
 
     async def get_hourly_price(self) -> float:
         """Return the configured resources' aggregate USD/hour at current rates.
@@ -1288,10 +1422,15 @@ fi
             poll_delay = min(5.0, poll_delay * 2.0)
 
     async def wait_until_ready(
-        self, *, timeout: float | None = 300
+        self, *, timeout: float | None = 300,
+        on_status: Callable[[SandboxInfo], None] | None = None,
     ) -> "Sandbox":
         deadline = None if timeout is None else time.monotonic() + timeout
-        if not await self._wait_for_startup(deadline):
+        started = (
+            await self._wait_for_startup(deadline, on_status=on_status)
+            if on_status is not None else await self._wait_for_startup(deadline)
+        )
+        if not started:
             raise SandboxTimeoutError(
                 f"sandbox {self.id} did not become ready within {timeout} seconds"
             )
@@ -1299,9 +1438,13 @@ fi
             return self
         raise SandboxFailedError(
             f"sandbox {self.id} did not become ready (status: {self.status.value})"
+            + (f": {self.info.failure}" if self.info.failure else "")
         )
 
-    async def _wait_for_startup(self, deadline: float | None) -> bool:
+    async def _wait_for_startup(
+        self, deadline: float | None, *,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> bool:
         """Read the sandbox until it has left ``created``.
 
         Prefers the API's blocking wait, which answers the moment the sandbox
@@ -1315,6 +1458,9 @@ fi
         def expired() -> bool:
             return deadline is not None and time.monotonic() >= deadline
 
+        last_status = (self.status, self.info.failure)
+        if on_status is not None:
+            on_status(self.info)
         failing_since: float | None = None
         delay = 1.0
         while True:
@@ -1340,6 +1486,10 @@ fi
                 delay = min(5.0, delay * 2.0)
             else:
                 failing_since = None
+                current_status = (self.status, self.info.failure)
+                if on_status is not None and current_status != last_status:
+                    on_status(self.info)
+                    last_status = current_status
                 if self.status != SandboxStatus.CREATED:
                     return True
                 if expired():
@@ -1395,6 +1545,12 @@ fi
             await self._close_connection()
             if self._owns_client:
                 await self._client.close()
+
+
+def _validate_port(port: int, *, allow_zero: bool = False) -> None:
+    minimum = 0 if allow_zero else 1
+    if type(port) is not int or not minimum <= port <= 65535:
+        raise InvalidRequestError(f"port must be an integer between {minimum} and 65535")
 
 
 def _path_segment(value: str) -> str:
