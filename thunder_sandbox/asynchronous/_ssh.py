@@ -56,6 +56,21 @@ class SSHConnectionManager:
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connection_lock = asyncio.Lock()
         self._closed = False
+        self._dedicated: set[SSHConnectionManager] = set()
+
+    def dedicated(self) -> SSHConnectionManager:
+        """Register an independent connection before any asynchronous setup starts."""
+        if self._closed:
+            raise ConnectionError("sandbox SSH connection manager is closed")
+        owner = SSHConnectionManager(self._open_connection)
+        self._dedicated.add(owner)
+        return owner
+
+    async def release(self, owner: SSHConnectionManager) -> None:
+        try:
+            await owner.close()
+        finally:
+            self._dedicated.discard(owner)
 
     async def get(self) -> asyncssh.SSHClientConnection:
         """Return the healthy cached connection, opening at most one replacement."""
@@ -73,6 +88,8 @@ class SSHConnectionManager:
                 return connection
             connection = await self._open_connection()
             self._connection = connection
+            if self._closed:
+                raise ConnectionError("sandbox SSH connection closed while opening")
             return connection
 
     async def discard(self, connection: asyncssh.SSHClientConnection) -> None:
@@ -139,16 +156,19 @@ class SSHConnectionManager:
     async def close(self) -> None:
         """Close only the transport; remote detached jobs remain untouched."""
 
+        self._closed = True
         async with self._connection_lock:
-            if self._closed:
-                return
-            self._closed = True
             connection = self._connection
             self._connection = None
-        if connection is not None:
-            connection.close()
-            with suppress(Exception):
-                await connection.wait_closed()
+            dedicated = tuple(self._dedicated)
+            self._dedicated.clear()
+        async def close_cached() -> None:
+            if connection is not None:
+                connection.close()
+                with suppress(Exception):
+                    await connection.wait_closed()
+
+        await asyncio.gather(close_cached(), *(owner.close() for owner in dedicated))
 
 
 __all__ = [

@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
-from contextlib import suppress
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +46,6 @@ from ..image import Image
 from . import credentials
 from ._jobs import (
     JobSpec,
-    JobState,
     JobStatus,
     RemoteJobPaths,
     cleanup_command,
@@ -67,7 +66,10 @@ from ._transfer import (
     publish_local_transfer as _publish_local_transfer,
     remove_local_transfer_path as _remove_local_transfer_path,
 )
+from ._lifecycle import ephemeral
+from ._services import ServiceManager
 from .client import Client
+from .tunnel import Tunnel
 from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
@@ -96,6 +98,7 @@ class Sandbox:
         self._info = info
         self._main_process: Process[str] | None = None
         self._ssh_manager = SSHConnectionManager(self._open_connection)
+        self._services = ServiceManager(self)
 
     @staticmethod
     async def create(
@@ -281,6 +284,30 @@ class Sandbox:
     def ssh_command(self) -> tuple[str, ...]:
         return self.ssh.command
 
+    def ephemeral(
+        self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> AbstractAsyncContextManager[Sandbox]:
+        """Take ownership, wait for readiness, and terminate on scope exit."""
+        return ephemeral(self, ready_timeout=ready_timeout,
+                         cleanup_timeout=cleanup_timeout, on_status=on_status)
+
+    async def tunnel(
+        self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
+    ) -> Tunnel:
+        """Tunnel one sandbox loopback service over a dedicated SSH connection."""
+        return await Tunnel._open(self._ssh_manager, remote_port,
+                                 local_port=local_port, timeout=timeout)
+
+    async def start_service(
+        self, *args: str, port: int, ready_timeout: float = 30,
+        workdir: str | None = None, env: Mapping[str, str | None] | None = None,
+    ) -> Process[str]:
+        """Start a durable foreground command, retain logs, and await its TCP port."""
+        return await self._services.start(
+            *args, port=port, ready_timeout=ready_timeout, workdir=workdir, env=env,
+        )
+
     @overload
     async def exec(
         self,
@@ -290,6 +317,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -304,6 +332,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -318,6 +347,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: bool,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
@@ -331,10 +361,17 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         text: bool = True,
         pty: bool = False,
+        durable: bool | None = None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
+        """Run argv, with durable jobs or attached stdin/stdout/stderr.
+
+        durable=None preserves legacy behavior (durable unless pty=True).
+        durable=False allows stdin without a terminal. timeout limits wait(),
+        not the remote process lifetime; terminate explicitly when needed.
+        """
         if not args:
             raise InvalidRequestError("exec requires a command")
         if stdout not in {"capture", "discard"}:
@@ -345,7 +382,14 @@ class Sandbox:
             raise InvalidRequestError(
                 "stdout, stderr, and retain durable-job options require pty=False"
             )
-        if not pty:
+        if durable is not None and not isinstance(durable, bool):
+            raise InvalidRequestError("durable must be True, False, or None")
+        resolved_durable = not pty if durable is None else durable
+        if resolved_durable and pty:
+            raise InvalidRequestError("durable=True cannot be combined with pty=True")
+        if not resolved_durable and (stdout != "capture" or stderr != "capture" or retain):
+            raise InvalidRequestError("output discard and retain require durable=True")
+        if resolved_durable:
             spec, status = await self._launch_detached_job(
                 args,
                 workdir=workdir,
@@ -1204,7 +1248,10 @@ fi
         await self._ssh_manager.discard(connection)
 
     async def _close_connection(self) -> None:
-        await self._ssh_manager.close()
+        try:
+            await self._services.close()
+        finally:
+            await self._ssh_manager.close()
 
     async def get_hourly_price(self) -> float:
         """Return the configured resources' aggregate USD/hour at current rates.
@@ -1288,10 +1335,15 @@ fi
             poll_delay = min(5.0, poll_delay * 2.0)
 
     async def wait_until_ready(
-        self, *, timeout: float | None = 300
+        self, *, timeout: float | None = 300,
+        on_status: Callable[[SandboxInfo], None] | None = None,
     ) -> "Sandbox":
         deadline = None if timeout is None else time.monotonic() + timeout
-        if not await self._wait_for_startup(deadline):
+        started = (
+            await self._wait_for_startup(deadline, on_status=on_status)
+            if on_status is not None else await self._wait_for_startup(deadline)
+        )
+        if not started:
             raise SandboxTimeoutError(
                 f"sandbox {self.id} did not become ready within {timeout} seconds"
             )
@@ -1299,9 +1351,13 @@ fi
             return self
         raise SandboxFailedError(
             f"sandbox {self.id} did not become ready (status: {self.status.value})"
+            + (f": {self.info.failure}" if self.info.failure else "")
         )
 
-    async def _wait_for_startup(self, deadline: float | None) -> bool:
+    async def _wait_for_startup(
+        self, deadline: float | None, *,
+        on_status: Callable[[SandboxInfo], None] | None = None,
+    ) -> bool:
         """Read the sandbox until it has left ``created``.
 
         Prefers the API's blocking wait, which answers the moment the sandbox
@@ -1315,6 +1371,9 @@ fi
         def expired() -> bool:
             return deadline is not None and time.monotonic() >= deadline
 
+        last_status = (self.status, self.info.failure)
+        if on_status is not None:
+            on_status(self.info)
         failing_since: float | None = None
         delay = 1.0
         while True:
@@ -1340,6 +1399,10 @@ fi
                 delay = min(5.0, delay * 2.0)
             else:
                 failing_since = None
+                current_status = (self.status, self.info.failure)
+                if on_status is not None and current_status != last_status:
+                    on_status(self.info)
+                    last_status = current_status
                 if self.status != SandboxStatus.CREATED:
                     return True
                 if expired():
@@ -1382,11 +1445,6 @@ fi
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self.status == SandboxStatus.CREATED:
-                if not await self._wait_for_startup(deadline):
-                    raise SandboxTimeoutError(
-                        f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
-                    )
             if self.status.terminal:
                 return
             await _stop_sandbox(self._client, self.id, deadline=deadline)
@@ -1631,13 +1689,19 @@ async def _stop_sandbox(
                 "POST", f"/sandboxes/{_path_segment(sandbox_id)}/stop"
             )
             return
-        except (ConnectionError, RetryableError) as exc:
+        except (ConnectionError, RetryableError, ConflictError) as exc:
             now = time.monotonic()
-            failing_since = now if failing_since is None else failing_since
-            if now - failing_since >= OUTAGE_GRACE_SECONDS:
-                raise
+            if isinstance(exc, ConflictError):
+                if exc.code != "sandbox_not_ready":
+                    raise
+                # Older APIs refuse /stop until allocation finishes; retry the stop itself.
+                failing_since = None
+            else:
+                failing_since = now if failing_since is None else failing_since
+                if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                    raise
             if deadline is not None and now >= deadline:
-                raise
+                raise SandboxTimeoutError(f"stopping sandbox {sandbox_id} exceeded its deadline") from exc
             await _sleep_until_next_poll(deadline, delay, exc.retry_after)
             delay = min(5.0, delay * 2.0)
 

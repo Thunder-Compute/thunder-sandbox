@@ -10,6 +10,12 @@ from typing import Literal
 
 from .exceptions import InvalidRequestError
 
+def validate_port(port: int, *, allow_zero: bool = False) -> None:
+    minimum = 0 if allow_zero else 1
+    if type(port) is not int or not minimum <= port <= 65535:
+        raise InvalidRequestError(f"port must be an integer between {minimum} and 65535")
+
+
 OutputMode = Literal["capture", "discard"]
 
 

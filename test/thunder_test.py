@@ -247,6 +247,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "executes POSIX guest process behavior")
     def test_container_session_waiter_waits_and_propagates_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -288,6 +289,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completed.returncode, 23)
             self.assertEqual(marker.read_text(encoding="utf-8"), "complete")
 
+    @unittest.skipUnless(os.name == "posix", "executes POSIX guest process behavior")
     async def test_launcher_executes_a_payload_at_most_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,6 +324,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.state, JobState.SUCCEEDED)
             self.assertEqual(status.returncode, 0)
 
+    @unittest.skipUnless(os.name == "posix", "executes POSIX guest process behavior")
     async def test_launcher_redirects_output_and_records_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2723,7 +2726,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 await sandbox.wait_until_ready()
             await client.close()
 
-    async def test_terminate_waits_for_startup_before_stopping(self) -> None:
+    async def test_terminate_retries_stop_while_sandbox_is_created(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             sandbox = AsyncSandbox._from_response(
@@ -2731,8 +2734,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[
-                    still_starting(),
-                    SANDBOX_RESPONSE,
+                    thunder.ConflictError("not ready", code="sandbox_not_ready"),
                     {},
                     {**SANDBOX_RESPONSE, "status": "finished"},
                 ]
@@ -2741,12 +2743,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
             ) as sleep:
                 await sandbox.terminate()
-            sleep.assert_not_awaited()
+            sleep.assert_awaited_once()
             self.assertEqual(
                 [call.args for call in client._request.await_args_list],
                 [
-                    ("GET", "/sandboxes/sbx-test/wait"),
-                    ("GET", "/sandboxes/sbx-test/wait"),
+                    ("POST", "/sandboxes/sbx-test/stop"),
                     ("POST", "/sandboxes/sbx-test/stop"),
                     ("GET", "/sandboxes/sbx-test"),
                 ],
