@@ -989,6 +989,25 @@ fi
                     name=f"upload {parsed_source.name} to sandbox {self.id}",
                 )
                 guest_source = stage + "/" + parsed_source.name
+            # docker cp keeps each file's numeric owner, and the stage belongs
+            # to the SSH user (uid 1000 on the guest). In an image whose own
+            # non-root user is also uid 1000 the upload would land owned by
+            # that user: a verifier that sweeps that user's files would delete
+            # its own tests, and a root-only lockdown would not keep the user
+            # out. Hand the stage to root first, as other container backends
+            # deliver uploads. Only the stage changes hands, never files
+            # already at the destination. -h keeps a symlink in the payload
+            # from redirecting the sudo chown outside the stage.
+            await self._run_guest_command(
+                "sudo",
+                "--non-interactive",
+                "chown",
+                "-R",
+                "-h",
+                "--",
+                "0:0",
+                stage,
+            )
             await self._run_guest_command(
                 "sudo",
                 "--non-interactive",
@@ -1000,6 +1019,30 @@ fi
         except (OSError, asyncssh.Error) as exc:
             raise SandboxFailedError(f"could not upload to sandbox container: {exc}") from exc
         finally:
+            # Cleanup runs as the SSH user and could not remove a root-owned
+            # stage, so give it back first.
+            with suppress(Exception):
+                await self._run_idempotent_command(
+                    _remote_command(
+                        (
+                            "sudo",
+                            "--non-interactive",
+                            "chown",
+                            "-R",
+                            "-h",
+                            "--",
+                            f"{self.ssh.user}:",
+                            stage,
+                        ),
+                        workdir=None,
+                        env=None,
+                    ),
+                    name=f"release transfer staging in sandbox {self.id}",
+                    deadline=_earliest_deadline(
+                        time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS,
+                        self._ssh_deadline(),
+                    ),
+                )
             await self._cleanup_remote_transfer_paths(stage)
 
     async def _download_from_container(

@@ -2499,6 +2499,16 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     (
                         "sudo",
                         "--non-interactive",
+                        "chown",
+                        "-R",
+                        "-h",
+                        "--",
+                        "0:0",
+                        stage,
+                    ),
+                    (
+                        "sudo",
+                        "--non-interactive",
                         "docker",
                         "cp",
                         stage + "/payload.txt",
@@ -2506,6 +2516,63 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     ),
                 ],
             )
+            await client.close()
+
+    async def test_upload_to_image_container_delivers_root_owned_files(
+        self,
+    ) -> None:
+        # docker cp keeps the stage's numeric owner, the SSH user (uid 1000).
+        # An image whose own user is also uid 1000 would receive the upload as
+        # that user, so a verifier sweeping its files deleted its own tests.
+        # The stage goes to root for the copy, then back for cleanup.
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            source = Path(directory) / "tests"
+            source.mkdir()
+            (source / "reference.json").write_text("{}", encoding="utf-8")
+            connection = FakeSSHConnection()
+            order: list[str] = []
+
+            async def record_run(command: str, **kwargs: object) -> mock.Mock:
+                if "chown" in command:
+                    order.append("chown ubuntu:" if "ubuntu:" in command else "chown ?")
+                elif "mkdir" in command:
+                    order.append("reset")
+                elif command.startswith("rm -rf"):
+                    order.append("rm")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            async def record_guest(*args: str) -> None:
+                if "chown" in args:
+                    order.append("chown " + args[args.index("--") + 1])
+                else:
+                    order.append("docker cp")
+
+            async def record_scp(*args: object, **kwargs: object) -> None:
+                order.append("scp")
+
+            connection.run = mock.AsyncMock(side_effect=record_run)  # type: ignore[attr-defined]
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            with mock.patch.object(
+                sandbox, "_run_guest_command", new=mock.AsyncMock(side_effect=record_guest)
+            ) as guest, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
+                new=mock.AsyncMock(side_effect=record_scp),
+            ):
+                await sandbox.upload(str(source) + os.sep + ".", "/tests", recursive=True)
+
+            self.assertEqual(
+                order,
+                ["reset", "scp", "chown 0:0", "docker cp", "chown ubuntu:", "rm"],
+            )
+            chown = next(c.args for c in guest.await_args_list if "chown" in c.args)
+            # Under sudo, a symlink in the payload must never redirect the
+            # ownership change to a guest file outside the stage.
+            self.assertIn("-h", chown)
+            self.assertEqual(chown[:2], ("sudo", "--non-interactive"))
             await client.close()
 
     async def test_download_from_image_container_uses_isolated_guest_staging(
