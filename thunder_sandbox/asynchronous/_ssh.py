@@ -18,6 +18,7 @@ SSH_RETRY_INITIAL_SECONDS = 0.25
 SSH_RETRY_MAX_SECONDS = 5.0
 SSH_RETRY_JITTER_RATIO = 0.2
 SSH_CONNECT_TIMEOUT_SECONDS = 15.0
+SSH_CLOSE_TIMEOUT_SECONDS = 5.0
 
 T = TypeVar("T")
 OpenConnection = Callable[[], Awaitable[asyncssh.SSHClientConnection]]
@@ -165,8 +166,12 @@ class SSHConnectionManager:
         async def close_cached() -> None:
             if connection is not None:
                 connection.close()
+                # Cancellation shields this wait, so a deadline is what lets a
+                # blackholed peer stop stalling tunnel and sandbox teardown.
                 with suppress(Exception):
-                    await connection.wait_closed()
+                    await asyncio.wait_for(
+                        connection.wait_closed(), timeout=SSH_CLOSE_TIMEOUT_SECONDS,
+                    )
 
         await asyncio.gather(close_cached(), *(owner.close() for owner in dedicated))
 
@@ -174,6 +179,7 @@ class SSHConnectionManager:
 __all__ = [
     "RetryableSSHOperationError",
     "SSHConnectionManager",
+    "SSH_CLOSE_TIMEOUT_SECONDS",
     "SSH_CONNECT_TIMEOUT_SECONDS",
     "SSH_RETRY_INITIAL_SECONDS",
     "SSH_RETRY_JITTER_RATIO",
