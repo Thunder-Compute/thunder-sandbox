@@ -11,8 +11,8 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Container, Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -31,10 +31,8 @@ from .._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ThunderError,
-    UnsupportedFeatureError,
     _WaitWindowElapsedError,
 )
-from .._common.lifecycle import finish_cleanup
 from .._common.types import (
     GPUType,
     NetworkPolicy,
@@ -68,6 +66,8 @@ from ._transfer import (
     publish_local_transfer as _publish_local_transfer,
     remove_local_transfer_path as _remove_local_transfer_path,
 )
+from ._lifecycle import ephemeral
+from ._services import ServiceManager
 from .client import Client
 from .tunnel import Tunnel
 from .process import Process
@@ -97,8 +97,8 @@ class Sandbox:
         self._owns_client = owns_client
         self._info = info
         self._main_process: Process[str] | None = None
-        self._tunnels: set[Tunnel] = set()
         self._ssh_manager = SSHConnectionManager(self._open_connection)
+        self._services = ServiceManager(self)
 
     @staticmethod
     async def create(
@@ -284,113 +284,29 @@ class Sandbox:
     def ssh_command(self) -> tuple[str, ...]:
         return self.ssh.command
 
-    @asynccontextmanager
-    async def ephemeral(
+    def ephemeral(
         self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
         on_status: Callable[[SandboxInfo], None] | None = None,
-    ) -> AsyncIterator[Sandbox]:
+    ) -> AbstractAsyncContextManager[Sandbox]:
         """Take ownership, wait for readiness, and terminate on scope exit."""
-        try:
-            await self.wait_until_ready(timeout=ready_timeout, on_status=on_status)
-            yield self
-        finally:
-            await finish_cleanup(asyncio.wait_for(
-                self.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
-            ))
+        return ephemeral(self, ready_timeout=ready_timeout,
+                         cleanup_timeout=cleanup_timeout, on_status=on_status)
 
     async def tunnel(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
     ) -> Tunnel:
-        """Tunnel one sandbox loopback service over a dedicated SSH connection.
-
-        Both ends bind to IPv4 loopback. Local port zero allocates a free port.
-        Requires TCP forwarding permission in the SSH certificate and daemon.
-        Existing streams cannot resume after a connection loss.
-        """
-        _validate_port(remote_port)
-        _validate_port(local_port, allow_zero=True)
-
-        async def open_tunnel() -> Tunnel:
-            connection = await self._open_connection()
-            try:
-                # Permission is checked when a TCP channel opens, not when a listener binds.
-                _, writer = await connection.open_connection("127.0.0.1", remote_port)
-                writer.close()
-                await writer.wait_closed()
-                listener = await connection.forward_local_port(
-                    "127.0.0.1", local_port, "127.0.0.1", remote_port,
-                )
-                tunnel = Tunnel(connection, listener, self._tunnels.discard)
-                self._tunnels.add(tunnel)
-                return tunnel
-            except BaseException:
-                connection.close()
-                await finish_cleanup(asyncio.wait_for(connection.wait_closed(), timeout=5))
-                raise
-
-        try:
-            return await asyncio.wait_for(open_tunnel(), timeout=timeout)
-        except asyncssh.ChannelOpenError as exc:
-            if exc.code == asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED:
-                raise UnsupportedFeatureError(
-                    "sandbox SSH forwarding is disabled; the platform must grant "
-                    "permit-port-forwarding and allow local TCP forwarding to loopback",
-                    code="ssh_forwarding_disabled",
-                ) from exc
-            raise ConnectionError(
-                f"cannot reach sandbox {self.id} port {remote_port}: {exc}"
-            ) from exc
-        except asyncio.TimeoutError as exc:
-            raise SandboxTimeoutError(
-                f"opening sandbox {self.id} port {remote_port} exceeded {timeout} seconds"
-            ) from exc
-        except (OSError, asyncssh.Error) as exc:
-            raise ConnectionError(f"could not open sandbox {self.id} tunnel: {exc}") from exc
+        """Tunnel one sandbox loopback service over a dedicated SSH connection."""
+        return await Tunnel._open(self._ssh_manager, remote_port,
+                                 local_port=local_port, timeout=timeout)
 
     async def start_service(
         self, *args: str, port: int, ready_timeout: float = 30,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
     ) -> Process[str]:
-        """Start a durable foreground command and wait for its loopback TCP port.
-
-        Logs are retained for diagnosis, including after startup failure. Call
-        Process.cleanup() when finished. TCP readiness is not an application
-        health check. The command must keep running in the foreground.
-        """
-        _validate_port(port)
-        process = await self.exec(*args, workdir=workdir, env=env, durable=True, retain=True)
-
-        async def wait_listening() -> None:
-            command = _remote_command(
-                ["python3", "-c", "import socket; "
-                 f"socket.create_connection(('127.0.0.1', {port}), 1).close()"],
-                workdir=None, env=None,
-            )
-            while True:
-                result = await self._run_idempotent_command(
-                    command, name=f"service {process.id} readiness", check=False,
-                )
-                code = await process.poll()
-                if code is not None:
-                    raise SandboxFailedError(
-                        f"service {process.id} exited with status {code}; "
-                        "recover its logs with sandbox.get_process(process_id)"
-                    )
-                if result.exit_status == 0:
-                    return
-                await asyncio.sleep(0.1)
-
-        try:
-            await asyncio.wait_for(wait_listening(), timeout=ready_timeout)
-        except BaseException as exc:
-            await finish_cleanup(asyncio.wait_for(process.terminate(), timeout=30))
-            if isinstance(exc, asyncio.TimeoutError):
-                raise SandboxTimeoutError(
-                    f"service {process.id} did not listen on port {port} within "
-                    f"{ready_timeout} seconds; recover its logs with sandbox.get_process(process_id)"
-                ) from exc
-            raise
-        return process
+        """Start a durable foreground command, retain logs, and await its TCP port."""
+        return await self._services.start(
+            *args, port=port, ready_timeout=ready_timeout, workdir=workdir, env=env,
+        )
 
     @overload
     async def exec(
@@ -1333,10 +1249,7 @@ fi
 
     async def _close_connection(self) -> None:
         try:
-            if self._tunnels:
-                await asyncio.gather(*(
-                    tunnel.close() for tunnel in tuple(self._tunnels)
-                ))
+            await self._services.close()
         finally:
             await self._ssh_manager.close()
 
@@ -1532,11 +1445,6 @@ fi
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self.status == SandboxStatus.CREATED:
-                if not await self._wait_for_startup(deadline):
-                    raise SandboxTimeoutError(
-                        f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
-                    )
             if self.status.terminal:
                 return
             await _stop_sandbox(self._client, self.id, deadline=deadline)
@@ -1545,12 +1453,6 @@ fi
             await self._close_connection()
             if self._owns_client:
                 await self._client.close()
-
-
-def _validate_port(port: int, *, allow_zero: bool = False) -> None:
-    minimum = 0 if allow_zero else 1
-    if type(port) is not int or not minimum <= port <= 65535:
-        raise InvalidRequestError(f"port must be an integer between {minimum} and 65535")
 
 
 def _path_segment(value: str) -> str:
@@ -1787,13 +1689,19 @@ async def _stop_sandbox(
                 "POST", f"/sandboxes/{_path_segment(sandbox_id)}/stop"
             )
             return
-        except (ConnectionError, RetryableError) as exc:
+        except (ConnectionError, RetryableError, ConflictError) as exc:
             now = time.monotonic()
-            failing_since = now if failing_since is None else failing_since
-            if now - failing_since >= OUTAGE_GRACE_SECONDS:
-                raise
+            if isinstance(exc, ConflictError):
+                if exc.code != "sandbox_not_ready":
+                    raise
+                # Older APIs refuse /stop until allocation finishes; retry the stop itself.
+                failing_since = None
+            else:
+                failing_since = now if failing_since is None else failing_since
+                if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                    raise
             if deadline is not None and now >= deadline:
-                raise
+                raise SandboxTimeoutError(f"stopping sandbox {sandbox_id} exceeded its deadline") from exc
             await _sleep_until_next_poll(deadline, delay, exc.retry_after)
             delay = min(5.0, delay * 2.0)
 

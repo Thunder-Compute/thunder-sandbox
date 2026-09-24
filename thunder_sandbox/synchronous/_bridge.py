@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
+import sys
 from typing import TypeVar
+
+from .._common.lifecycle import finish_cleanup
 
 T = TypeVar("T")
 
@@ -51,27 +56,90 @@ class AsyncBridge:
         if close is not None:
             close()
 
-    def run(self, coroutine: Awaitable[T]) -> T:
+    def _submit(
+        self, coroutine: Awaitable[T],
+    ) -> tuple[concurrent.futures.Future[T], concurrent.futures.Future[None]]:
         if self._closed or self._loop is None:
             self._close(coroutine)
-            raise RuntimeError("synchronous client is closed")
+            raise RuntimeError("SDK connection is closed")
+        # Cancelling the result must not report that native finalizers have finished.
+        result: concurrent.futures.Future[T] = concurrent.futures.Future()
+        finished: concurrent.futures.Future[None] = concurrent.futures.Future()
+        loop = self._loop
+
+        def start() -> None:
+            task = loop.create_task(self._await(coroutine))
+
+            def complete(task: asyncio.Task[T]) -> None:
+                try:
+                    value = task.result()
+                except BaseException as exc:
+                    if not result.done():
+                        with suppress(concurrent.futures.InvalidStateError):
+                            result.set_exception(exc)
+                else:
+                    if not result.done():
+                        with suppress(concurrent.futures.InvalidStateError):
+                            result.set_result(value)
+                finally:
+                    self._close(coroutine)
+                    finished.set_result(None)
+
+            task.add_done_callback(complete)
+            result.add_done_callback(
+                lambda future: loop.call_soon_threadsafe(task.cancel) if future.cancelled() else None
+            )
+
+        loop.call_soon_threadsafe(start)
+        return result, finished
+
+    def run(self, coroutine: Awaitable[T]) -> T:
         if threading.current_thread() is self._thread:
             self._close(coroutine)
             raise RuntimeError("cannot call the synchronous API from its event-loop thread")
-        future = asyncio.run_coroutine_threadsafe(self._await(coroutine), self._loop)
-        return future.result()
+        future, finished = self._submit(coroutine)
+        try:
+            return future.result()
+        except BaseException:
+            future.cancel()
+            finished.result()
+            raise
 
     async def run_async(self, coroutine: Awaitable[T]) -> T:
-        """Await a coroutine on the bridge loop without blocking the caller's loop."""
-        if self._closed or self._loop is None:
-            self._close(coroutine)
-            raise RuntimeError("client is closed")
-        future = asyncio.run_coroutine_threadsafe(self._await(coroutine), self._loop)
+        """Cancel and join native work before its owning scope can close the loop."""
+        future, finished = self._submit(coroutine)
         try:
             return await asyncio.wrap_future(future)
         except asyncio.CancelledError:
             future.cancel()
+
+            async def join() -> None:
+                await asyncio.wrap_future(finished)
+
+            await finish_cleanup(join())
             raise
+
+    @contextmanager
+    def context(self, scope: AbstractAsyncContextManager[T]) -> Iterator[T]:
+        value = self.run(scope.__aenter__())
+        try:
+            yield value
+        except BaseException:
+            if not self.run(scope.__aexit__(*sys.exc_info())):
+                raise
+        else:
+            self.run(scope.__aexit__(None, None, None))
+
+    @asynccontextmanager
+    async def context_async(self, scope: AbstractAsyncContextManager[T]) -> AsyncIterator[T]:
+        value = await self.run_async(scope.__aenter__())
+        try:
+            yield value
+        except BaseException:
+            if not await self.run_async(scope.__aexit__(*sys.exc_info())):
+                raise
+        else:
+            await self.run_async(scope.__aexit__(None, None, None))
 
     def close(self) -> None:
         if self._closed:

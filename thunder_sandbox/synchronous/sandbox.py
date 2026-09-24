@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
@@ -237,30 +236,30 @@ class Sandbox:
     ) -> Iterator[Sandbox]:
         """Wait for readiness and terminate this sandbox when the scope exits."""
         try:
-            self.wait_until_ready(timeout=ready_timeout, on_status=on_status)
-            yield self
+            with self._client._bridge.context(self._sandbox.ephemeral(
+                ready_timeout=ready_timeout, cleanup_timeout=cleanup_timeout,
+                on_status=on_status,
+            )):
+                yield self
         finally:
-            try:
-                self._client._bridge.run(asyncio.wait_for(
-                    self._sandbox.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
-                ))
-            finally:
-                if self._owns_client:
-                    self._client.close()
+            if self._owns_client:
+                self._client.close()
 
     @asynccontextmanager
     async def ephemeral_async(
         self, *, ready_timeout: float = 300, cleanup_timeout: float = 120,
         on_status: Callable[[SandboxInfo], None] | None = None,
     ) -> AsyncIterator[Sandbox]:
-        """Await readiness and finish bounded cleanup before propagating cancellation."""
+        """Await the native ephemeral scope on the adapter's event loop."""
         try:
-            await self.wait_until_ready_async(timeout=ready_timeout, on_status=on_status)
-            yield self
+            async with self._client._bridge.context_async(self._sandbox.ephemeral(
+                ready_timeout=ready_timeout, cleanup_timeout=cleanup_timeout,
+                on_status=on_status,
+            )):
+                yield self
         finally:
-            await finish_cleanup(asyncio.wait_for(
-                self.terminate_async(timeout=cleanup_timeout), timeout=cleanup_timeout,
-            ))
+            if self._owns_client:
+                await finish_cleanup(self._client.close_async())
 
     def tunnel(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
