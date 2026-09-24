@@ -2524,7 +2524,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         # docker cp keeps the stage's numeric owner, the SSH user (uid 1000).
         # An image whose own user is also uid 1000 would receive the upload as
         # that user, so a verifier sweeping its files deleted its own tests.
-        # The stage goes to root for the copy, then back for cleanup.
+        # The stage goes to root for the copy, so cleanup needs sudo.
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             sandbox = AsyncSandbox._from_response(
@@ -2537,10 +2537,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             order: list[str] = []
 
             async def record_run(command: str, **kwargs: object) -> mock.Mock:
-                if "chown" in command:
-                    order.append("chown ubuntu:" if "ubuntu:" in command else "chown ?")
-                elif "mkdir" in command:
+                if "mkdir" in command:
                     order.append("reset")
+                elif command.startswith("sudo --non-interactive rm -rf"):
+                    order.append("sudo rm")
                 elif command.startswith("rm -rf"):
                     order.append("rm")
                 return mock.Mock(returncode=0, stdout="", stderr="")
@@ -2566,7 +2566,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 order,
-                ["reset", "scp", "chown 0:0", "docker cp", "chown ubuntu:", "rm"],
+                ["reset", "scp", "chown 0:0", "docker cp", "sudo rm"],
             )
             chown = next(c.args for c in guest.await_args_list if "chown" in c.args)
             # Under sudo, a symlink in the payload must never redirect the

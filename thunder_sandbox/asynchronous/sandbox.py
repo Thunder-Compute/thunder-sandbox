@@ -906,8 +906,12 @@ fi
             command, name=f"publish upload in sandbox {self.id}"
         )
 
-    async def _cleanup_remote_transfer_paths(self, *paths: str) -> None:
+    async def _cleanup_remote_transfer_paths(
+        self, *paths: str, privileged: bool = False
+    ) -> None:
         command = "rm -rf -- " + " ".join(shlex.quote(path) for path in paths)
+        if privileged:
+            command = "sudo --non-interactive " + command
         deadline = _earliest_deadline(
             time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS, self._ssh_deadline()
         )
@@ -1019,31 +1023,9 @@ fi
         except (OSError, asyncssh.Error) as exc:
             raise SandboxFailedError(f"could not upload to sandbox container: {exc}") from exc
         finally:
-            # Cleanup runs as the SSH user and could not remove a root-owned
-            # stage, so give it back first.
-            with suppress(Exception):
-                await self._run_idempotent_command(
-                    _remote_command(
-                        (
-                            "sudo",
-                            "--non-interactive",
-                            "chown",
-                            "-R",
-                            "-h",
-                            "--",
-                            f"{self.ssh.user}:",
-                            stage,
-                        ),
-                        workdir=None,
-                        env=None,
-                    ),
-                    name=f"release transfer staging in sandbox {self.id}",
-                    deadline=_earliest_deadline(
-                        time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS,
-                        self._ssh_deadline(),
-                    ),
-                )
-            await self._cleanup_remote_transfer_paths(stage)
+            # The stage is root-owned once it has changed hands above, which
+            # the SSH user could not remove.
+            await self._cleanup_remote_transfer_paths(stage, privileged=True)
 
     async def _download_from_container(
         self,
