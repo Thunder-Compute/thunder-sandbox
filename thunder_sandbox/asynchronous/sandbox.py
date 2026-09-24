@@ -73,6 +73,11 @@ from .tunnel import Tunnel
 from .process import Process
 
 OUTAGE_GRACE_SECONDS = 30.0
+# Bound for stopping a service whose port never opened. Durable terminate()
+# can wait indefinitely for a PID; this caps how long start_service() blocks
+# on that, without cancelling the stop itself.
+_SERVICE_TERMINATE_TIMEOUT_SECONDS = 30.0
+_service_stop_tasks: set[asyncio.Task[None]] = set()
 # The API refuses a readiness wait held open longer than this per request.
 WAIT_WINDOW_MAX_SECONDS = 30.0
 # How much longer than its window one wait request may take to answer before
@@ -294,8 +299,12 @@ class Sandbox:
             await self.wait_until_ready(timeout=ready_timeout, on_status=on_status)
             yield self
         finally:
+            # The cleanup budget is also the outer wait. Spending it on another
+            # readiness wait would be cancelled before /stop is sent, so a
+            # sandbox still in CREATED is stopped directly.
             await finish_cleanup(asyncio.wait_for(
-                self.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
+                self._terminate(timeout=cleanup_timeout, stop_created=True),
+                timeout=cleanup_timeout,
             ))
 
     async def tunnel(
@@ -383,7 +392,7 @@ class Sandbox:
         try:
             await asyncio.wait_for(wait_listening(), timeout=ready_timeout)
         except BaseException as exc:
-            await finish_cleanup(asyncio.wait_for(process.terminate(), timeout=30))
+            await _stop_failed_service(process)
             if isinstance(exc, asyncio.TimeoutError):
                 raise SandboxTimeoutError(
                     f"service {process.id} did not listen on port {port} within "
@@ -1530,14 +1539,27 @@ fi
         self._info = _info_from_response(client.config.paths, response)
 
     async def terminate(self, *, timeout: float | None = 300) -> None:
+        await self._terminate(timeout=timeout)
+
+    async def _terminate(
+        self, *, timeout: float | None = 300, stop_created: bool = False
+    ) -> None:
+        """Stop this sandbox and close its client connection.
+
+        A direct terminate waits for a sandbox that is still being created,
+        then stops it. If that wait expires, or ``stop_created`` is set, the
+        same ``/stop`` request ``create()`` uses on rollback is sent anyway.
+        Otherwise a readiness timeout leaves the allocation running.
+        """
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self.status == SandboxStatus.CREATED:
+            if self.status == SandboxStatus.CREATED and not stop_created:
                 if not await self._wait_for_startup(deadline):
-                    raise SandboxTimeoutError(
-                        f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
-                    )
-            if self.status.terminal:
+                    stop_created = True
+            if self.status == SandboxStatus.CREATED and stop_created:
+                await _stop_sandbox(self._client, self.id, deadline=deadline)
+                await self.refresh()
+            if self.status.terminal or self.status == SandboxStatus.CREATED:
                 return
             await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
@@ -1774,6 +1796,39 @@ async def _sleep_until_next_poll(
     if deadline is not None:
         delay = max(0.0, min(delay, deadline - time.monotonic()))
     await asyncio.sleep(delay)
+
+
+def _discard_task_result(task: asyncio.Task[object]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _stop_failed_service(process: Process[str]) -> None:
+    """Stop a service that failed to open its port.
+
+    The readiness error must survive this cleanup. ``wait_for`` cancels the
+    task it wraps, and durable ``terminate()`` can sit in its PID wait longer
+    than the budget; cancelling there returns before SIGTERM or SIGKILL.
+    Shield the stop and let it finish in the background if the budget expires.
+    """
+    termination = asyncio.create_task(process.terminate())
+    try:
+        await finish_cleanup(asyncio.wait_for(
+            asyncio.shield(termination), timeout=_SERVICE_TERMINATE_TIMEOUT_SECONDS,
+        ))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        if termination.done():
+            _discard_task_result(termination)
+        else:
+            _service_stop_tasks.add(termination)
+            termination.add_done_callback(_service_stop_tasks.discard)
+            termination.add_done_callback(_discard_task_result)
 
 
 async def _stop_sandbox(

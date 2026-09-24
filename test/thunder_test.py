@@ -2754,6 +2754,116 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sandbox.status, SandboxStatus.FINISHED)
             await client.close()
 
+    async def test_terminate_stops_a_sandbox_that_stays_created(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "status": "created", "ssh": None}
+            )
+            sandbox._wait_for_startup = mock.AsyncMock(return_value=False)  # type: ignore[method-assign]
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[{}, {**SANDBOX_RESPONSE, "status": "finished"}]
+            )
+            await sandbox.terminate(timeout=5)
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("POST", "/sandboxes/sbx-test/stop"),
+                    ("GET", "/sandboxes/sbx-test"),
+                ],
+            )
+            self.assertEqual(sandbox.status, SandboxStatus.FINISHED)
+            await client.close()
+
+    async def test_ephemeral_stops_a_sandbox_that_never_becomes_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "status": "created", "ssh": None}
+            )
+
+            async def fail_ready(*_args: object, **_kwargs: object) -> AsyncSandbox:
+                raise SandboxTimeoutError(
+                    "sandbox sbx-test did not become ready within 1 seconds"
+                )
+
+            sandbox.wait_until_ready = fail_ready  # type: ignore[method-assign]
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[{}, {**SANDBOX_RESPONSE, "status": "finished"}]
+            )
+            with self.assertRaisesRegex(SandboxTimeoutError, "did not become ready"):
+                async with sandbox.ephemeral(cleanup_timeout=5):
+                    pass
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("POST", "/sandboxes/sbx-test/stop"),
+                    ("GET", "/sandboxes/sbx-test"),
+                ],
+            )
+            await client.close()
+
+    async def test_start_service_keeps_the_readiness_error_when_stop_is_slow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            finished = asyncio.Event()
+
+            class SlowProcess:
+                id = "job-1"
+
+                async def poll(self) -> None:
+                    return None
+
+                async def terminate(self) -> None:
+                    started.set()
+                    await release.wait()
+                    finished.set()
+
+            process = SlowProcess()
+            sandbox.exec = mock.AsyncMock(return_value=process)  # type: ignore[method-assign]
+            sandbox._run_idempotent_command = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=mock.Mock(exit_status=1)
+            )
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.sandbox._SERVICE_TERMINATE_TIMEOUT_SECONDS",
+                    0.05,
+                ), self.assertRaisesRegex(SandboxTimeoutError, "did not listen") as caught:
+                    await sandbox.start_service("serve", port=8080, ready_timeout=0.05)
+                self.assertIsInstance(caught.exception, SandboxTimeoutError)
+                self.assertTrue(started.is_set())
+                self.assertFalse(finished.is_set())
+                release.set()
+                await asyncio.wait_for(finished.wait(), timeout=1)
+            finally:
+                release.set()
+                await client.close()
+
+    async def test_start_service_keeps_the_exit_error_when_stop_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+
+            class ExitedProcess:
+                id = "job-2"
+
+                async def poll(self) -> int:
+                    return 7
+
+                async def terminate(self) -> None:
+                    raise RuntimeError("terminate failed")
+
+            sandbox.exec = mock.AsyncMock(return_value=ExitedProcess())  # type: ignore[method-assign]
+            sandbox._run_idempotent_command = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=mock.Mock(exit_status=1)
+            )
+            try:
+                with self.assertRaisesRegex(SandboxFailedError, "exited with status 7"):
+                    await sandbox.start_service("serve", port=8080)
+            finally:
+                await client.close()
+
     async def test_wait_survives_retryable_polling_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -2964,6 +3074,30 @@ class SynchronousSandboxTest(unittest.TestCase):
                 self.assertEqual(sandbox.name, "worker")
                 self.assertEqual(sandbox.status, SandboxStatus.READY)
                 self.assertEqual(sandbox.ssh.port, 2222)
+            finally:
+                client.close()
+
+    def test_ephemeral_stops_a_created_sandbox_without_another_readiness_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client(config(directory))
+            prepare_key(client.config.paths)
+            asynchronous = AsyncSandbox._from_response(
+                client._client, {**SANDBOX_RESPONSE, "status": "created", "ssh": None}
+            )
+            sandbox = Sandbox._from_async(client, asynchronous)
+            asynchronous.wait_until_ready = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=SandboxTimeoutError(
+                    "sandbox sbx-test did not become ready within 1 seconds"
+                )
+            )
+            asynchronous._terminate = mock.AsyncMock()  # type: ignore[method-assign]
+            try:
+                with self.assertRaisesRegex(SandboxTimeoutError, "did not become ready"):
+                    with sandbox.ephemeral(cleanup_timeout=5):
+                        pass
+                asynchronous._terminate.assert_awaited_once_with(  # type: ignore[attr-defined]
+                    timeout=5, stop_created=True
+                )
             finally:
                 client.close()
 

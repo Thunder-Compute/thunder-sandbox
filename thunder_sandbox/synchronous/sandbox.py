@@ -241,8 +241,14 @@ class Sandbox:
             yield self
         finally:
             try:
+                # Stop a sandbox still in CREATED directly. terminate()'s
+                # startup wait would consume this same budget and be cancelled
+                # before /stop is sent.
                 self._client._bridge.run(asyncio.wait_for(
-                    self._sandbox.terminate(timeout=cleanup_timeout), timeout=cleanup_timeout,
+                    self._sandbox._terminate(
+                        timeout=cleanup_timeout, stop_created=True
+                    ),
+                    timeout=cleanup_timeout,
                 ))
             finally:
                 if self._owns_client:
@@ -258,9 +264,16 @@ class Sandbox:
             await self.wait_until_ready_async(timeout=ready_timeout, on_status=on_status)
             yield self
         finally:
-            await finish_cleanup(asyncio.wait_for(
-                self.terminate_async(timeout=cleanup_timeout), timeout=cleanup_timeout,
-            ))
+            async def cleanup() -> None:
+                try:
+                    await self._client._bridge.run_async(self._sandbox._terminate(
+                        timeout=cleanup_timeout, stop_created=True
+                    ))
+                finally:
+                    if self._owns_client:
+                        await self._client.close_async()
+
+            await finish_cleanup(asyncio.wait_for(cleanup(), timeout=cleanup_timeout))
 
     def tunnel(
         self, remote_port: int, *, local_port: int = 0, timeout: float = 30,
