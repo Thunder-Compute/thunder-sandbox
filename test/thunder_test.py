@@ -247,6 +247,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process and shell semantics")
     def test_container_session_waiter_waits_and_propagates_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -288,6 +289,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completed.returncode, 23)
             self.assertEqual(marker.read_text(encoding="utf-8"), "complete")
 
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
     async def test_launcher_executes_a_payload_at_most_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,6 +324,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.state, JobState.SUCCEEDED)
             self.assertEqual(status.returncode, 0)
 
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
     async def test_launcher_redirects_output_and_records_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
