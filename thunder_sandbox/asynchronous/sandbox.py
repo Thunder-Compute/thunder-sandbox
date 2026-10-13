@@ -102,6 +102,7 @@ class Sandbox:
         *args: str,
         name: str | None = None,
         env: Mapping[str, str | None] | None = None,
+        gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
         cpu: int | None = None,
         memory: int | None = None,
@@ -165,6 +166,11 @@ class Sandbox:
                     "cidr_allowlist": cidrs,
                     "domain_allowlist": domains,
                 },
+                **(
+                    {"gatedFeatures": dict(gated_features)}
+                    if gated_features is not None
+                    else {}
+                ),
                 **({"name": name} if name is not None else {}),
                 **(
                     {"image_id": resolved_image.id}
