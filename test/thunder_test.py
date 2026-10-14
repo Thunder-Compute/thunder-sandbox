@@ -1255,9 +1255,25 @@ class SynchronousClientTest(unittest.TestCase):
             client._client.resolve_image = mock.AsyncMock(return_value=expected)
             try:
                 image = Image.from_registry("ubuntu:24.04")
-                self.assertEqual(client.resolve_image(image, timeout=42), expected)
+                features = {"image_feature": True}
+                self.assertEqual(
+                    client.resolve_image(image, timeout=42, gated_features=features),
+                    expected,
+                )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42
+                    image, timeout=42, gated_features=features
+                )
+                client._client.resolve_image.reset_mock()
+                self.assertEqual(
+                    asyncio.run(
+                        client.resolve_image_async(
+                            image, timeout=42, gated_features=features
+                        )
+                    ),
+                    expected,
+                )
+                client._client.resolve_image.assert_awaited_once_with(
+                    image, timeout=42, gated_features=features
                 )
             finally:
                 client.close()
@@ -1339,7 +1355,9 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                     "secret",
                     display_name="Training image",
                 )
-                resolved = await client.resolve_image(image)
+                resolved = await client.resolve_image(
+                    image, gated_features={"image_feature": True}
+                )
                 self.assertEqual(resolved.id, "image-id")
                 client._request.assert_awaited_once()
                 request = client._request.await_args
@@ -1351,6 +1369,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                         "username": "user",
                         "password": "secret",
                         "display_name": "Training image",
+                        "gatedFeatures": {"image_feature": True},
                     },
                 )
             finally:
@@ -1392,7 +1411,8 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                     new=mock.AsyncMock(),
                 ):
                     resolved = await client.resolve_image(
-                        Image.from_dockerfile(root, display_name="Training image")
+                        Image.from_dockerfile(root, display_name="Training image"),
+                        gated_features={"image_feature": True},
                     )
                 self.assertEqual(resolved.id, "image-id")
                 create_call, status_call = client._request.await_args_list
@@ -1405,6 +1425,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 self.assertRegex(body["context_hash"], r"^sha256:[0-9a-f]{64}$")
                 self.assertGreater(body["archive_bytes"], 0)
                 self.assertEqual(body["display_name"], "Training image")
+                self.assertEqual(body["gatedFeatures"], {"image_feature": True})
                 upload_public_key = asyncssh.import_public_key(body["ssh_public_key"])
                 archived_context = client._upload_image_context.await_args.args[0]
                 upload_private_key = client._upload_image_context.await_args.kwargs[
@@ -1551,10 +1572,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             events: list[str] = []
 
             async def resolve(
-                candidate: Image, *, timeout: float | None = 7200
+                candidate: Image,
+                *,
+                timeout: float | None = 7200,
+                gated_features=None,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
                 self.assertEqual(timeout, 7200)
+                self.assertEqual(gated_features, {"image_feature": True})
                 events.append("image-ready")
                 return resolved
 
@@ -1569,6 +1594,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(method, "POST")
                     assert isinstance(body, dict)
                     self.assertEqual(body["image_id"], resolved.id)
+                    self.assertEqual(body["gatedFeatures"], {"image_feature": True})
                     return {"id": "sbx-test"}
                 return {**SANDBOX_RESPONSE, "image_id": resolved.id}
 
@@ -1578,7 +1604,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=request
             )
-            sandbox = await AsyncSandbox.create(image=image, client=client)
+            sandbox = await AsyncSandbox.create(
+                image=image, client=client, gated_features={"image_feature": True}
+            )
             self.assertEqual(sandbox.id, "sbx-test")
             self.assertEqual(sandbox.image_id, resolved.id)
             self.assertEqual(

@@ -99,19 +99,33 @@ class Client:
         return await self._bridge.run_async(self._client.get_pricing())
 
     def resolve_image(
-        self, image: "Image", *, timeout: float | None = 7200
+        self,
+        image: "Image",
+        *,
+        timeout: float | None = 7200,
+        gated_features: Mapping[str, object] | None = None,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
-        return self._bridge.run(self._client.resolve_image(image, timeout=timeout))
+        return self._bridge.run(
+            self._client.resolve_image(
+                image, timeout=timeout, gated_features=gated_features
+            )
+        )
 
     async def resolve_image_async(
-        self, image: "Image", *, timeout: float | None = 7200
+        self,
+        image: "Image",
+        *,
+        timeout: float | None = 7200,
+        gated_features: Mapping[str, object] | None = None,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return await self._bridge.run_async(
-            self._client.resolve_image(image, timeout=timeout)
+            self._client.resolve_image(
+                image, timeout=timeout, gated_features=gated_features
+            )
         )
 
     async def create_sandbox_async(
