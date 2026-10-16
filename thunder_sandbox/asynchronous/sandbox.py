@@ -134,7 +134,9 @@ class Sandbox:
         resolved_client = client or Client.from_cli()
         try:
             resolved_image = (
-                await resolved_client.resolve_image(image) if image is not None else None
+                await resolved_client.resolve_image(image, gated_features=gated_features)
+                if image is not None
+                else None
             )
             internet_access, cidrs, domains = _network_policy_request(
                 block_network,

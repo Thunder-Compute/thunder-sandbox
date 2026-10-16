@@ -214,7 +214,11 @@ class Client:
         )
 
     async def resolve_image(
-        self, image: "Image", *, timeout: float | None = 7200
+        self,
+        image: "Image",
+        *,
+        timeout: float | None = 7200,
+        gated_features: Mapping[str, object] | None = None,
     ) -> "ResolvedImage":
         """Build or import an image and wait until its managed image is ready."""
         from ..image import Image, _create_canonical_build_context
@@ -235,6 +239,8 @@ class Client:
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
+                if gated_features is not None:
+                    request_body["gatedFeatures"] = dict(gated_features)
                 response = await self._request(
                     "POST",
                     "/sandbox-images/from-registry",
@@ -265,6 +271,8 @@ class Client:
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
+                if gated_features is not None:
+                    request_body["gatedFeatures"] = dict(gated_features)
                 response = await self._request(
                     "POST",
                     "/sandbox-images/from-dockerfile",
