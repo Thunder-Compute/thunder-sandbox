@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast, overload
 from urllib.parse import quote
 
@@ -296,6 +296,7 @@ class Sandbox:
         *args: str,
         timeout: float | None = None,
         workdir: str | None = None,
+        user: str | None = None,
         env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True,
         pty: bool = False,
@@ -310,6 +311,7 @@ class Sandbox:
         *args: str,
         timeout: float | None = None,
         workdir: str | None = None,
+        user: str | None = None,
         env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False,
         pty: bool = False,
@@ -324,6 +326,7 @@ class Sandbox:
         *args: str,
         timeout: float | None = None,
         workdir: str | None = None,
+        user: str | None = None,
         env: Mapping[str, str | None] | None = None,
         text: bool,
         pty: bool = False,
@@ -337,6 +340,7 @@ class Sandbox:
         *args: str,
         timeout: float | None = None,
         workdir: str | None = None,
+        user: str | None = None,
         env: Mapping[str, str | None] | None = None,
         text: bool = True,
         pty: bool = False,
@@ -344,6 +348,13 @@ class Sandbox:
         stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
+        if user is not None:
+            if not isinstance(user, str) or not user or "\x00" in user:
+                raise InvalidRequestError(
+                    "user must be a non-empty string without NUL bytes"
+                )
+            if self.image_id is None:
+                raise InvalidRequestError("user requires an image-backed sandbox")
         if not args:
             raise InvalidRequestError("exec requires a command")
         if stdout not in {"capture", "discard"}:
@@ -358,6 +369,7 @@ class Sandbox:
             spec, status = await self._launch_detached_job(
                 args,
                 workdir=workdir,
+                user=user,
                 env=env,
                 stdout=stdout,
                 stderr=stderr,
@@ -367,7 +379,9 @@ class Sandbox:
                 spec, status=status, timeout=timeout, text=text
             )
         command = (
-            _container_remote_command(args, workdir=workdir, env=env, pty=pty)
+            _container_remote_command(
+                args, workdir=workdir, env=env, pty=pty, user=user
+            )
             if self.image_id is not None
             else _remote_command(args, workdir=workdir, env=env)
         )
@@ -432,6 +446,7 @@ class Sandbox:
         args: Sequence[str],
         *,
         workdir: str | None,
+        user: str | None = None,
         env: Mapping[str, str | None] | None,
         stdout: OutputMode = "capture",
         stderr: OutputMode = "capture",
@@ -449,6 +464,7 @@ class Sandbox:
             job_id,
             tuple(args),
             workdir=workdir,
+            user=user,
             env=env,
             container=_CONTAINER_NAME if self.image_id is not None else None,
             stdout=stdout,
@@ -457,7 +473,7 @@ class Sandbox:
         )
         remote_command = (
             _container_remote_command(
-                args, workdir=workdir, env=env, pty=False, job_id=job_id
+                args, workdir=workdir, env=env, pty=False, job_id=job_id, user=user
             )
             if self.image_id is not None
             else _remote_command(args, workdir=workdir, env=env)
@@ -1814,6 +1830,39 @@ exit "$code"
 """
 
 
+def _container_job_prepare_script(job_root: str, busybox: str) -> str:
+    """Create job parents without following attacker-controlled symlinks.
+
+    Each verified directory protects the next component from replacement.
+    BusyBox stat uses lstat by default; do not add its symlink-following -L.
+    """
+
+    root = PurePosixPath(job_root)
+    tmp = shlex.quote(str(root.parent.parent))
+    parent = shlex.quote(str(root.parent))
+    jobs = shlex.quote(str(root))
+    binary = shlex.quote(busybox)
+    return f"""set -eu
+umask 022
+# A root-owned sticky /tmp protects root-owned entries from replacement.
+# A root-owned 0755 /tmp is safe as well.
+case "$({binary} stat -c '%u:%a:%F' -- {tmp})" in
+    '0:1777:directory'|'0:755:directory') ;;
+    *) echo 'unsafe container temporary directory' >&2; exit 70 ;;
+esac
+{binary} mkdir -m 755 -- {parent} 2>/dev/null || :
+[ "$({binary} stat -c '%u:%a:%F' -- {parent})" = '0:755:directory' ] || {{
+    echo 'unsafe container job parent' >&2
+    exit 70
+}}
+{binary} mkdir -m 1777 -- {jobs} 2>/dev/null || :
+[ "$({binary} stat -c '%u:%a:%F' -- {jobs})" = '0:1777:directory' ] || {{
+    echo 'unsafe container job directory' >&2
+    exit 70
+}}
+"""
+
+
 def _container_remote_command(
     args: Sequence[str],
     *,
@@ -1821,10 +1870,13 @@ def _container_remote_command(
     env: Mapping[str, str | None] | None,
     pty: bool,
     job_id: str | None = None,
+    user: str | None = None,
 ) -> str:
     parts = ["sudo", "--non-interactive", "docker", "exec", "--interactive"]
     if pty:
         parts.append("--tty")
+    if user is not None:
+        parts.extend(("--user", user))
     if workdir is not None:
         parts.extend(("--workdir", workdir))
     unset: list[str] = []
@@ -1848,7 +1900,7 @@ def _container_remote_command(
         inner = (
             "set -eu\n"
             f"job={shlex.quote(container_job)}\n"
-            'mkdir -p -- "$job"\n'
+            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$job"\n'
             'printf \'%s\\n\' "$$" >"$job/pid"\n'
             'exec "$@"\n'
         )
@@ -1871,7 +1923,21 @@ def _container_remote_command(
             )
         )
         parts.extend(payload)
-    return " ".join(shlex.quote(part) for part in parts)
+    command = " ".join(shlex.quote(part) for part in parts)
+    if job_id is not None:
+        prepare = _container_job_prepare_script(
+            str(container_job_directory(job_id).parent), _CONTAINER_BUSYBOX
+        )
+        # Job payloads can use different users within the same container.
+        # Prepare the shared parent as root, then let the selected user own
+        # its job directory. UID 0 works even without a root passwd entry.
+        # Lifecycle operations also execute as UID 0.
+        command = (
+            "sudo --non-interactive docker exec --user 0 "
+            f"{shlex.quote(_CONTAINER_NAME)} {shlex.quote(_CONTAINER_BUSYBOX)} "
+            f"sh -c {shlex.quote(prepare)} && {command}"
+        )
+    return command
 
 
 __all__ = ["Sandbox"]

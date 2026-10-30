@@ -165,7 +165,7 @@ class JobSpec:
     """Immutable command metadata staged for recovery and operator debugging.
 
     Recovery consumes the output, retention, and container fields. The argv,
-    workdir, and environment fields preserve the submitted command's intent for
+    workdir, user, and environment fields preserve the submitted command's intent for
     inspection; execution itself uses the separately persisted launch script.
     """
 
@@ -177,6 +177,7 @@ class JobSpec:
     stdout: OutputMode = "capture"
     stderr: OutputMode = "capture"
     retain: bool = False
+    user: str | None = None
 
     def __post_init__(self) -> None:
         validate_job_id(self.job_id)
@@ -186,6 +187,8 @@ class JobSpec:
             _validate_text(argument, "command argument")
         if self.workdir is not None:
             _validate_text(self.workdir, "working directory", empty=False)
+        if self.user is not None:
+            _validate_text(self.user, "user", empty=False)
         if self.container is not None:
             _validate_text(self.container, "container name", empty=False)
         if self.stdout not in {"capture", "discard"}:
@@ -213,6 +216,7 @@ class JobSpec:
                 "stdout": self.stdout,
                 "stderr": self.stderr,
                 "retain": self.retain,
+                "user": self.user,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -236,6 +240,7 @@ class JobSpec:
             stdout = raw.get("stdout", "capture")
             stderr = raw.get("stderr", "capture")
             retain = raw.get("retain", False)
+            user = raw.get("user")
             if not isinstance(job_id, str) or not isinstance(argv, list):
                 raise TypeError
             if not all(isinstance(argument, str) for argument in argv):
@@ -250,6 +255,8 @@ class JobSpec:
                     for name, item in env.items()
                 )
             ):
+                raise TypeError
+            if user is not None and not isinstance(user, str):
                 raise TypeError
             if container is not None and not isinstance(container, str):
                 raise TypeError
@@ -266,6 +273,7 @@ class JobSpec:
                 stdout=stdout,  # type: ignore[arg-type]
                 stderr=stderr,  # type: ignore[arg-type]
                 retain=retain,
+                user=user,
             )
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ValueError("invalid durable-job specification") from exc
@@ -570,7 +578,7 @@ def cleanup_command(
     container_cleanup = ""
     if container is not None:
         container_cleanup = (
-            "sudo --non-interactive docker exec "
+            "sudo --non-interactive docker exec --user 0 "
             f"{shlex.quote(container)} {shlex.quote(container_busybox)} rm -rf -- "
             f"{shlex.quote(str(container_job_directory(paths.job_id)))} "
             "2>/dev/null || true\n"
@@ -610,7 +618,7 @@ def _container_process_group(
 container_pid=''
 attempt=0
 while [ -z "$container_pid" ]; do
-    container_pid=$(sudo --non-interactive docker exec {quoted_container} {quoted_busybox} cat -- {quoted_pid_file} 2>/dev/null || true)
+    container_pid=$(sudo --non-interactive docker exec --user 0 {quoted_container} {quoted_busybox} cat -- {quoted_pid_file} 2>/dev/null || true)
     if [ -n "$container_pid" ] || grep -Eq {terminal_pattern} "$status"; then
         break
     fi
@@ -632,7 +640,7 @@ case "$container_pid" in
 esac
 """
     prefix = (
-        f"sudo --non-interactive docker exec {quoted_container} {quoted_busybox} kill"
+        f"sudo --non-interactive docker exec --user 0 {quoted_container} {quoted_busybox} kill"
     )
     return _ProcessGroupTarget(
         prepare=prepare,
