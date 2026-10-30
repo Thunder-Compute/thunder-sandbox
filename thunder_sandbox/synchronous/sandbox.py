@@ -52,9 +52,11 @@ class Sandbox:
     ) -> "Sandbox":
         """Create a sandbox, resolving an optional image before allocation.
 
-        An image-backed sandbox starts a long-running container without running
-        the image's ENTRYPOINT or CMD. Positional arguments start the first
-        process through ``exec`` after the sandbox becomes ready.
+        Image ENTRYPOINT and CMD run once, without automatic restarts. Images
+        with neither use a restarting keepalive. Positional arguments launch a
+        separate ``exec`` command after readiness; they do not override image
+        defaults and require the container to still be running. Image-command
+        exit leaves the sandbox VM running until termination or TTL expiry.
         """
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -496,6 +498,10 @@ class Sandbox:
         return await self._client._bridge.run_async(self._sandbox.poll())
 
     def wait(self, *, timeout: float | None = None) -> int | None:
+        """Wait for the positional create command, or for VM termination.
+
+        This does not wait for the image's ENTRYPOINT/CMD or return its exit code.
+        """
         return self._client._bridge.run(self._sandbox.wait(timeout=timeout))
 
     async def wait_async(self, *, timeout: float | None = None) -> int | None:
@@ -504,6 +510,10 @@ class Sandbox:
         )
 
     def wait_until_ready(self, *, timeout: float | None = 300) -> "Sandbox":
+        """Wait for guest initialization, without checking application health.
+
+        A short image ENTRYPOINT/CMD may already have exited when this returns.
+        """
         self._client._bridge.run(self._sandbox.wait_until_ready(timeout=timeout))
         return self
 

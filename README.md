@@ -301,17 +301,50 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-An image-backed sandbox ignores the image's `ENTRYPOINT` and `CMD` and keeps
-the container alive for the sandbox lifetime. Commands run inside that
-container through `sandbox.exec(...)`:
+## Container images
 
-```python
-sandbox = thunder.Sandbox.create(image=thunder.Image.from_registry("ubuntu:24.04"))
-process = sandbox.exec("sh", "-c", "echo hello")
+An image-backed sandbox runs the image's `ENTRYPOINT` followed by its `CMD` arguments. If only one is set, it runs that command. The workload runs once: a successful exit, an error, or signal termination leaves the container stopped. Service restarts do not relaunch it.
+
+For example, put this `Dockerfile` in `./server-image` to start a Python HTTP server automatically:
+
+```dockerfile
+FROM python:3.12-slim
+ENTRYPOINT ["python", "-m", "http.server"]
+CMD ["8080", "--bind", "0.0.0.0"]
 ```
 
-Use `user` to override the image's `USER` for an individual command, without
-requiring `su`, `sudo`, or a password inside the image:
+```python
+sandbox = thunder.Sandbox.create(
+    image=thunder.Image.from_dockerfile("./server-image"),
+    timeout=900,
+)
+try:
+    sandbox.wait_until_ready()
+    # Additional commands execute inside the running server container.
+    process = sandbox.exec("python", "--version")
+    print(process.stdout.read())
+    process.wait()
+finally:
+    sandbox.terminate()
+```
+
+`Image.from_registry(...)` uses the same image-command behavior. Inherited defaults count too: a base image's shell or interpreter command can exit immediately when started without interactive input.
+
+If both `ENTRYPOINT` and `CMD` are absent or empty, Thunder keeps the container alive for `sandbox.exec(...)` and automatically restarts the keepalive after an unexpected exit. To build an exec-only image, clear both defaults, including inherited ones:
+
+```dockerfile
+FROM ubuntu:24.04
+ENTRYPOINT []
+CMD []
+```
+
+Positional arguments to `Sandbox.create("python", "script.py", image=image)` run as a separate `exec` command after sandbox readiness. They do not replace the image's `ENTRYPOINT` or `CMD`. The image workload may already be running or may have exited before this additional command starts. Without an image, `exec` runs directly in the guest VM.
+
+`wait_until_ready()` waits for guest initialization, not application health. It can succeed even if a short image command has already finished. After the image command exits, the container stays stopped and further `exec` calls fail, while the VM remains running and the sandbox can still report `READY`. Call `terminate()` when finished, or use a finite sandbox lifetime to release its resources. Container file transfers should be completed while the container is running; the runc backend does not support transfers after it stops.
+
+`sandbox.wait()` and `sandbox.poll()` track a positional command passed to `create`, or otherwise the sandbox VM's lifecycle. They do not track the image command's exit or return its exit code. The SDK does not expose a `Process` handle, captured output, or exit status for the image's initial command. Commands launched with `sandbox.exec(...)` retain their normal `Process` output and wait behavior. These semantics also apply to the async APIs.
+
+Use `user` to choose the account for an individual command, without requiring `su`, `sudo`, or a password inside the image:
 
 ```python
 setup = sandbox.exec("mkdir", "-p", "/opt/agent-tools", user="root")
@@ -319,15 +352,7 @@ setup.wait()
 agent = sandbox.exec("id", user="1000:1000")
 ```
 
-`user` accepts a username or UID, optionally followed by a group name or GID
-(`"root"`, `"1000"`, or `"1000:1000"`), and is passed to `docker exec --user`.
-Omitting it uses the image's configured user. It works for durable and PTY
-commands through `exec` and `exec_async`, including the native async SDK.
-Specifying `user` without an image raises `InvalidRequestError`.
-
-Positional arguments to `Sandbox.create` start the first process through the
-same `exec` path after the sandbox becomes ready. Without an image, `exec`
-runs directly in the guest VM.
+`user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`), and is passed to `docker exec --user`. Commands default to root in the current container runtime, regardless of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK. Specifying `user` without an image raises `InvalidRequestError`.
 
 ## Configuration
 
