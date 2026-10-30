@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast, overload
 from urllib.parse import quote
 
@@ -1830,6 +1830,39 @@ exit "$code"
 """
 
 
+def _container_job_prepare_script(job_root: str, busybox: str) -> str:
+    """Create job parents without following attacker-controlled symlinks.
+
+    Each verified directory protects the next component from replacement.
+    BusyBox stat uses lstat by default; do not add its symlink-following -L.
+    """
+
+    root = PurePosixPath(job_root)
+    tmp = shlex.quote(str(root.parent.parent))
+    parent = shlex.quote(str(root.parent))
+    jobs = shlex.quote(str(root))
+    binary = shlex.quote(busybox)
+    return f"""set -eu
+umask 022
+# A root-owned sticky /tmp protects root-owned entries from replacement.
+# A root-owned 0755 /tmp is safe as well.
+case "$({binary} stat -c '%u:%a:%F' -- {tmp})" in
+    '0:1777:directory'|'0:755:directory') ;;
+    *) echo 'unsafe container temporary directory' >&2; exit 70 ;;
+esac
+{binary} mkdir -m 755 -- {parent} 2>/dev/null || :
+[ "$({binary} stat -c '%u:%a:%F' -- {parent})" = '0:755:directory' ] || {{
+    echo 'unsafe container job parent' >&2
+    exit 70
+}}
+{binary} mkdir -m 1777 -- {jobs} 2>/dev/null || :
+[ "$({binary} stat -c '%u:%a:%F' -- {jobs})" = '0:1777:directory' ] || {{
+    echo 'unsafe container job directory' >&2
+    exit 70
+}}
+"""
+
+
 def _container_remote_command(
     args: Sequence[str],
     *,
@@ -1867,7 +1900,7 @@ def _container_remote_command(
         inner = (
             "set -eu\n"
             f"job={shlex.quote(container_job)}\n"
-            'mkdir -p -- "$job"\n'
+            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$job"\n'
             'printf \'%s\\n\' "$$" >"$job/pid"\n'
             'exec "$@"\n'
         )
@@ -1892,10 +1925,8 @@ def _container_remote_command(
         parts.extend(payload)
     command = " ".join(shlex.quote(part) for part in parts)
     if job_id is not None:
-        job_root = shlex.quote(str(container_job_directory(job_id).parent))
-        prepare = (
-            f"{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -p -- {job_root} && "
-            f"{shlex.quote(_CONTAINER_BUSYBOX)} chmod 1777 -- {job_root}"
+        prepare = _container_job_prepare_script(
+            str(container_job_directory(job_id).parent), _CONTAINER_BUSYBOX
         )
         # Job payloads can use different users within the same container.
         # Prepare the shared parent as root, then let the selected user own

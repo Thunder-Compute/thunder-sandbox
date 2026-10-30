@@ -63,6 +63,7 @@ from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import (
     _container_session_waiter,
     _container_remote_command,
+    _container_job_prepare_script,
     _pinned_host_key,
 )
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
@@ -2283,7 +2284,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("--user root --workdir /workspace", submitted)
             self.assertIn('"user":"root"', submitted)
-            self.assertIn("chmod 1777", submitted)
+            self.assertIn("mkdir -m 1777", submitted)
             self.assertIn("thunder-sandbox /busybox sh -c", submitted)
             self.assertIn("/busybox setsid", submitted)
             self.assertIn("session_pid=$!", submitted)
@@ -2417,7 +2418,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     "sudo", "--non-interactive", "docker", "exec", "--user",
                     "0", "thunder-sandbox", "/busybox",
                 ])
-                self.assertIn("chmod 1777 -- /tmp/thunder-sandbox/jobs", tokens[10])
+                self.assertIn("mkdir -m 1777 -- /tmp/thunder-sandbox/jobs", tokens[10])
                 payload = tokens[separator + 1:]
                 if user is None:
                     self.assertNotIn("--user", payload)
@@ -2427,6 +2428,111 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     ["sh", "-n"], input=command, text=True, capture_output=True
                 )
                 self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX modes and symlinks")
+    def test_container_job_prepare_rejects_planted_paths(self) -> None:
+        # Emulate BusyBox applets using real filesystem operations. Map this
+        # test process's UID to root so the test needs neither root nor Docker.
+        applets = """import os, stat, sys
+command, *args = sys.argv[1:]
+path = args[-1]
+if command == 'mkdir':
+    try:
+        mode = int(args[args.index('-m') + 1], 8)
+        os.mkdir(path, mode)
+        os.chmod(path, mode)  # Match mkdir -m, including sticky bits on macOS.
+    except OSError:
+        sys.exit(1)
+elif command == 'stat':
+    info = os.lstat(path)
+    uid = 0 if info.st_uid == os.getuid() else info.st_uid
+    if path == os.environ.get('TEST_NONROOT_PATH'):
+        uid = 1000
+    kind = 'directory' if stat.S_ISDIR(info.st_mode) else 'symbolic link'
+    print(f'{uid}:{stat.S_IMODE(info.st_mode):o}:{kind}')
+else:
+    raise AssertionError(command)
+"""
+        for planted in (None, "parent-link", "jobs-link", "parent-owner",
+                        "parent-mode", "jobs-mode", "tmp-mode", "tmp-link"):
+            with self.subTest(planted=planted), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory) / "tmp"
+                base.mkdir(mode=0o755)
+                base.chmod(0o1777)
+                parent = base / "thunder-sandbox"
+                jobs = parent / "jobs"
+                victim = Path(directory) / "victim"
+                victim.mkdir(mode=0o755)
+                busybox = Path(directory) / "busybox"
+                busybox.write_text(f"#!{sys.executable}\n" + applets)
+                busybox.chmod(0o700)
+                env = dict(os.environ)
+                if planted == "parent-link":
+                    parent.symlink_to(victim, target_is_directory=True)
+                elif planted in ("jobs-link", "jobs-mode"):
+                    parent.mkdir(mode=0o755)
+                    if planted == "jobs-link":
+                        jobs.symlink_to(victim, target_is_directory=True)
+                    else:
+                        jobs.mkdir(mode=0o755)
+                elif planted in ("parent-owner", "parent-mode"):
+                    parent.mkdir(mode=0o755)
+                    if planted == "parent-owner":
+                        env["TEST_NONROOT_PATH"] = str(parent)
+                    else:
+                        parent.chmod(0o777)
+                elif planted == "tmp-mode":
+                    base.chmod(0o777)
+                elif planted == "tmp-link":
+                    base.rmdir()
+                    base.symlink_to(victim, target_is_directory=True)
+                script = _container_job_prepare_script(str(jobs), str(busybox))
+                for _ in range(2):  # Safe to repeat, including after rejection.
+                    result = subprocess.run(
+                        ["sh", "-c", script], env=env, text=True, capture_output=True
+                    )
+                    if planted is None:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(parent.stat().st_mode & 0o7777, 0o755)
+                        self.assertEqual(jobs.stat().st_mode & 0o7777, 0o1777)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(victim.stat().st_mode & 0o7777, 0o755)
+                    self.assertEqual(list(victim.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX modes and symlinks")
+    def test_container_job_launcher_rejects_existing_job_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            job = Path(directory) / "job"
+            victim = Path(directory) / "victim"
+            victim.mkdir()
+            (victim / "pid").write_text("unchanged")
+            job.symlink_to(victim, target_is_directory=True)
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.container_job_directory",
+                return_value=PurePosixPath(str(job)),
+            ), mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._CONTAINER_BUSYBOX",
+                shutil.which("env"),
+            ):
+                command = _container_remote_command(
+                    ("true",), workdir=None, env=None, pty=False,
+                    job_id="a" * 32, user="root",
+                )
+            inner = next(token for token in shlex.split(command)
+                         if token.startswith("set -eu\njob="))
+            rejected = subprocess.run(
+                ["sh", "-c", inner, "sh", "true"], text=True, capture_output=True
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual((victim / "pid").read_text(), "unchanged")
+            job.unlink()
+            accepted = subprocess.run(
+                ["sh", "-c", inner, "sh", "true"], text=True, capture_output=True
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(job.stat().st_mode & 0o7777, 0o700)
+            self.assertTrue((job / "pid").read_text().strip().isdigit())
 
     async def test_exec_enters_image_container(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
