@@ -429,17 +429,23 @@ payload_group_running() {{
 pid_temporary="$job/.supervisor.pid.$$"
 printf '%s\n' "$$" >"$pid_temporary"
 mv -f -- "$pid_temporary" {supervisor_pid}
-write_status starting null
 # A signal can interrupt the shell's wait even when the payload ignores it.
 # Keep the wrapper alive until the payload really exits so status never gets
 # ahead of the process group and terminate() can enforce its SIGKILL grace.
 trap ':' HUP INT TERM
-write_status running null
+write_status starting null
 set +e
 (
+    # A termination request may arrive before this child exists and therefore
+    # miss it with the process-group signal. Do not start work in that case.
+    if [ -f {termination_request} ]; then
+        exit 143
+    fi
     {command}
 ) </dev/null >{stdout} 2>{stderr} &
 payload_pid=$!
+# Once running is visible, the payload exists and receives group signals.
+write_status running null
 while :; do
     wait "$payload_pid"
     code=$?

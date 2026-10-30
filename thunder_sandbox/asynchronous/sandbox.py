@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import posixpath
 import random
@@ -1110,43 +1111,76 @@ fi
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        timeout: float | None = 300,
     ) -> None:
-        """Replace this running sandbox's outbound network policy.
+        """Replace the outbound policy and wait until its generation is enforced.
 
-        The call returns once Thunder accepts the desired policy. Enforcement on
-        the sandbox's node converges asynchronously. ``None`` leaves an allowlist
-        dimension unrestricted; an empty sequence blocks that dimension.
+        HTTP requests and polling yield to the event loop. ``timeout`` bounds
+        the whole operation; ``None`` waits indefinitely. Timeout or cancellation
+        does not undo an accepted update. ``None`` leaves an allowlist dimension
+        unrestricted; an empty sequence blocks that dimension.
         """
         _validate_network_policy_options(
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
         )
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise InvalidRequestError("network policy timeout must be positive and finite")
         internet_access, cidrs, domains = _network_policy_request(
             block_network,
             outbound_cidr_allowlist,
             outbound_domain_allowlist,
         )
-        response = await self._client._request(
-            "PATCH",
-            f"/sandboxes/{_path_segment(self.id)}/network-policy",
-            {
-                "network_policy": {
-                    "internet_access": internet_access,
-                    "cidr_allowlist": cidrs,
-                    "domain_allowlist": domains,
-                }
-            },
-        )
+        try:
+            await asyncio.wait_for(
+                self._update_network_policy({
+                    "network_policy": {
+                        "internet_access": internet_access,
+                        "cidr_allowlist": cidrs,
+                        "domain_allowlist": domains,
+                    }
+                }),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise SandboxTimeoutError(
+                f"network policy update for sandbox {self.id} did not complete "
+                f"within {timeout} seconds; an accepted update may still be applied"
+            ) from exc
+
+    async def _update_network_policy(self, request: dict[str, object]) -> None:
+        while True:
+            try:
+                response = await self._client._request(
+                    "PATCH",
+                    f"/sandboxes/{_path_segment(self.id)}/network-policy",
+                    request,
+                )
+                break
+            except ConflictError as exc:
+                if exc.code != "sandbox_update_conflict":
+                    raise
+                # Another update is pending. Pace retries
+                # below the policy endpoint's rate limit; never replay a PATCH
+                # after an ambiguous transport failure.
+                await _sleep_until_next_poll(None, 5.0, exc.retry_after)
         policy = response.get("network_policy")
         if not isinstance(policy, dict) or not policy.get("internet_access"):
             raise SandboxFailedError(
                 "Thunder did not return the accepted sandbox network policy"
             )
-        self._info = replace(
-            self._info,
-            network_policy=_network_policy_from_response(policy),
-        )
+        accepted_policy = _network_policy_from_response(policy)
+        generation = _network_policy_generation(response.get("generation"))
+        if generation is None:
+            self._info = replace(
+                self._info,
+                network_policy=accepted_policy,
+                network_policy_generation=None,
+                desired_network_policy_generation=None,
+            )
+        else:
+            await self._wait_for_network_policy(accepted_policy, generation)
         if self.image_id is not None:
             for args in (
                 ("resolvectl", "flush-caches"),
@@ -1166,6 +1200,55 @@ fi
             name=f"sandbox {self.id} VM DNS cache flush",
             check=False,
         )
+
+    async def _wait_for_network_policy(
+        self, policy: NetworkPolicy, generation: int
+    ) -> None:
+        failing_since: float | None = None
+        delay = 1.0
+        while True:
+            try:
+                response = await self._client._request(
+                    "GET", f"/sandboxes/{_path_segment(self.id)}"
+                )
+            except (ConnectionError, RetryableError) as exc:
+                now = time.monotonic()
+                failing_since = now if failing_since is None else failing_since
+                if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                    raise
+                await _sleep_until_next_poll(None, delay, exc.retry_after)
+                delay = min(5.0, delay * 2.0)
+                continue
+            failing_since = None
+            delay = 1.0
+            if response.get("id") != self.id:
+                raise ConnectionError(
+                    "Thunder returned a different sandbox during policy enforcement"
+                )
+            self._info = _info_from_response(self._client.config.paths, response)
+            if self.status.terminal:
+                raise SandboxFailedError(
+                    f"sandbox {self.id} stopped before policy enforcement was confirmed "
+                    f"(status: {self.status.value}): {self.info.failure or 'sandbox is no longer running'}"
+                )
+            desired = self.info.desired_network_policy_generation
+            enforced = self.info.network_policy_generation
+            if any(
+                value is not None and value > generation
+                for value in (desired, enforced)
+            ):
+                raise ConflictError(
+                    f"network policy generation {generation} was superseded",
+                    code="sandbox_update_conflict",
+                )
+            if desired == enforced == generation and self.status == SandboxStatus.READY:
+                if self.info.network_policy != policy:
+                    raise ConflictError(
+                        "enforced network policy differs from the accepted policy",
+                        code="sandbox_update_conflict",
+                    )
+                return
+            await _sleep_until_next_poll(None, delay)
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         try:
@@ -1499,6 +1582,12 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             gpu_count=int(str(spec.get("gpu_count", 0))),
         ),
         network_policy=_network_policy_from_response(policy_value),
+        network_policy_generation=_network_policy_generation(
+            response.get("network_policy_generation")
+        ),
+        desired_network_policy_generation=_network_policy_generation(
+            response.get("desired_network_policy_generation")
+        ),
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
         ssh=ssh,
@@ -1514,6 +1603,14 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
+
+
+def _network_policy_generation(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+        raise ConnectionError("Thunder returned an invalid network policy generation")
+    return value
 
 
 def _network_policy_from_response(value: object) -> NetworkPolicy:
