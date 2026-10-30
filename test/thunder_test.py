@@ -49,6 +49,7 @@ from thunder_sandbox.asynchronous._jobs import (
     JobStatus,
     RemoteJobPaths,
     can_transition,
+    cleanup_command,
     launcher_script,
     new_job_id,
     submission_command,
@@ -61,6 +62,7 @@ from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import (
     _container_session_waiter,
+    _container_remote_command,
     _pinned_host_key,
 )
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
@@ -166,6 +168,7 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             workdir="/workspace",
             env=environment,
             container="thunder-sandbox",
+            user="1000:1000",
         )
         environment["MODEL"] = "mutated"
         encoded = spec.to_json()
@@ -180,9 +183,11 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
         legacy.pop("stdout")
         legacy.pop("stderr")
         legacy.pop("retain")
+        legacy.pop("user")
         recovered = JobSpec.from_json(json.dumps(legacy))
         self.assertEqual((recovered.stdout, recovered.stderr), ("capture", "capture"))
         self.assertFalse(recovered.retain)
+        self.assertIsNone(recovered.user)
 
     def test_job_spec_rejects_values_unsafe_at_the_remote_boundary(self) -> None:
         job_id = "b" * 32
@@ -190,11 +195,21 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             {"argv": ()},
             {"argv": ("echo\x00bad",)},
             {"argv": ("echo",), "workdir": ""},
+            {"argv": ("echo",), "user": ""},
+            {"argv": ("echo",), "user": "root\x00bad"},
             {"argv": ("echo",), "env": {"BAD=NAME": "value"}},
             {"argv": ("echo",), "env": {"GOOD": "bad\x00value"}},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 JobSpec(job_id, **kwargs)
+
+    def test_container_cleanup_uses_uid_zero(self) -> None:
+        command = cleanup_command(
+            RemoteJobPaths("a" * 32), container="thunder-sandbox"
+        )
+        self.assertIn(
+            "docker exec --user 0 thunder-sandbox /busybox rm -rf --", command
+        )
 
     def test_job_state_machine_and_status_records_are_strict(self) -> None:
         self.assertTrue(can_transition(JobState.PREPARED, JobState.STARTING))
@@ -1951,6 +1966,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 ("python", "train.py"),
                 workdir="/workspace",
                 env={"MODEL": "large"},
+                user=None,
                 stdout="capture",
                 stderr="capture",
                 retain=False,
@@ -2161,7 +2177,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(status, terminated)
             command = connection.run.await_args.args[0]  # type: ignore[attr-defined]
-            self.assertIn("docker exec thunder-sandbox /busybox cat", command)
+            self.assertIn("docker exec --user 0 thunder-sandbox /busybox cat", command)
             self.assertIn("/tmp/thunder-sandbox/jobs/22222222222222222222222222222222/pid", command)
             self.assertIn('/busybox kill -KILL -- "-$container_pid"', command)
             self.assertIn('/busybox kill -0 -- "-$container_pid"', command)
@@ -2256,14 +2272,18 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 "thunder_sandbox.asynchronous.sandbox.new_job_id",
                 return_value="1" * 32,
             ):
-                await sandbox._launch_detached_job(
-                    ("python", "train.py"), workdir="/workspace", env=None
+                process = await sandbox.exec(
+                    "python", "train.py", workdir="/workspace", user="root"
                 )
+                self.assertTrue(process.is_durable)
 
             submitted = connection.run.await_args.args[0]
             self.assertIn(
                 "sudo --non-interactive docker exec --interactive", submitted
             )
+            self.assertIn("--user root --workdir /workspace", submitted)
+            self.assertIn('"user":"root"', submitted)
+            self.assertIn("chmod 1777", submitted)
             self.assertIn("thunder-sandbox /busybox sh -c", submitted)
             self.assertIn("/busybox setsid", submitted)
             self.assertIn("session_pid=$!", submitted)
@@ -2340,6 +2360,73 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(sandbox._open.await_count, 2)  # type: ignore[attr-defined]
             await client.close()
+
+    async def test_exec_user_validation_precedes_remote_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            try:
+                for pty in (False, True):
+                    with self.subTest(pty=pty), self.assertRaisesRegex(
+                        InvalidRequestError, "image-backed"
+                    ):
+                        await sandbox.exec("id", user="root", pty=pty)
+                sandbox = AsyncSandbox._from_response(
+                    client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+                )
+                for user in ("", "root\x00bad", 0):
+                    with self.subTest(user=user), self.assertRaisesRegex(
+                        InvalidRequestError, "non-empty string"
+                    ):
+                        await sandbox.exec("id", user=user)
+            finally:
+                await client.close()
+
+    async def test_exec_pty_passes_user_as_one_docker_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
+            )
+            try:
+                for user in ("root", "1000:1000", "agent", "name; $(touch /tmp/no)"):
+                    with self.subTest(user=user), mock.patch.object(
+                        sandbox, "_create_process", new_callable=mock.AsyncMock
+                    ) as create:
+                        await sandbox.exec("id", user=user, pty=True)
+                        argv = shlex.split(create.await_args.args[0])
+                        self.assertEqual(
+                            argv,
+                            ["sudo", "--non-interactive", "docker", "exec",
+                             "--interactive", "--tty", "--user", user,
+                             "thunder-sandbox", "id"],
+                        )
+            finally:
+                await client.close()
+
+    def test_durable_container_command_prepares_shared_jobs_before_user_payload(self) -> None:
+        for user in (None, "root", "agent", "1000:1000"):
+            with self.subTest(user=user):
+                command = _container_remote_command(
+                    ("id",), workdir=None, env=None, pty=False,
+                    job_id="a" * 32, user=user,
+                )
+                # Parse quoted scripts as single arguments.
+                tokens = shlex.split(command)
+                separator = tokens.index("&&")
+                self.assertEqual(tokens[:8], [
+                    "sudo", "--non-interactive", "docker", "exec", "--user",
+                    "0", "thunder-sandbox", "/busybox",
+                ])
+                self.assertIn("chmod 1777 -- /tmp/thunder-sandbox/jobs", tokens[10])
+                payload = tokens[separator + 1:]
+                if user is None:
+                    self.assertNotIn("--user", payload)
+                else:
+                    self.assertEqual(payload[payload.index("--user") + 1], user)
+                syntax = subprocess.run(
+                    ["sh", "-n"], input=command, text=True, capture_output=True
+                )
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     async def test_exec_enters_image_container(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3327,6 +3414,19 @@ class SynchronousSandboxTest(unittest.TestCase):
                 self.assertEqual(process.stdin.write("input"), 5)
                 self.assertEqual(process.stdout.read(), "output")
                 self.assertEqual(process.wait(), 0)
+            finally:
+                client.close()
+
+    def test_exec_interfaces_forward_user_to_native_sdk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, asynchronous = self.sandbox(directory)
+            asynchronous.exec = mock.AsyncMock(return_value=mock.Mock())
+            try:
+                sandbox.exec("id", user="root")
+                self.assertEqual(asynchronous.exec.await_args.kwargs["user"], "root")
+                asyncio.run(sandbox.exec_async("id", user="1000:1000", pty=True))
+                self.assertEqual(asynchronous.exec.await_args.kwargs["user"], "1000:1000")
+                self.assertTrue(asynchronous.exec.await_args.kwargs["pty"])
             finally:
                 client.close()
 

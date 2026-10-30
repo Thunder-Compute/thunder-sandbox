@@ -287,6 +287,7 @@ class Sandbox:
     @overload
     def exec(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -296,6 +297,7 @@ class Sandbox:
     @overload
     def exec(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -305,6 +307,7 @@ class Sandbox:
     @overload
     def exec(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -313,6 +316,7 @@ class Sandbox:
 
     def exec(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool = True, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -323,6 +327,7 @@ class Sandbox:
                 *args,
                 timeout=timeout,
                 workdir=workdir,
+                user=user,
                 env=env,
                 text=text,
                 pty=pty,
@@ -340,6 +345,7 @@ class Sandbox:
     @overload
     async def exec_async(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[True] = True, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -349,6 +355,7 @@ class Sandbox:
     @overload
     async def exec_async(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: Literal[False] = False, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -358,6 +365,7 @@ class Sandbox:
     @overload
     async def exec_async(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -366,6 +374,7 @@ class Sandbox:
 
     async def exec_async(
         self, *args: str, timeout: float | None = None,
+        user: str | None = None,
         workdir: str | None = None, env: Mapping[str, str | None] | None = None,
         text: bool = True, pty: bool = False,
         stdout: OutputMode = "capture", stderr: OutputMode = "capture",
@@ -376,6 +385,7 @@ class Sandbox:
                 *args,
                 timeout=timeout,
                 workdir=workdir,
+                user=user,
                 env=env,
                 text=text,
                 pty=pty,

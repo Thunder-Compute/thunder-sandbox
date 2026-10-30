@@ -310,6 +310,21 @@ sandbox = thunder.Sandbox.create(image=thunder.Image.from_registry("ubuntu:24.04
 process = sandbox.exec("sh", "-c", "echo hello")
 ```
 
+Use `user` to override the image's `USER` for an individual command, without
+requiring `su`, `sudo`, or a password inside the image:
+
+```python
+setup = sandbox.exec("mkdir", "-p", "/opt/agent-tools", user="root")
+setup.wait()
+agent = sandbox.exec("id", user="1000:1000")
+```
+
+`user` accepts a username or UID, optionally followed by a group name or GID
+(`"root"`, `"1000"`, or `"1000:1000"`), and is passed to `docker exec --user`.
+Omitting it uses the image's configured user. It works for durable and PTY
+commands through `exec` and `exec_async`, including the native async SDK.
+Specifying `user` without an image raises `InvalidRequestError`.
+
 Positional arguments to `Sandbox.create` start the first process through the
 same `exec` path after the sandbox becomes ready. Without an image, `exec`
 runs directly in the guest VM.
