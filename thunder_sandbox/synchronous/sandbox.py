@@ -428,18 +428,21 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        timeout: float | None = 300,
     ) -> None:
         """Replace this running sandbox's outbound network policy.
 
-        The call returns once Thunder accepts the desired policy. Enforcement on
-        the sandbox's node converges asynchronously. ``None`` leaves an allowlist
-        dimension unrestricted; an empty sequence blocks that dimension.
+        Returns after enforcement is confirmed and DNS caches are flushed.
+        ``timeout`` bounds the whole operation; ``None`` waits indefinitely.
+        Timeout or cancellation does not undo an accepted update. ``None`` leaves
+        an allowlist dimension unrestricted; an empty sequence blocks it.
         """
         self._client._bridge.run(
             self._sandbox.update_network_policy(
                 block_network=block_network,
                 outbound_cidr_allowlist=outbound_cidr_allowlist,
                 outbound_domain_allowlist=outbound_domain_allowlist,
+                timeout=timeout,
             )
         )
 
@@ -449,12 +452,14 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        timeout: float | None = 300,
     ) -> None:
         await self._client._bridge.run_async(
             self._sandbox.update_network_policy(
                 block_network=block_network,
                 outbound_cidr_allowlist=outbound_cidr_allowlist,
                 outbound_domain_allowlist=outbound_domain_allowlist,
+                timeout=timeout,
             )
         )
 

@@ -27,6 +27,7 @@ from thunder_sandbox._common.config import DEFAULT_API_URL, ClientConfig, Thunde
 from thunder_sandbox._common.exceptions import (
     AuthenticationError,
     CapacityError,
+    ConflictError,
     ConnectionError,
     InvalidRequestError,
     NotFoundError,
@@ -2953,18 +2954,23 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     accepted_domains,
                 ) in cases:
                     with self.subTest(name=name):
-                        client._request = mock.AsyncMock(  # type: ignore[method-assign]
-                            return_value={
+                        accepted = {
                                 "id": sandbox.id,
+                                "generation": 1,
                                 "network_policy": {
                                     "internet_access": access,
                                     "cidr_allowlist": accepted_cidrs,
                                     "domain_allowlist": accepted_domains,
                                 },
                             }
-                        )
+                        client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                            accepted,
+                            {**SANDBOX_RESPONSE, "network_policy": accepted["network_policy"],
+                             "desired_network_policy_generation": 1, "network_policy_generation": 1},
+                        ])
                         await sandbox.update_network_policy(**options)
-                        client._request.assert_awaited_once_with(
+                        self.assertEqual(client._request.await_count, 2)
+                        self.assertEqual(client._request.await_args_list[0], mock.call(
                             "PATCH",
                             "/sandboxes/sbx-test/network-policy",
                             {
@@ -2974,7 +2980,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                                     "domain_allowlist": domains,
                                 }
                             },
-                        )
+                        ))
                         self.assertEqual(
                             sandbox.info.network_policy.internet_access, access
                         )
@@ -3004,13 +3010,15 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     sandbox = AsyncSandbox._from_response(
                         client, {**SANDBOX_RESPONSE, "image_id": image_id}
                     )
-                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
-                        return_value={"network_policy": {"internet_access": "closed"}}
-                    )
+                    client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                        {"generation": 1, "network_policy": {"internet_access": "closed"}},
+                        {**SANDBOX_RESPONSE, "image_id": image_id, "network_policy": {"internet_access": "closed"},
+                         "desired_network_policy_generation": 1, "network_policy_generation": 1},
+                    ])
                     connection = mock.Mock()
 
                     async def run(command: str, **kwargs: object) -> mock.Mock:
-                        client._request.assert_awaited_once()
+                        self.assertEqual(client._request.await_count, 2)
                         self.assertEqual(sandbox.info.network_policy.internet_access, "closed")
                         return mock.Mock(returncode=exit_codes[connection.run.await_count - 1])
 
@@ -3031,6 +3039,138 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(commands, expected)
                     finally:
                         await client.close()
+
+    async def test_network_policy_waits_for_matching_enforcement_before_flushing_dns(self) -> None:
+        for generation in (0, 2):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as directory:
+                sandbox, client = self.sandbox(directory)
+                policy = {"internet_access": "closed"}
+                target = generation
+                accepted = {"network_policy": policy, "generation": generation}
+                pending = {**SANDBOX_RESPONSE, "network_policy": policy,
+                           "desired_network_policy_generation": target}
+                if target > 0:
+                    pending["network_policy_generation"] = target - 1
+                enforced = {**pending, "network_policy_generation": target}
+                client._request = mock.AsyncMock(side_effect=[accepted, pending, enforced])  # type: ignore[method-assign]
+
+                async def flush(*args: object, **kwargs: object) -> mock.Mock:
+                    self.assertEqual(client._request.await_count, 3)
+                    self.assertEqual(sandbox.info.network_policy_generation, target)
+                    return mock.Mock(returncode=0)
+
+                sandbox._run_idempotent_command = mock.AsyncMock(side_effect=flush)  # type: ignore[method-assign]
+                try:
+                    with mock.patch("thunder_sandbox.asynchronous.sandbox._sleep_until_next_poll", new_callable=mock.AsyncMock) as sleep:
+                        await sandbox.update_network_policy(block_network=True)
+                    sleep.assert_awaited_once()
+                    self.assertEqual([call.args[0] for call in client._request.await_args_list], ["PATCH", "GET", "GET"])
+                finally:
+                    await client.close()
+
+    async def test_network_policy_without_generation_returns_after_acceptance_and_flushes_dns(self) -> None:
+        for include_null in (False, True):
+            with self.subTest(include_null=include_null), tempfile.TemporaryDirectory() as directory:
+                sandbox, client = self.sandbox(directory)
+                policy = {"internet_access": "closed"}
+                accepted = {"network_policy": policy}
+                if include_null:
+                    accepted["generation"] = None
+
+                async def request(method: str, *args: object) -> dict[str, object]:
+                    self.assertEqual(method, "PATCH")
+                    return accepted
+
+                client._request = mock.AsyncMock(side_effect=request)  # type: ignore[method-assign]
+                sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+                try:
+                    await sandbox.update_network_policy(block_network=True, timeout=None)
+                    client._request.assert_awaited_once()
+                    self.assertEqual(sandbox.info.network_policy.internet_access, "closed")
+                    sandbox._run_idempotent_command.assert_awaited_once()
+                finally:
+                    await client.close()
+
+    async def test_network_policy_retries_pending_admission_before_waiting_for_its_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            policy = {"internet_access": "closed"}
+            client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                ConflictError("pending", code="sandbox_update_conflict", status=409),
+                {"generation": 2, "network_policy": policy},
+                {**SANDBOX_RESPONSE, "network_policy": policy,
+                 "desired_network_policy_generation": 2, "network_policy_generation": 2},
+            ])
+            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            try:
+                with mock.patch("thunder_sandbox.asynchronous.sandbox._sleep_until_next_poll", new_callable=mock.AsyncMock) as sleep:
+                    await sandbox.update_network_policy(block_network=True)
+                sleep.assert_awaited_once_with(None, 5.0, None)
+                self.assertEqual([call.args[0] for call in client._request.await_args_list], ["PATCH", "PATCH", "GET"])
+            finally:
+                await client.close()
+
+    async def test_network_policy_does_not_report_superseded_or_terminal_updates_as_enforced(self) -> None:
+        for status, desired, error in [("ready", 3, ConflictError), ("failed", 2, SandboxFailedError), ("finished", 2, SandboxFailedError)]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                sandbox, client = self.sandbox(directory)
+                policy = {"internet_access": "closed"}
+                client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                    {"generation": 2, "network_policy": policy},
+                    {**SANDBOX_RESPONSE, "status": status, "network_policy": policy,
+                     "desired_network_policy_generation": desired, "network_policy_generation": 2},
+                ])
+                sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+                try:
+                    with self.assertRaises(error):
+                        await sandbox.update_network_policy(block_network=True)
+                    sandbox._run_idempotent_command.assert_not_awaited()
+                finally:
+                    await client.close()
+
+    async def test_network_policy_times_out_when_api_cannot_confirm_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            policy = {"internet_access": "closed"}
+            client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                {"generation": 2, "network_policy": policy},
+                {**SANDBOX_RESPONSE, "network_policy": policy,
+                 "desired_network_policy_generation": 2, "network_policy_generation": 1},
+            ])
+            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(SandboxTimeoutError):
+                    await sandbox.update_network_policy(block_network=True, timeout=0.01)
+                sandbox._run_idempotent_command.assert_not_awaited()
+            finally:
+                await client.close()
+
+    async def test_network_policy_wait_yields_and_propagates_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            entered = asyncio.Event()
+
+            async def request(method: str, *args: object) -> dict[str, object]:
+                if method == "PATCH":
+                    return {"generation": 2, "network_policy": {"internet_access": "closed"}}
+                entered.set()
+                await asyncio.Event().wait()
+                return {}
+
+            client._request = mock.AsyncMock(side_effect=request)  # type: ignore[method-assign]
+            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            task = asyncio.create_task(sandbox.update_network_policy(block_network=True))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                sandbox._run_idempotent_command.assert_not_awaited()
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                await client.close()
 
     async def test_update_network_policy_rejects_closed_with_allowlists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3089,6 +3229,7 @@ class SynchronousSandboxTest(unittest.TestCase):
                 block_network=True,
                 outbound_cidr_allowlist=None,
                 outbound_domain_allowlist=None,
+                timeout=300,
             )
             asynchronous.terminate.assert_awaited_once_with(timeout=5)  # type: ignore[attr-defined]
 
@@ -3273,6 +3414,7 @@ class SynchronousSandboxTest(unittest.TestCase):
                     block_network=False,
                     outbound_cidr_allowlist=None,
                     outbound_domain_allowlist=["example.com"],
+                    timeout=300,
                 )
 
         asyncio.run(exercise())

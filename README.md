@@ -64,9 +64,7 @@ poll. Its `timeout` is enforced on the client: each held request is bounded
 here and retried until the sandbox is ready, fails, or the timeout passes. An
 API without this endpoint is polled instead.
 
-Sandboxes are addressed by `id`. `Sandbox.create()` generates an Ed25519 key
-pair and stores it under `~/.thunder/sandbox_keys/<sandbox-id>`. The public key
-is immutable for the lifetime of the sandbox.
+Sandboxes are addressed by `id`. SSH connections use an Ed25519 key and a renewable organization certificate shared across the organization's sandboxes. The SDK creates credentials and renews certificates as needed, caching them under `~/.thunder/sandbox_keys/` when writable.
 
 A `name` is an optional label. It must be free of any other *live* sandbox in
 the organization, and it is released once a sandbox finishes, so the same label
@@ -230,6 +228,7 @@ Replace the complete outbound policy of a running sandbox with the same options 
 ```python
 # Permit package downloads while blocking other destinations.
 restricted.update_network_policy(
+    outbound_cidr_allowlist=[],
     outbound_domain_allowlist=["pypi.org", "files.pythonhosted.org"],
 )
 
@@ -240,9 +239,11 @@ restricted.update_network_policy(block_network=True)
 restricted.update_network_policy()
 ```
 
-`update_network_policy()` returns after Thunder accepts the desired policy; enforcement on the sandbox's node converges asynchronously. Tightening a policy blocks new connections but does not currently guarantee that already-established connections are terminated.
+`update_network_policy()` waits until Thunder confirms that the accepted policy generation is enforced. Both the blocking and asynchronous SDK paths wait for completion; asynchronous HTTP requests and polling yield to the event loop. The default timeout is 300 seconds; pass `timeout=...` to change it or `timeout=None` to wait indefinitely. Timeout or cancellation stops waiting but does not undo an accepted update. A superseded policy raises `ConflictError`, and a failed or stopped sandbox raises `SandboxFailedError`. Existing user connections are revoked during policy changes; SSH and permitted platform infrastructure remain available.
 
-After the policy is accepted, the SDK attempts to flush DNS caches using `resolvectl flush-caches`: inside image-backed containers first (retrying with non-interactive `sudo` if needed), then on the VM with non-interactive `sudo` for all sandbox types. Nonzero flush exit codes are ignored; SSH transport errors still follow the normal retry and error behavior.
+After enforcement is confirmed, the SDK attempts to flush DNS caches using `resolvectl flush-caches`: inside image-backed containers first (retrying with non-interactive `sudo` if needed), then on the VM with non-interactive `sudo` for all sandbox types. Nonzero flush exit codes are ignored; SSH transport errors still follow the normal retry and error behavior.
+
+Refreshed `sandbox.info` exposes `desired_network_policy_generation` and the last confirmed `network_policy_generation`.
 
 ## Environment and lifetime
 
@@ -268,8 +269,7 @@ with thunder.Client.from_cli() as client:
     print(" ".join(sandbox.ssh_command))
 ```
 
-The private SSH key must still exist locally to execute commands or transfer
-files against an existing sandbox.
+You can reconnect to existing sandboxes from another machine using API credentials authorized for that organization; the SDK obtains SSH credentials as needed. Running the printed `ssh_command` outside the SDK requires its cached private key and certificate.
 
 ## Async API
 

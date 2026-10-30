@@ -134,3 +134,5 @@ class SandboxInfo:
     failure_code: str | None = None
     failure: str | None = None
     image_id: str | None = None
+    network_policy_generation: int | None = None
+    desired_network_policy_generation: int | None = None
