@@ -457,6 +457,55 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
                 if process.returncode is None:
                     await process.wait()
 
+    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    async def test_launcher_handles_term_during_startup(self) -> None:
+        for state in ("starting", "running"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = RemoteJobPaths("9" * 32, root=PurePosixPath(directory))
+                Path(paths.directory).mkdir(mode=0o700)
+                spec = JobSpec(paths.job_id, ("sleep", "30"))
+                script = launcher_script("sleep 30", paths, spec)
+                # Hold the supervisor at the exact signal window. A busy loop
+                # adds no child which could itself receive the group signal.
+                script = script.replace(
+                    f"write_status {state} null\n",
+                    f"write_status {state} null\n"
+                    ': >"$job/paused"\n'
+                    'while [ ! -f "$job/release" ]; do :; done\n',
+                )
+                Path(paths.launcher).write_text(script, encoding="utf-8")
+                Path(paths.status).write_text(
+                    JobStatus(JobState.PREPARED).to_json(), encoding="utf-8"
+                )
+                process = await asyncio.create_subprocess_exec(
+                    "sh",
+                    str(paths.launcher),
+                    start_new_session=True,
+                    env=self.launcher_environment(root),
+                )
+                try:
+                    for _ in range(500):
+                        if Path(paths.directory, "paused").exists():
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("launcher did not reach the startup barrier")
+
+                    Path(paths.termination_request).touch()
+                    os.killpg(process.pid, 15)
+                    Path(paths.directory, "release").touch()
+                    self.assertEqual(
+                        await asyncio.wait_for(process.wait(), timeout=5), 0
+                    )
+                    status = JobStatus.from_json(Path(paths.status).read_bytes())
+                    self.assertEqual(status.state, JobState.TERMINATED)
+                    self.assertEqual(status.returncode, 143)
+                finally:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, 9)
+                    await process.wait()
+
     def test_launcher_can_discard_either_output_stream(self) -> None:
         job_id = "3" * 32
         paths = RemoteJobPaths(job_id)
