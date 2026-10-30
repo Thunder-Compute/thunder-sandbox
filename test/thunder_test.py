@@ -3072,6 +3072,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         for include_null in (False, True):
             with self.subTest(include_null=include_null), tempfile.TemporaryDirectory() as directory:
                 sandbox, client = self.sandbox(directory)
+                sandbox = AsyncSandbox._from_response(client, {
+                    **SANDBOX_RESPONSE,
+                    "desired_network_policy_generation": 4,
+                    "network_policy_generation": 4,
+                })
                 policy = {"internet_access": "closed"}
                 accepted = {"network_policy": policy}
                 if include_null:
@@ -3087,6 +3092,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     await sandbox.update_network_policy(block_network=True, timeout=None)
                     client._request.assert_awaited_once()
                     self.assertEqual(sandbox.info.network_policy.internet_access, "closed")
+                    self.assertIsNone(sandbox.info.desired_network_policy_generation)
+                    self.assertIsNone(sandbox.info.network_policy_generation)
                     sandbox._run_idempotent_command.assert_awaited_once()
                 finally:
                     await client.close()

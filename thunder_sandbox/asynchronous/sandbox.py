@@ -1176,6 +1176,7 @@ fi
             self._info = replace(
                 self._info,
                 network_policy=accepted_policy,
+                network_policy_generation=None,
                 desired_network_policy_generation=None,
             )
         else:
