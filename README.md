@@ -71,7 +71,9 @@ the organization, and it is released once a sandbox finishes, so the same label
 can be reused later. A name never addresses a sandbox:
 
 ```python
-sandbox = thunder.Sandbox.create(name="training-run", gpu_type=thunder.GPUType.H100)
+sandbox = thunder.Sandbox.create(
+    name="training-run", gpu_type=thunder.GPUType.H100, gpu_count=1
+)
 print(sandbox.id, sandbox.name)
 
 # Claiming a name a live sandbox already holds raises ConflictError.
@@ -108,8 +110,10 @@ message text. Each carries the API's `code`, the HTTP `status`, and the
 server's `retry_after` hint when one was sent:
 
 ```python
+import time
+
 try:
-    sandbox = thunder.Sandbox.create(gpu_type=thunder.GPUType.H100)
+    sandbox = thunder.Sandbox.create(gpu_type=thunder.GPUType.H100, gpu_count=1)
 except thunder.CapacityError as exc:
     # No free GPU of that type right now; the request was fine.
     time.sleep(exc.retry_after or 30)
@@ -150,13 +154,9 @@ state cannot be reconstructed safely after their SSH channel disappears. A PTY
 disconnect raises `ConnectionError` and leaves the remote command's final state
 unknown. Use the default `pty=False` mode for unattended or long-running work.
 
-Durable stdout and stderr are reconnectable streams. The SDK reads short SFTP
-chunks by byte offset and advances its cursor only after a complete chunk is in
-client memory, so a lost SSH connection resumes without gaps or duplicates.
-Text mode also preserves UTF-8 characters split across chunks.
+Durable stdout and stderr are reconnectable streams. After a lost connection, reading resumes without gaps or duplicate output. Text mode preserves UTF-8 characters across reads.
 
-Output is captured by default. Long-running commands which do not need one or
-both streams can redirect them directly to `/dev/null` in the durable launcher:
+Output is captured by default. Use `"discard"` for streams you do not need:
 
 ```python
 process = sandbox.exec(
@@ -164,10 +164,7 @@ process = sandbox.exec(
 )
 ```
 
-Once a job is terminal and both captured streams have reached EOF, its remote
-job directory is removed automatically. Pass `retain=True` to keep it available
-for later `get_process()` recovery, and call `process.cleanup()` when finished.
-Explicit cleanup is idempotent and waits for a running job to finish.
+Once a command has finished and both captured streams have reached EOF, its saved state is removed automatically. Pass `retain=True` to keep it available for later `get_process()` recovery, and call `process.cleanup()` when finished. Explicit cleanup is idempotent and waits for a running command to finish.
 
 `process.terminate()` is also durable. It records termination intent, signals
 the entire remote process group, and reconnects safely if the SSH
@@ -197,12 +194,7 @@ sandbox.download("/home/ubuntu/results.json", "results.json")
 sandbox.download("/home/ubuntu/checkpoints", "checkpoints", recursive=True)
 ```
 
-Transfers intentionally restart from the beginning rather than maintaining a
-resumable byte manifest. Uploads first write to an isolated remote staging path;
-downloads first write beside the local destination. If SSH disconnects, the SDK
-reconnects and repeats the complete staged transfer. Completed files are
-published with an atomic rename, so partial data is never presented as the
-destination. Directory merges begin only after the network transfer completes.
+Transfers retry from the beginning after a lost connection. Files appear at their destination only after their contents have transferred successfully, so an interrupted transfer does not expose partially transferred files. Directory transfers merge with the destination after the network transfer completes.
 
 ## Network policies
 
@@ -241,7 +233,7 @@ restricted.update_network_policy()
 
 `update_network_policy()` waits until Thunder confirms that the accepted policy generation is enforced. Both the blocking and asynchronous SDK paths wait for completion; asynchronous HTTP requests and polling yield to the event loop. The default timeout is 300 seconds; pass `timeout=...` to change it or `timeout=None` to wait indefinitely. Timeout or cancellation stops waiting but does not undo an accepted update. A superseded policy raises `ConflictError`, and a failed or stopped sandbox raises `SandboxFailedError`. Existing user connections are revoked during policy changes; SSH and permitted platform infrastructure remain available.
 
-After enforcement is confirmed, the SDK attempts to flush DNS caches using `resolvectl flush-caches`: inside image-backed containers first (retrying with non-interactive `sudo` if needed), then on the VM with non-interactive `sudo` for all sandbox types. Nonzero flush exit codes are ignored; SSH transport errors still follow the normal retry and error behavior.
+After a policy update is enforced, the SDK attempts to refresh DNS caches where supported.
 
 Refreshed `sandbox.info` exposes `desired_network_policy_generation` and the last confirmed `network_policy_generation`.
 
@@ -303,7 +295,7 @@ asyncio.run(main())
 
 ## Container images
 
-An image-backed sandbox runs the image's `ENTRYPOINT` followed by its `CMD` arguments. If only one is set, it runs that command. The workload runs once: a successful exit, an error, or signal termination leaves the container stopped. Service restarts do not relaunch it.
+An image-backed sandbox runs the image's `ENTRYPOINT` followed by its `CMD` arguments. If only one is set, it runs that command. The initial command is attempted once. After it exits or fails, the sandbox stays alive and available for `exec` and file transfers until you terminate it or its lifetime expires. If the container needs to restart, Thunder restores that availability without relaunching the initial command.
 
 For example, put this `Dockerfile` in `./server-image` to start a Python HTTP server automatically:
 
@@ -330,7 +322,7 @@ finally:
 
 `Image.from_registry(...)` uses the same image-command behavior. Inherited defaults count too: a base image's shell or interpreter command can exit immediately when started without interactive input.
 
-If both `ENTRYPOINT` and `CMD` are absent or empty, Thunder keeps the container alive for `sandbox.exec(...)` and automatically restarts the keepalive after an unexpected exit. To build an exec-only image, clear both defaults, including inherited ones:
+If both `ENTRYPOINT` and `CMD` are absent or empty, the sandbox stays available for `sandbox.exec(...)` without running an initial command. To prevent an inherited command from running, clear both defaults:
 
 ```dockerfile
 FROM ubuntu:24.04
@@ -338,11 +330,11 @@ ENTRYPOINT []
 CMD []
 ```
 
-Positional arguments to `Sandbox.create("python", "script.py", image=image)` run as a separate `exec` command after sandbox readiness. They do not replace the image's `ENTRYPOINT` or `CMD`. The image workload may already be running or may have exited before this additional command starts. Without an image, `exec` runs directly in the guest VM.
+Positional arguments to `Sandbox.create("python", "script.py", image=image)` run as a separate `exec` command after sandbox readiness. They do not replace the image's `ENTRYPOINT` or `CMD`. The image workload may already be running or may have exited before this additional command starts. Without an image, commands run directly in the sandbox.
 
-`wait_until_ready()` waits for guest initialization, not application health. It can succeed even if a short image command has already finished. After the image command exits, the container stays stopped and further `exec` calls fail, while the VM remains running and the sandbox can still report `READY`. Call `terminate()` when finished, or use a finite sandbox lifetime to release its resources. Container file transfers should be completed while the container is running; the runc backend does not support transfers after it stops.
+`wait_until_ready()` waits for sandbox initialization, not application health. It can succeed even if a short image command has already finished. Commands and file transfers remain available after that command exits. Call `terminate()` when finished, or use a finite sandbox lifetime to release its resources.
 
-`sandbox.wait()` and `sandbox.poll()` track a positional command passed to `create`, or otherwise the sandbox VM's lifecycle. They do not track the image command's exit or return its exit code. The SDK does not expose a `Process` handle, captured output, or exit status for the image's initial command. Commands launched with `sandbox.exec(...)` retain their normal `Process` output and wait behavior. These semantics also apply to the async APIs.
+`sandbox.wait()` and `sandbox.poll()` track a positional command passed to `create`, or otherwise the sandbox's lifecycle. They do not track the image command's exit or return its exit code. The SDK does not expose a `Process` handle, captured output, or exit status for the image's initial command. Commands launched with `sandbox.exec(...)` retain their normal `Process` output and wait behavior. These semantics also apply to the async APIs.
 
 Use `user` to choose the account for an individual command, without requiring `su`, `sudo`, or a password inside the image:
 
@@ -352,7 +344,7 @@ setup.wait()
 agent = sandbox.exec("id", user="1000:1000")
 ```
 
-`user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`), and is passed to `docker exec --user`. Commands default to root in the current container runtime, regardless of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK. Specifying `user` without an image raises `InvalidRequestError`.
+`user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`). Commands default to root unless `user` is specified, independently of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK. Specifying `user` without an image raises `InvalidRequestError`.
 
 ## Configuration
 

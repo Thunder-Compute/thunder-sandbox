@@ -118,11 +118,12 @@ class Sandbox:
     ) -> "Sandbox":
         """Create a sandbox, resolving an optional image before allocation.
 
-        Image ENTRYPOINT and CMD run once, without automatic restarts. Images
-        with neither use a restarting keepalive. Positional arguments launch a
+        The image's initial command is attempted once. The sandbox remains
+        available for commands and file transfers after it exits, including
+        after container restarts. Images without ENTRYPOINT or CMD stay alive
+        without running an initial command. Positional arguments launch a
         separate ``exec`` command after readiness; they do not override image
-        defaults and require the container to still be running. Image-command
-        exit leaves the sandbox VM running until termination or TTL expiry.
+        defaults.
         """
         _validate_create_options(
             timeout=timeout,
@@ -136,8 +137,20 @@ class Sandbox:
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
+            resource_spec: dict[str, object] = {
+                "cpu_count": cpu if cpu is not None else 4,
+                "memory_gib": memory if memory is not None else 32,
+                "storage_gib": storage if storage is not None else 50,
+                **(
+                    {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
+                    if gpu_type is not None
+                    else {}
+                ),
+            }
             resolved_image = (
-                await resolved_client.resolve_image(image, gated_features=gated_features)
+                await resolved_client.resolve_image(
+                    image, gated_features=gated_features, spec=resource_spec
+                )
                 if image is not None
                 else None
             )
@@ -147,16 +160,7 @@ class Sandbox:
                 outbound_domain_allowlist,
             )
             request = {
-                "spec": {
-                    "cpu_count": cpu if cpu is not None else 4,
-                    "memory_gib": memory if memory is not None else 32,
-                    "storage_gib": storage if storage is not None else 50,
-                    **(
-                        {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
-                        if gpu_type is not None
-                        else {}
-                    ),
-                },
+                "spec": resource_spec,
                 "env": {
                     key: value
                     for key, value in (env or {}).items()
