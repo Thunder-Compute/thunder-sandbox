@@ -1327,7 +1327,7 @@ class SynchronousClientTest(unittest.TestCase):
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features
+                    image, timeout=42, gated_features=features, spec=None
                 )
                 client._client.resolve_image.reset_mock()
                 self.assertEqual(
@@ -1339,7 +1339,7 @@ class SynchronousClientTest(unittest.TestCase):
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features
+                    image, timeout=42, gated_features=features, spec=None
                 )
             finally:
                 client.close()
@@ -1642,10 +1642,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 *,
                 timeout: float | None = 7200,
                 gated_features=None,
+                spec=None,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
                 self.assertEqual(timeout, 7200)
                 self.assertEqual(gated_features, {"image_feature": True})
+                self.assertEqual(
+                    spec, {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50}
+                )
                 events.append("image-ready")
                 return resolved
 
