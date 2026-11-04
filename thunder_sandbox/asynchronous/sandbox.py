@@ -834,8 +834,13 @@ class Sandbox:
         try:
             async def transfer(connection: asyncssh.SSHClientConnection) -> None:
                 await asyncio.to_thread(_remove_local_transfer_path, stage)
+                # Request the directory itself: asyncssh refuses the "." name a
+                # remote scp sends for "dir/.". The stage is removed above, so
+                # the directory's contents land directly in it.
                 await asyncssh.scp(
-                    (connection, remote_path), os.fspath(stage), recurse=recursive
+                    (connection, parsed_source.path),
+                    os.fspath(stage),
+                    recurse=recursive,
                 )
 
             await self._retry_scp(

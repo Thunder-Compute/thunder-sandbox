@@ -2148,6 +2148,26 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(transfer.await_count, 2)
             await client.close()
 
+    async def test_contents_download_requests_the_directory_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            sandbox._ssh_manager._connection = FakeSSHConnection()  # type: ignore[assignment]
+            target = Path(directory) / "target"
+            target.mkdir()
+            requested: list[str] = []
+
+            async def scp(source: tuple[object, str], stage: str, **_kwargs: object) -> None:
+                requested.append(source[1])
+                Path(stage).mkdir()
+                (Path(stage) / "result.txt").write_text("done", encoding="utf-8")
+
+            with mock.patch("thunder_sandbox.asynchronous.sandbox.asyncssh.scp", scp):
+                await sandbox._download_from_guest("/logs/.", target, recursive=True)
+
+            self.assertEqual(requested, ["/logs"])
+            self.assertEqual((target / "result.txt").read_text(encoding="utf-8"), "done")
+            await client.close()
+
     async def test_upload_timeout_raises_sandbox_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
