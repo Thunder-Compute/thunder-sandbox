@@ -7,14 +7,16 @@ from typing import TYPE_CHECKING, Any
 
 from .._common.config import ClientConfig
 from .._common.exceptions import ConnectionError
-from .._common.types import GPUType, Pricing, SandboxStatus
+from .._common.types import GPUType, Pricing, SandboxStatus, SnapshotStatus
 from ..asynchronous.client import Client as NativeClient
 from ._bridge import AsyncBridge
 
 if TYPE_CHECKING:
     from ..asynchronous.sandbox import Sandbox as NativeSandbox
+    from ..asynchronous.snapshot import Snapshot as NativeSnapshot
     from ..image import Image, ResolvedImage
     from .sandbox import Sandbox
+    from .snapshot import Snapshot
 
 
 class Client:
@@ -66,6 +68,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        snapshot: "Snapshot | str | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -84,6 +87,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            snapshot=snapshot,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -143,6 +147,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        snapshot: "Snapshot | str | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -161,6 +166,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            snapshot=snapshot,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -225,6 +231,71 @@ class Client:
                 yield self._wrap_sandbox(sandbox)
         finally:
             await self._bridge.run_async(iterator.aclose())
+
+    def _wrap_snapshot(self, snapshot: "NativeSnapshot") -> "Snapshot":
+        from .snapshot import Snapshot
+
+        return Snapshot(self, snapshot)
+
+    def create_snapshot(
+        self, sandbox_id: str, *, name: str | None = None
+    ) -> "Snapshot":
+        """Start capturing a ready sandbox's disk and return the new snapshot."""
+        snapshot = self._bridge.run(
+            self._client.create_snapshot(sandbox_id, name=name)
+        )
+        return self._wrap_snapshot(snapshot)
+
+    async def create_snapshot_async(
+        self, sandbox_id: str, *, name: str | None = None
+    ) -> "Snapshot":
+        snapshot = await self._bridge.run_async(
+            self._client.create_snapshot(sandbox_id, name=name)
+        )
+        return self._wrap_snapshot(snapshot)
+
+    def get_snapshot(self, snapshot_id: str) -> "Snapshot":
+        snapshot = self._bridge.run(self._client.get_snapshot(snapshot_id))
+        return self._wrap_snapshot(snapshot)
+
+    async def get_snapshot_async(self, snapshot_id: str) -> "Snapshot":
+        snapshot = await self._bridge.run_async(self._client.get_snapshot(snapshot_id))
+        return self._wrap_snapshot(snapshot)
+
+    def list_snapshots(
+        self, *, status: str | SnapshotStatus | None = None
+    ) -> Iterator["Snapshot"]:
+        iterator = self._client.list_snapshots(status=status)
+        try:
+            while True:
+                try:
+                    snapshot = self._bridge.run(anext(iterator))
+                except StopAsyncIteration:
+                    return
+                yield self._wrap_snapshot(snapshot)
+        finally:
+            self._bridge.run(iterator.aclose())
+
+    async def list_snapshots_async(
+        self, *, status: str | SnapshotStatus | None = None
+    ) -> AsyncGenerator["Snapshot", None]:
+        iterator = self._client.list_snapshots(status=status)
+        try:
+            while True:
+                try:
+                    snapshot = await self._bridge.run_async(anext(iterator))
+                except StopAsyncIteration:
+                    return
+                yield self._wrap_snapshot(snapshot)
+        finally:
+            await self._bridge.run_async(iterator.aclose())
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot in any state, cancelling a capture in progress."""
+        self._bridge.run(self._client.delete_snapshot(snapshot_id))
+
+    async def delete_snapshot_async(self, snapshot_id: str) -> None:
+        await self._bridge.run_async(self._client.delete_snapshot(snapshot_id))
 
     def close(self) -> None:
         if self._closed:

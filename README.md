@@ -267,7 +267,8 @@ You can reconnect to existing sandboxes from another machine using API credentia
 
 Every blocking operation has an awaitable `_async` twin on the same public
 class. This makes it possible to use one import and pass `Client`, `Sandbox`,
-and `Process` objects between synchronous and asynchronous application code:
+`Snapshot`, and `Process` objects between synchronous and asynchronous
+application code:
 
 ```python
 import asyncio
@@ -345,6 +346,51 @@ agent = sandbox.exec("id", user="1000:1000")
 ```
 
 `user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`). Commands default to root unless `user` is specified, independently of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK. Specifying `user` without an image raises `InvalidRequestError`.
+
+## Snapshots
+
+A snapshot is a durable copy of a ready sandbox's disk. Restoring it creates a new sandbox whose files match the source at capture time. It outlives the source sandbox, so you can terminate the source once the snapshot is ready:
+
+```python
+with thunder.Client.from_cli() as client:
+    source = client.create_sandbox(image=thunder.Image.from_registry("python:3.12"))
+    source.wait_until_ready()
+    source.exec("sh", "-c", "pip install numpy > /root/setup.log").wait()
+
+    snapshot = source.snapshot(name="numpy-ready")
+    snapshot.wait_until_ready(timeout=1800)
+    source.terminate()
+
+    restored = client.create_sandbox(
+        snapshot=snapshot, gpu_type=thunder.GPUType.H100, gpu_count=1
+    )
+    try:
+        restored.wait_until_ready()
+        process = restored.exec("cat", "/root/setup.log")
+        process.wait()
+        print(restored.snapshot_id, process.stdout.read())
+    finally:
+        restored.terminate()
+```
+
+Snapshots capture disk state only. They do not capture memory, running processes, open connections, or GPU state. A restored sandbox starts fresh from that disk: its image command runs again, and `wait_until_ready()` behaves as it does for any new sandbox.
+
+`create_sandbox(snapshot=...)` accepts a `Snapshot` or its ID and cannot be combined with `image`, which raises `InvalidRequestError` before any request. The restored sandbox uses the source's image. Every other option applies as usual, including a different GPU type or count. A `storage` value smaller than the snapshot is grown to fit it. Restoring a snapshot that is not yet ready raises `ConflictError`.
+
+`wait_until_ready()` waits until capture finishes, holding the request open on the API where it offers a snapshot wait and polling otherwise. A failed capture raises `SnapshotFailedError`, whose `failure_code` and `failure` give the recorded reason. When `timeout` passes first, it raises `SandboxTimeoutError`. A timeout or cancellation does not delete the snapshot: capture continues server-side, and a later wait picks it up. A snapshot deleted while waiting raises `NotFoundError`.
+
+A snapshot uses the client of the sandbox that created it. A sandbox created without an explicit client closes its own client on `terminate()`. In that case, wait on the snapshot before terminating the source, or use a shared `Client` as shown above.
+
+```python
+with thunder.Client.from_cli() as client:
+    for snapshot in client.list_snapshots(status=thunder.SnapshotStatus.READY):
+        print(snapshot.id, snapshot.name, snapshot.info.storage_gib)
+
+    snapshot = client.get_snapshot("snap-your-id")
+    snapshot.delete()
+```
+
+`delete()` works in any state and cancels a capture in progress. Creating a snapshot of a sandbox that is not ready raises `ConflictError`. Exceeding the organization's snapshot limit raises `ConflictError`; delete a snapshot before creating another. Every method has an `_async` twin, and the native asynchronous API offers the same operations on `thunder_sandbox.asynchronous.Snapshot`.
 
 ## Configuration
 

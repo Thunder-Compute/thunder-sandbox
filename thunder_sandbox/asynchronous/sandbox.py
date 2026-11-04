@@ -6,7 +6,6 @@ import asyncio
 import math
 import os
 import posixpath
-import random
 import shlex
 import shutil
 import tempfile
@@ -18,7 +17,6 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast, overload
-from urllib.parse import quote
 
 import asyncssh
 
@@ -47,7 +45,6 @@ from ..image import Image
 from . import credentials
 from ._jobs import (
     JobSpec,
-    JobState,
     JobStatus,
     RemoteJobPaths,
     cleanup_command,
@@ -56,6 +53,16 @@ from ._jobs import (
     signal_command,
     submission_command,
     validate_job_id,
+)
+from ._polling import (
+    OUTAGE_GRACE_SECONDS,
+    WAIT_REPLY_GRACE_SECONDS,
+    WAIT_WINDOW_MAX_SECONDS,  # noqa: F401  (kept importable from this module)
+    _datetime,
+    _earliest_deadline,
+    _path_segment,
+    _sleep_until_next_poll,
+    _wait_window,
 )
 from ._ssh import (
     RetryableSSHOperationError,
@@ -70,13 +77,8 @@ from ._transfer import (
 )
 from .client import Client
 from .process import Process
+from .snapshot import Snapshot
 
-OUTAGE_GRACE_SECONDS = 30.0
-# The API refuses a readiness wait held open longer than this per request.
-WAIT_WINDOW_MAX_SECONDS = 30.0
-# How much longer than its window one wait request may take to answer before
-# the client gives up on it, covering transit and a server that has stalled.
-WAIT_REPLY_GRACE_SECONDS = 15.0
 _CONTAINER_NAME = "thunder-sandbox"
 _CONTAINER_BUSYBOX = "/busybox"
 
@@ -111,6 +113,7 @@ class Sandbox:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: Image | None = None,
+        snapshot: Snapshot | str | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -124,12 +127,19 @@ class Sandbox:
         without running an initial command. Positional arguments launch a
         separate ``exec`` command after readiness; they do not override image
         defaults.
+
+        ``snapshot`` (a :class:`Snapshot` or its ID) restores a ready
+        snapshot's disk into the new sandbox, which runs the source's image;
+        it cannot be combined with ``image``. Every other option applies as
+        for a fresh sandbox, and a ``storage`` below the snapshot's size is
+        grown to fit it.
         """
         _validate_create_options(
             timeout=timeout,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            snapshot=snapshot,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -184,6 +194,15 @@ class Sandbox:
                 **(
                     {"image_id": resolved_image.id}
                     if resolved_image is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "snapshot_id": snapshot.id
+                        if isinstance(snapshot, Snapshot)
+                        else snapshot
+                    }
+                    if snapshot is not None
                     else {}
                 ),
             }
@@ -279,6 +298,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._info.image_id
+
+    @property
+    def snapshot_id(self) -> str | None:
+        """The snapshot this sandbox was restored from, if any."""
+        return self._info.snapshot_id
 
     @property
     def info(self) -> SandboxInfo:
@@ -1344,6 +1368,17 @@ fi
     async def _close_connection(self) -> None:
         await self._ssh_manager.close()
 
+    async def snapshot(self, *, name: str | None = None) -> Snapshot:
+        """Start a durable snapshot of this ready sandbox's disk.
+
+        Returns as soon as capture starts; wait for it with
+        :meth:`Snapshot.wait_until_ready`. Only the disk is captured, not
+        memory or running processes. The snapshot uses this sandbox's client,
+        so a sandbox that owns its client closes it on :meth:`terminate`:
+        finish with the snapshot handle first, or pass a client explicitly.
+        """
+        return await self._client.create_snapshot(self.id, name=name)
+
     async def get_hourly_price(self) -> float:
         """Return the configured resources' aggregate USD/hour at current rates.
 
@@ -1543,39 +1578,11 @@ fi
                 await self._client.close()
 
 
-def _path_segment(value: str) -> str:
-    if not value:
-        raise InvalidRequestError("sandbox ID cannot be empty")
-    return quote(value, safe="")
-
-
-def _earliest_deadline(first: float | None, second: float | None) -> float | None:
-    if first is None:
-        return second
-    if second is None:
-        return first
-    return min(first, second)
-
-
 def _decode_status(value: str, *, context: str) -> JobStatus:
     try:
         return JobStatus.from_json(value.strip())
     except ValueError as exc:
         raise SandboxFailedError(context) from exc
-
-
-@overload
-def _datetime(value: object, optional: Literal[False] = False) -> datetime: ...
-
-
-@overload
-def _datetime(value: object, optional: Literal[True]) -> datetime | None: ...
-
-
-def _datetime(value: object, optional: bool = False) -> datetime | None:
-    if value in (None, ""):
-        return None if optional else datetime.fromtimestamp(0).astimezone()
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
 def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> SandboxInfo:
@@ -1626,6 +1633,9 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         ),
         failure=str(response["failure"]) if response.get("failure") else None,
         image_id=str(response["image_id"]) if response.get("image_id") else None,
+        snapshot_id=(
+            str(response["snapshot_id"]) if response.get("snapshot_id") else None
+        ),
     )
 
 
@@ -1652,8 +1662,6 @@ def _network_policy_from_response(value: object) -> NetworkPolicy:
     )
 
 
-def _known_host_name(ssh: SSHConnection) -> str:
-    return ssh.host if ssh.port == 22 else f"[{ssh.host}]:{ssh.port}"
 # Host keys are remembered only for the life of this process. A sandbox is
 # short-lived and nothing verifies the key on the first connection, so a file
 # would add staleness and an unwritable-home failure mode without buying any
@@ -1696,6 +1704,7 @@ def _validate_create_options(
     gpu_type: GPUType | None,
     gpu_count: int | None,
     image: Image | None,
+    snapshot: Snapshot | str | None,
     block_network: bool,
     outbound_cidr_allowlist: Sequence[str] | None,
     outbound_domain_allowlist: Sequence[str] | None,
@@ -1711,6 +1720,16 @@ def _validate_create_options(
         raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
     if image is not None and not isinstance(image, Image):
         raise InvalidRequestError("image must be an Image")
+    if snapshot is not None:
+        if image is not None:
+            raise InvalidRequestError(
+                "image and snapshot cannot be combined: a restored sandbox "
+                "uses its snapshot's image"
+            )
+        if not isinstance(snapshot, Snapshot) and (
+            not isinstance(snapshot, str) or not snapshot
+        ):
+            raise InvalidRequestError("snapshot must be a Snapshot or a snapshot ID")
     _validate_network_policy_options(
         block_network=block_network,
         outbound_cidr_allowlist=outbound_cidr_allowlist,
@@ -1752,32 +1771,6 @@ def _network_policy_request(
         else ["*"]
     )
     return "restricted", cidrs, domains
-
-
-def _wait_window(deadline: float | None) -> float:
-    """Seconds to ask the API to hold one readiness wait open.
-
-    The client deadline, not the server's maximum, is the binding bound once
-    it is nearer. Rounded to the millisecond so the query string stays plain,
-    and never below one: the API rejects a window of zero, and a deadline that
-    has just passed is reported by the caller, not by a 400.
-    """
-    window = WAIT_WINDOW_MAX_SECONDS
-    if deadline is not None:
-        window = min(window, deadline - time.monotonic())
-    window = max(0.001, round(window, 3))
-    assert 0.0 < window <= WAIT_WINDOW_MAX_SECONDS, window
-    return window
-
-
-async def _sleep_until_next_poll(
-    deadline: float | None, delay: float, retry_after: float | None = None
-) -> None:
-    delay = max(delay, retry_after or 0.0)
-    delay += random.uniform(0.0, min(delay * 0.2, 1.0))
-    if deadline is not None:
-        delay = max(0.0, min(delay, deadline - time.monotonic()))
-    await asyncio.sleep(delay)
 
 
 async def _stop_sandbox(

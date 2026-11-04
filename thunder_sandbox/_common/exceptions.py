@@ -81,6 +81,14 @@ class SandboxTimeoutError(SandboxError, TimeoutError):
     """A sandbox operation exceeded its timeout."""
 
 
+class SnapshotFailedError(ThunderError):
+    """A sandbox snapshot could not be captured, or a failed one was used.
+
+    ``code`` is the snapshot's recorded failure code when one was read in the
+    ``failed`` state, or the API's error code when it refused a request.
+    """
+
+
 class _WaitWindowElapsedError(ThunderError):
     """One bounded server-side readiness wait ended with the sandbox still starting.
 

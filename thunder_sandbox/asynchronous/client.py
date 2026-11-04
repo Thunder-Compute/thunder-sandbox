@@ -25,16 +25,19 @@ from .._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
+    SnapshotFailedError,
     ThunderError,
     _WaitWindowElapsedError,
 )
-from .._common.types import GPUType, Pricing, SandboxStatus
+from .._common.types import GPUType, Pricing, SandboxStatus, SnapshotStatus
 from .._version import __version__
+from ._polling import _path_segment
 from .credentials import CredentialStore
 
 if TYPE_CHECKING:
     from ..image import Image, ResolvedImage, _CanonicalBuildContext
     from .sandbox import Sandbox
+    from .snapshot import Snapshot
 
 USER_AGENT = f"thunder-python-sdk/{__version__}"
 
@@ -55,6 +58,14 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_image_stale_attempt": ConflictError,
     "sandbox_image_not_ready": ConflictError,
     "sandbox_image_failed": SandboxFailedError,
+    "sandbox_snapshot_source_not_ready": ConflictError,
+    "sandbox_snapshot_not_ready": ConflictError,
+    "sandbox_snapshot_image_conflict": InvalidRequestError,
+    "sandbox_snapshot_failed": SnapshotFailedError,
+    # A cap on stored snapshots, like the instance snapshot cap: retrying
+    # cannot succeed until one is deleted.
+    "sandbox_snapshot_limit_exceeded": ConflictError,
+    "sandbox_snapshot_wait_timeout": _WaitWindowElapsedError,
 }
 
 _ERROR_STATUSES: dict[int, type[ThunderError]] = {
@@ -99,6 +110,9 @@ class Client:
         # property of the API this client talks to: an older API then costs
         # one extra read per client rather than one per wait.
         self._wait_endpoint_available = True
+        # The same, separately, for the snapshot wait: an API can offer one
+        # wait route without the other.
+        self._snapshot_wait_endpoint_available = True
 
     @classmethod
     def from_cli(cls) -> "Client":
@@ -483,6 +497,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        snapshot: "Snapshot | str | None" = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -501,6 +516,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            snapshot=snapshot,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -530,12 +546,62 @@ class Client:
                 "/sandboxes",
                 query={"limit": 100, "status": wanted, "page_token": page_token},
             )
+            # A nil Go slice arrives as null; treat it, and a null token, as empty.
             for item in response.get("sandboxes", []):
                 if isinstance(item, dict):
                     yield Sandbox._from_response(self, item)
             page_token = str(response.get("next_page_token", ""))
             if not page_token:
                 return
+
+    async def create_snapshot(
+        self, sandbox_id: str, *, name: str | None = None
+    ) -> "Snapshot":
+        """Start capturing a ready sandbox's disk and return the new snapshot.
+
+        Capture continues server-side; wait for it with
+        :meth:`Snapshot.wait_until_ready`. The source sandbox keeps running.
+        """
+        from .snapshot import Snapshot
+
+        response = await self._request(
+            "POST",
+            f"/sandboxes/{_path_segment(sandbox_id)}/snapshots",
+            {"name": name} if name is not None else {},
+        )
+        return Snapshot._from_response(self, response)
+
+    async def get_snapshot(self, snapshot_id: str) -> "Snapshot":
+        from .snapshot import Snapshot
+
+        return await Snapshot.from_id(snapshot_id, client=self)
+
+    async def list_snapshots(
+        self, *, status: str | SnapshotStatus | None = None
+    ) -> AsyncGenerator["Snapshot", None]:
+        """Yield this organization's snapshots, optionally filtered by status."""
+        from .snapshot import Snapshot
+
+        wanted = status.value if isinstance(status, SnapshotStatus) else status
+        page_token = ""
+        while True:
+            response = await self._request(
+                "GET",
+                "/sandbox-snapshots",
+                query={"limit": 100, "status": wanted, "page_token": page_token},
+            )
+            for item in response.get("snapshots") or []:
+                if isinstance(item, dict):
+                    yield Snapshot._from_response(self, item)
+            page_token = str(response.get("next_page_token") or "")
+            if not page_token:
+                return
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot in any state, cancelling a capture in progress."""
+        from .snapshot import _snapshot_path
+
+        await self._request("DELETE", _snapshot_path(snapshot_id))
 
     async def close(self) -> None:
         if self._closed:
