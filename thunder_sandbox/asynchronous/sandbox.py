@@ -1558,8 +1558,9 @@ fi
                     raise SandboxTimeoutError(
                         f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
                     ) from exc
-                if not self.status.terminal:
-                    await _stop_sandbox(self._client, self.id, deadline=deadline)
+                if self.status.terminal:
+                    return
+                await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
         finally:
             await self._close_connection()
