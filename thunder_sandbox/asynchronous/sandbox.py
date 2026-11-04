@@ -79,6 +79,8 @@ WAIT_WINDOW_MAX_SECONDS = 30.0
 WAIT_REPLY_GRACE_SECONDS = 15.0
 _CONTAINER_NAME = "thunder-sandbox"
 _CONTAINER_BUSYBOX = "/busybox"
+# Linux's MAX_ARG_STRLEN, including the terminating NUL.
+MAX_ARGUMENT_BYTES = 128 * 1024
 
 
 SSH_KEEPALIVE_INTERVAL_SECONDS = 15
@@ -363,6 +365,13 @@ class Sandbox:
                 raise InvalidRequestError("user requires an image-backed sandbox")
         if not args:
             raise InvalidRequestError("exec requires a command")
+        for text_value in (*args, *(f"{k}={v}" for k, v in (env or {}).items())):
+            if len(text_value.encode("utf-8", "surrogateescape")) >= MAX_ARGUMENT_BYTES:
+                raise InvalidRequestError(
+                    f"one exec argument or environment value must be under "
+                    f"{MAX_ARGUMENT_BYTES} bytes, the Linux limit; upload larger "
+                    "input as a file"
+                )
         if stdout not in {"capture", "discard"}:
             raise InvalidRequestError("stdout must be 'capture' or 'discard'")
         if stderr not in {"capture", "discard"}:
@@ -491,8 +500,15 @@ class Sandbox:
             # A fresh staging directory avoids colliding with a first remote
             # shell which may still be unwinding after its connection was lost.
             # The durable job ID and immutable contents remain identical.
-            command = submission_command(spec, remote_command, paths)
-            result = await connection.run(command, check=False, encoding="utf-8")
+            # Sent over stdin: as an exec request the script would embed the
+            # command twice in one shell argument, hitting Linux's 128 KiB limit
+            # on a single argument near 64 KiB and the SSH packet limit beyond.
+            result = await connection.run(
+                "sh -s",
+                input=submission_command(spec, remote_command, paths),
+                check=False,
+                encoding="utf-8",
+            )
             if result.returncode is None or result.returncode == 75:
                 raise RetryableSSHOperationError(
                     "durable job submission acknowledgement was lost"
@@ -620,22 +636,28 @@ class Sandbox:
             raise InvalidRequestError(f"invalid durable job stream: {stream!r}")
         path = paths.stdout if stream == "stdout" else paths.stderr
 
-        async def read(
-            connection: asyncssh.SSHClientConnection,
-        ) -> bytes:
-            try:
-                async with connection.start_sftp_client() as sftp:
-                    async with sftp.open(str(path), "rb") as remote:
-                        value = await remote.read(size, offset)
-            except asyncssh.SFTPNoSuchFile as exc:
+        # dd on the guest, not SFTP: opening an SFTP session per read costs over a
+        # second, while this is one exec round trip like every status read.
+        command = (
+            f"dd if={shlex.quote(str(path))} bs=64K status=none "
+            f"iflag=skip_bytes,count_bytes,fullblock skip={offset} count={size}"
+        )
+
+        async def read(connection: asyncssh.SSHClientConnection) -> bytes:
+            result = await connection.run(command, check=False, encoding=None)
+            if result.returncode is None:
+                raise RetryableSSHOperationError(
+                    f"durable sandbox job {job_id} {stream} read was lost"
+                )
+            if result.returncode != 0:
                 raise SandboxFailedError(
                     f"durable sandbox job {job_id} {stream} is unavailable"
-                ) from exc
-            return bytes(value)
+                )
+            return bytes(result.stdout or b"")
 
         return await self._ssh_manager.run(
             read,
-            name=f"durable sandbox job {job_id} {stream} at byte {offset}",
+            name=f"durable sandbox job {job_id} {stream} read",
             deadline=self._ssh_deadline(),
         )
 
@@ -713,6 +735,21 @@ class Sandbox:
         remote_path: str,
         *,
         recursive: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        """Upload a file or directory, raising after ``timeout`` seconds if given."""
+        await _within_timeout(
+            self._upload(local_path, remote_path, recursive=recursive),
+            timeout,
+            f"upload to sandbox {self.id}",
+        )
+
+    async def _upload(
+        self,
+        local_path: str | os.PathLike[str],
+        remote_path: str,
+        *,
+        recursive: bool,
     ) -> None:
         source = os.fspath(local_path)
         parsed_source = _parse_transfer_path(source, separator=os.sep)
@@ -753,13 +790,19 @@ class Sandbox:
         local_path: str | os.PathLike[str],
         *,
         recursive: bool = False,
+        timeout: float | None = None,
     ) -> None:
-        if self.image_id is not None:
-            await self._download_from_container(
-                remote_path, local_path, recursive=recursive
-            )
-            return
-        await self._download_from_guest(remote_path, local_path, recursive=recursive)
+        """Download a file or directory, raising after ``timeout`` seconds if given."""
+        transfer = (
+            self._download_from_container
+            if self.image_id is not None
+            else self._download_from_guest
+        )
+        await _within_timeout(
+            transfer(remote_path, local_path, recursive=recursive),
+            timeout,
+            f"download from sandbox {self.id}",
+        )
 
     async def _download_from_guest(
         self,
@@ -817,15 +860,12 @@ class Sandbox:
         async def attempt(connection: asyncssh.SSHClientConnection) -> None:
             try:
                 await transfer(connection)
-            except (
-                asyncssh.SFTPFailure,
-                asyncssh.SFTPNoSuchFile,
-                asyncssh.SFTPNoSuchPath,
-                asyncssh.SFTPPermissionDenied,
-            ) as exc:
-                raise SandboxFailedError(f"could not complete {name}: {exc}") from exc
-            except OSError as exc:
-                if not connection.is_closed():
+            except (OSError, asyncssh.SFTPError) as exc:
+                # On a live connection the transfer itself failed, and repeating
+                # it cannot help. Only a lost connection is worth retrying.
+                if not connection.is_closed() and not isinstance(
+                    exc, (asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection)
+                ):
                     raise SandboxFailedError(
                         f"could not complete {name}: {exc}"
                     ) from exc
@@ -1549,6 +1589,17 @@ def _path_segment(value: str) -> str:
     return quote(value, safe="")
 
 
+async def _within_timeout(
+    operation: Awaitable[None], timeout: float | None, name: str
+) -> None:
+    try:
+        await asyncio.wait_for(operation, timeout)
+    except asyncio.TimeoutError as exc:
+        raise SandboxTimeoutError(
+            f"{name} did not finish within {timeout} seconds"
+        ) from exc
+
+
 def _earliest_deadline(first: float | None, second: float | None) -> float | None:
     if first is None:
         return second
@@ -1741,17 +1792,13 @@ def _network_policy_request(
         return "closed", [], []
     if outbound_cidr_allowlist is None and outbound_domain_allowlist is None:
         return "open", [], []
-    cidrs = (
-        list(outbound_cidr_allowlist)
-        if outbound_cidr_allowlist is not None
-        else ["0.0.0.0/0"]
+    # Naming one allowlist restricts egress to it. Leaving the other open would
+    # silently undo the restriction the caller asked for.
+    return (
+        "restricted",
+        list(outbound_cidr_allowlist or ()),
+        list(outbound_domain_allowlist or ()),
     )
-    domains = (
-        list(outbound_domain_allowlist)
-        if outbound_domain_allowlist is not None
-        else ["*"]
-    )
-    return "restricted", cidrs, domains
 
 
 def _wait_window(deadline: float | None) -> float:
@@ -1820,6 +1867,33 @@ def _remote_command(
                 parts.append(f"{shlex.quote(key)}={shlex.quote(value)}")
     parts.extend(shlex.quote(arg) for arg in args)
     return " ".join(parts)
+
+
+# BusyBox's shell prefers its own applets to PATH, even for ``exec``, so a bare
+# ``sh`` or ``ls`` would run BusyBox rather than the image's program. A path with
+# a slash is always executed as written, so look the command up in PATH first.
+# BusyBox remains the fallback for images which lack the command altogether.
+_CONTAINER_EXEC_IMAGE_COMMAND = """case "$1" in
+*/*) ;;
+*)
+    set -f
+    old_ifs=$IFS
+    IFS=:
+    for directory in ${PATH:-}; do
+        candidate=${directory:-.}/$1
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            shift
+            IFS=$old_ifs
+            set +f
+            exec "$candidate" "$@"
+        fi
+    done
+    IFS=$old_ifs
+    set +f
+    ;;
+esac
+exec "$@"
+"""
 
 
 def _container_session_waiter(container_busybox: str) -> str:
@@ -1900,14 +1974,12 @@ def _container_remote_command(
         else:
             parts.extend(("--env", f"{key}={value}"))
     parts.append(_CONTAINER_NAME)
-    payload: list[str] = []
-    if unset:
-        payload.extend((_CONTAINER_BUSYBOX, "env"))
-        for key in unset:
-            payload.extend(("-u", key))
-    payload.extend(args)
     if job_id is None:
-        parts.extend(payload)
+        if unset:
+            parts.extend((_CONTAINER_BUSYBOX, "env"))
+            for key in unset:
+                parts.extend(("-u", key))
+        parts.extend(args)
     else:
         validate_job_id(job_id)
         container_job = str(container_job_directory(job_id))
@@ -1916,7 +1988,8 @@ def _container_remote_command(
             f"job={shlex.quote(container_job)}\n"
             f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$job"\n'
             'printf \'%s\\n\' "$$" >"$job/pid"\n'
-            'exec "$@"\n'
+            + "".join(f"unset {shlex.quote(key)} || :\n" for key in unset)
+            + _CONTAINER_EXEC_IMAGE_COMMAND
         )
         # Do not make setsid the docker-exec process. If that process is already
         # a process-group leader, BusyBox forks and lets the observed parent
@@ -1936,7 +2009,7 @@ def _container_remote_command(
                 "sh",
             )
         )
-        parts.extend(payload)
+        parts.extend(args)
     command = " ".join(shlex.quote(part) for part in parts)
     if job_id is not None:
         prepare = _container_job_prepare_script(

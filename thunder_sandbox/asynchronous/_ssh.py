@@ -18,6 +18,9 @@ SSH_RETRY_INITIAL_SECONDS = 0.25
 SSH_RETRY_MAX_SECONDS = 5.0
 SSH_RETRY_JITTER_RATIO = 0.2
 SSH_CONNECT_TIMEOUT_SECONDS = 15.0
+# How long an operation may keep failing before it is reported. This bounds
+# failures which reconnecting cannot fix, for sandboxes with no TTL to end them.
+SSH_RETRY_BUDGET_SECONDS = 600.0
 
 T = TypeVar("T")
 OpenConnection = Callable[[], Awaitable[asyncssh.SSHClientConnection]]
@@ -106,13 +109,16 @@ class SSHConnectionManager:
         """Run an idempotent operation, reconnecting after transport failures.
 
         ``deadline`` is an absolute value in this manager's monotonic clock.
-        Without one, retries continue until success, cancellation, a permanent
-        SSH error, or manager shutdown.
+        Retries also stop once attempts have been failing for
+        ``SSH_RETRY_BUDGET_SECONDS``. An attempt which ran that long before it
+        failed, such as a large transfer, starts a new budget.
         """
 
         delay = SSH_RETRY_INITIAL_SECONDS
+        failing_since: float | None = None
         while True:
             connection: asyncssh.SSHClientConnection | None = None
+            attempt_started = self._clock()
             try:
                 connection = await self.get()
                 return await operation(connection)
@@ -123,6 +129,17 @@ class SSHConnectionManager:
                     raise
                 if connection is not None:
                     await self.discard(connection)
+                now = self._clock()
+                if (
+                    failing_since is None
+                    or now - attempt_started >= SSH_RETRY_BUDGET_SECONDS
+                ):
+                    failing_since = now
+                elif now - failing_since >= SSH_RETRY_BUDGET_SECONDS:
+                    raise ConnectionError(
+                        f"{name} kept failing for {SSH_RETRY_BUDGET_SECONDS:.0f} "
+                        f"seconds: {exc}"
+                    ) from exc
                 if deadline is not None:
                     remaining = deadline - self._clock()
                     if remaining <= 0:
@@ -155,6 +172,7 @@ __all__ = [
     "RetryableSSHOperationError",
     "SSHConnectionManager",
     "SSH_CONNECT_TIMEOUT_SECONDS",
+    "SSH_RETRY_BUDGET_SECONDS",
     "SSH_RETRY_INITIAL_SECONDS",
     "SSH_RETRY_JITTER_RATIO",
     "SSH_RETRY_MAX_SECONDS",
