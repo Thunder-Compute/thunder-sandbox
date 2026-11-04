@@ -15,9 +15,11 @@ from .._common.types import (
 )
 from ..asynchronous.process import Process as NativeProcess
 from ..asynchronous.sandbox import Sandbox as NativeSandbox
+from ..asynchronous.snapshot import Snapshot as NativeSnapshot
 from ..image import Image
 from .client import Client
 from .process import Process
+from .snapshot import Snapshot
 
 
 class Sandbox:
@@ -45,6 +47,7 @@ class Sandbox:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: Image | None = None,
+        snapshot: Snapshot | str | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -57,6 +60,10 @@ class Sandbox:
         separate ``exec`` command after readiness; they do not override image
         defaults and require the container to still be running. Image-command
         exit leaves the sandbox VM running until termination or TTL expiry.
+
+        ``snapshot`` (a :class:`Snapshot` or its ID) restores a ready
+        snapshot's disk into the new sandbox instead of starting from an
+        image; it cannot be combined with ``image``.
         """
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -74,6 +81,7 @@ class Sandbox:
                     gpu_type=gpu_type,
                     gpu_count=gpu_count,
                     image=image,
+                    snapshot=_native_snapshot(snapshot),
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
@@ -101,6 +109,7 @@ class Sandbox:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: Image | None = None,
+        snapshot: Snapshot | str | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -122,6 +131,7 @@ class Sandbox:
                     gpu_type=gpu_type,
                     gpu_count=gpu_count,
                     image=image,
+                    snapshot=_native_snapshot(snapshot),
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
@@ -219,6 +229,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._sandbox.image_id
+
+    @property
+    def snapshot_id(self) -> str | None:
+        """The snapshot this sandbox was restored from, if any."""
+        return self._sandbox.snapshot_id
 
     @property
     def info(self) -> SandboxInfo:
@@ -475,6 +490,22 @@ class Sandbox:
             )
         )
 
+    def snapshot(self, *, name: str | None = None) -> Snapshot:
+        """Start a durable snapshot of this ready sandbox's disk.
+
+        Returns as soon as capture starts; wait for it with
+        :meth:`Snapshot.wait_until_ready`. The snapshot uses this sandbox's
+        client, which a sandbox that owns its client closes on termination.
+        """
+        snapshot = self._client._bridge.run(self._sandbox.snapshot(name=name))
+        return self._client._wrap_snapshot(snapshot)
+
+    async def snapshot_async(self, *, name: str | None = None) -> Snapshot:
+        snapshot = await self._client._bridge.run_async(
+            self._sandbox.snapshot(name=name)
+        )
+        return self._client._wrap_snapshot(snapshot)
+
     def get_hourly_price(self) -> float:
         """Return the configured resources' USD/hour at current published rates."""
         return self._client._bridge.run(self._sandbox.get_hourly_price())
@@ -540,6 +571,12 @@ class Sandbox:
         finally:
             if self._owns_client:
                 await self._client.close_async()
+
+
+def _native_snapshot(
+    snapshot: Snapshot | NativeSnapshot | str | None,
+) -> NativeSnapshot | str | None:
+    return snapshot._snapshot if isinstance(snapshot, Snapshot) else snapshot
 
 
 __all__ = ["Sandbox"]

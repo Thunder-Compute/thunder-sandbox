@@ -14,6 +14,7 @@ from ._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
+    SnapshotFailedError,
     ThunderError,
     UnsupportedFeatureError,
 )
@@ -24,6 +25,8 @@ from ._common.types import (
     Resources,
     SandboxInfo,
     SandboxStatus,
+    SnapshotInfo,
+    SnapshotStatus,
     SSHConnection,
 )
 from .image import Image, ResolvedImage
@@ -34,5 +37,6 @@ __all__ = [
     "NetworkPolicy", "NotFoundError", "Pricing", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
+    "SnapshotFailedError", "SnapshotInfo", "SnapshotStatus",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError",
 ]

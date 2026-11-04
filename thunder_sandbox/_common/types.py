@@ -36,6 +36,28 @@ class SandboxStatus(str, Enum):
         return self in (SandboxStatus.FINISHED, SandboxStatus.FAILED)
 
 
+class SnapshotStatus(str, Enum):
+    CREATING = "creating"
+    READY = "ready"
+    FAILED = "failed"
+    DELETING = "deleting"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SnapshotStatus":
+        # As for sandboxes: a newer API's status must not break this client.
+        return cls.UNKNOWN
+
+    @property
+    def terminal(self) -> bool:
+        """Whether capture has finished, successfully or not.
+
+        ``DELETING`` is not terminal for capture: the snapshot is on its way
+        out, and a read after deletion reports it as not found.
+        """
+        return self in (SnapshotStatus.READY, SnapshotStatus.FAILED)
+
+
 class GPUType(str, Enum):
     A6000 = "A6000"
     A100 = "A100"       # NVIDIA A100 40 GiB
@@ -136,3 +158,27 @@ class SandboxInfo:
     image_id: str | None = None
     network_policy_generation: int | None = None
     desired_network_policy_generation: int | None = None
+    # The snapshot this sandbox was restored from, if any.
+    snapshot_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotInfo:
+    """A durable disk snapshot of a sandbox.
+
+    ``storage_gib`` is the smallest disk a restore receives; the API grows a
+    smaller requested disk to it. ``image_id`` is the source sandbox's image,
+    which a restored sandbox inherits.
+    """
+
+    id: str
+    name: str
+    status: SnapshotStatus
+    source_sandbox_id: str
+    storage_gib: int
+    created_at: datetime
+    image_id: str | None = None
+    ready_at: datetime | None = None
+    expires_at: datetime | None = None
+    failure_code: str | None = None
+    failure: str | None = None

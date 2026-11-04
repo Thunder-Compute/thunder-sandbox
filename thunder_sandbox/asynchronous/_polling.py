@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from datetime import datetime
 from typing import Literal, overload
 from urllib.parse import quote
 
 from .._common.exceptions import InvalidRequestError
+
+# The fractional seconds of an RFC 3339 timestamp, before its offset or end.
+_FRACTION = re.compile(r"\.(\d+)(?=[+-]\d{2}:\d{2}$|$)")
 
 OUTAGE_GRACE_SECONDS = 30.0
 # The API refuses a readiness wait held open longer than this per request.
@@ -48,7 +52,12 @@ def _datetime(value: object, optional: Literal[True]) -> datetime | None: ...
 def _datetime(value: object, optional: bool = False) -> datetime | None:
     if value in (None, ""):
         return None if optional else datetime.fromtimestamp(0).astimezone()
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    text = str(value).replace("Z", "+00:00")
+    # The API trims trailing zeros from nanosecond timestamps, so any number
+    # of fractional digits arrives; Python 3.10 accepts only 3 or 6. Use six,
+    # truncating below the microsecond.
+    text = _FRACTION.sub(lambda match: "." + match.group(1).ljust(6, "0")[:6], text)
+    return datetime.fromisoformat(text)
 
 
 def _wait_window(deadline: float | None) -> float:

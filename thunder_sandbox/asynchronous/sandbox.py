@@ -77,6 +77,7 @@ from ._transfer import (
 )
 from .client import Client
 from .process import Process
+from .snapshot import Snapshot
 
 _CONTAINER_NAME = "thunder-sandbox"
 _CONTAINER_BUSYBOX = "/busybox"
@@ -112,6 +113,7 @@ class Sandbox:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: Image | None = None,
+        snapshot: Snapshot | str | None = None,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -125,12 +127,19 @@ class Sandbox:
         without running an initial command. Positional arguments launch a
         separate ``exec`` command after readiness; they do not override image
         defaults.
+
+        ``snapshot`` (a :class:`Snapshot` or its ID) restores a ready
+        snapshot's disk into the new sandbox, which runs the source's image;
+        it cannot be combined with ``image``. Every other option applies as
+        for a fresh sandbox, and a ``storage`` below the snapshot's size is
+        grown to fit it.
         """
         _validate_create_options(
             timeout=timeout,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            snapshot=snapshot,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -185,6 +194,15 @@ class Sandbox:
                 **(
                     {"image_id": resolved_image.id}
                     if resolved_image is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "snapshot_id": snapshot.id
+                        if isinstance(snapshot, Snapshot)
+                        else snapshot
+                    }
+                    if snapshot is not None
                     else {}
                 ),
             }
@@ -280,6 +298,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._info.image_id
+
+    @property
+    def snapshot_id(self) -> str | None:
+        """The snapshot this sandbox was restored from, if any."""
+        return self._info.snapshot_id
 
     @property
     def info(self) -> SandboxInfo:
@@ -1345,6 +1368,17 @@ fi
     async def _close_connection(self) -> None:
         await self._ssh_manager.close()
 
+    async def snapshot(self, *, name: str | None = None) -> Snapshot:
+        """Start a durable snapshot of this ready sandbox's disk.
+
+        Returns as soon as capture starts; wait for it with
+        :meth:`Snapshot.wait_until_ready`. Only the disk is captured, not
+        memory or running processes. The snapshot uses this sandbox's client,
+        so a sandbox that owns its client closes it on :meth:`terminate`:
+        finish with the snapshot handle first, or pass a client explicitly.
+        """
+        return await self._client.create_snapshot(self.id, name=name)
+
     async def get_hourly_price(self) -> float:
         """Return the configured resources' aggregate USD/hour at current rates.
 
@@ -1599,6 +1633,9 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         ),
         failure=str(response["failure"]) if response.get("failure") else None,
         image_id=str(response["image_id"]) if response.get("image_id") else None,
+        snapshot_id=(
+            str(response["snapshot_id"]) if response.get("snapshot_id") else None
+        ),
     )
 
 
@@ -1667,6 +1704,7 @@ def _validate_create_options(
     gpu_type: GPUType | None,
     gpu_count: int | None,
     image: Image | None,
+    snapshot: Snapshot | str | None,
     block_network: bool,
     outbound_cidr_allowlist: Sequence[str] | None,
     outbound_domain_allowlist: Sequence[str] | None,
@@ -1682,6 +1720,16 @@ def _validate_create_options(
         raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
     if image is not None and not isinstance(image, Image):
         raise InvalidRequestError("image must be an Image")
+    if snapshot is not None:
+        if image is not None:
+            raise InvalidRequestError(
+                "image and snapshot cannot be combined: a restored sandbox "
+                "uses its snapshot's image"
+            )
+        if not isinstance(snapshot, Snapshot) and (
+            not isinstance(snapshot, str) or not snapshot
+        ):
+            raise InvalidRequestError("snapshot must be a Snapshot or a snapshot ID")
     _validate_network_policy_options(
         block_network=block_network,
         outbound_cidr_allowlist=outbound_cidr_allowlist,

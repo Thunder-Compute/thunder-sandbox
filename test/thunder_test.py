@@ -36,10 +36,16 @@ from thunder_sandbox._common.exceptions import (
     SandboxFailedError,
     SandboxTimeoutError,
     ServiceUnavailableError,
+    SnapshotFailedError,
     _WaitWindowElapsedError,
 )
-from thunder_sandbox._common.types import GPUType, SandboxStatus
-from thunder_sandbox.asynchronous.client import USER_AGENT, _api_error
+from thunder_sandbox._common.types import (
+    GPUType,
+    SandboxStatus,
+    SnapshotInfo,
+    SnapshotStatus,
+)
+from thunder_sandbox.asynchronous.client import _ERROR_CODES, USER_AGENT, _api_error
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
 from thunder_sandbox.asynchronous._jobs import (
@@ -58,7 +64,10 @@ from thunder_sandbox.asynchronous._ssh import (
     SSH_CONNECT_TIMEOUT_SECONDS,
     SSHConnectionManager,
 )
-from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
+from thunder_sandbox.asynchronous.sandbox import (
+    WAIT_REPLY_GRACE_SECONDS,
+    WAIT_WINDOW_MAX_SECONDS,
+)
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import (
     _container_session_waiter,
@@ -66,11 +75,16 @@ from thunder_sandbox.asynchronous.sandbox import (
     _container_job_prepare_script,
     _pinned_host_key,
 )
+from thunder_sandbox.asynchronous._polling import _datetime
+from thunder_sandbox.asynchronous.snapshot import SNAPSHOT_POLL_MAX_SECONDS
+from thunder_sandbox.asynchronous.snapshot import Snapshot as AsyncSnapshot
+from thunder_sandbox.asynchronous.snapshot import _snapshot_from_response
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
 from thunder_sandbox.synchronous._bridge import AsyncBridge
 from thunder_sandbox.synchronous.client import Client
 from thunder_sandbox.synchronous.process import Process
 from thunder_sandbox.synchronous.sandbox import Sandbox
+from thunder_sandbox.synchronous.snapshot import Snapshot
 from test.ssh_faults import FakeSSHConnection, SSHDisconnected, SSHFaults, disconnect
 
 SANDBOX_RESPONSE = {
@@ -86,6 +100,20 @@ SANDBOX_RESPONSE = {
     "created_at": "2026-08-23T12:00:00Z",
     "expires_at": "2099-08-23T13:00:00Z",
     "ssh": {"host": "sandbox.example", "port": 2222, "user": "ubuntu"},
+}
+
+SNAPSHOT_RESPONSE = {
+    "id": "snap-test",
+    "name": "checkpoint",
+    "status": "creating",
+    "source_sandbox_id": "sbx-test",
+    "image_id": "a" * 64,
+    "storage_gib": 50,
+    "created_at": "2026-11-04T12:00:00Z",
+    "ready_at": None,
+    "expires_at": None,
+    "failure_code": None,
+    "failure": None,
 }
 
 
@@ -956,20 +984,30 @@ class ConfigTest(unittest.TestCase):
         self.assertIs(asynchronous.Client, AsyncClient)
         self.assertIs(asynchronous.Sandbox, AsyncSandbox)
         self.assertIs(asynchronous.Process, AsyncProcess)
+        self.assertIs(thunder.Snapshot, Snapshot)
+        self.assertIs(synchronous.Snapshot, Snapshot)
+        self.assertIs(asynchronous.Snapshot, AsyncSnapshot)
         self.assertIs(asynchronous.Image, Image)
         self.assertIs(synchronous.Image, Image)
         self.assertEqual(AsyncClient.__name__, Client.__name__)
         self.assertEqual(AsyncSandbox.__name__, Sandbox.__name__)
         self.assertEqual(AsyncProcess.__name__, Process.__name__)
+        self.assertEqual(AsyncSnapshot.__name__, Snapshot.__name__)
         self.assertEqual(set(asynchronous.__all__), set(synchronous.__all__))
+        self.assertEqual(set(thunder.__all__) - {"__version__"}, set(synchronous.__all__))
         self.assertIs(asynchronous.GPUType, synchronous.GPUType)
+        for name in ("SnapshotFailedError", "SnapshotInfo", "SnapshotStatus"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(thunder, name), getattr(asynchronous, name))
+                self.assertIs(getattr(synchronous, name), getattr(asynchronous, name))
         self.assertEqual(USER_AGENT, f"thunder-python-sdk/{thunder.__version__}")
 
     def test_public_io_methods_have_async_twins(self) -> None:
         for cls, methods in {
             thunder.Client: (
-                "close", "create_sandbox", "get_sandbox",
-                "get_sandbox_by_name", "list_sandboxes", "resolve_image",
+                "close", "create_sandbox", "create_snapshot", "delete_snapshot",
+                "get_sandbox", "get_sandbox_by_name", "get_snapshot",
+                "list_sandboxes", "list_snapshots", "resolve_image",
             ),
             thunder.Sandbox: (
                 "create",
@@ -980,6 +1018,7 @@ class ConfigTest(unittest.TestCase):
                 "get_process",
                 "poll",
                 "refresh",
+                "snapshot",
                 "terminate",
                 "update_network_policy",
                 "upload",
@@ -987,10 +1026,22 @@ class ConfigTest(unittest.TestCase):
                 "wait_until_ready",
             ),
             thunder.Process: ("cleanup", "poll", "terminate", "wait"),
+            thunder.Snapshot: ("delete", "from_id", "refresh", "wait_until_ready"),
         }.items():
             for method in methods:
                 with self.subTest(cls=cls.__name__, method=method):
                     self.assertTrue(callable(getattr(cls, f"{method}_async")))
+        # Every blocking Snapshot method is I/O, so the list above is complete.
+        self.assertEqual(
+            {
+                name
+                for name in dir(thunder.Snapshot)
+                if not name.startswith("_")
+                and not name.endswith("_async")
+                and callable(getattr(thunder.Snapshot, name))
+            },
+            {"delete", "from_id", "refresh", "wait_until_ready"},
+        )
 
     def test_configuration_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3684,6 +3735,875 @@ class SynchronousSandboxTest(unittest.TestCase):
                 )
 
         asyncio.run(exercise())
+
+
+def snapshot_response(**overrides: object) -> dict[str, object]:
+    return {**SNAPSHOT_RESPONSE, **overrides}
+
+
+def snapshot_window_elapsed() -> _WaitWindowElapsedError:
+    """What the snapshot wait answers when its window closes on a running capture."""
+    return _WaitWindowElapsedError(
+        "Snapshot is still being captured. Retry the wait request.",
+        code="sandbox_snapshot_wait_timeout",
+        status=408,
+        retry_after=0,
+    )
+
+
+class AsyncSnapshotTest(unittest.IsolatedAsyncioTestCase):
+    def snapshot(
+        self, directory: str, *, wait_route: bool = False
+    ) -> tuple[AsyncSnapshot, AsyncClient]:
+        """A handle on a fresh client, in polling mode unless ``wait_route``."""
+        client = AsyncClient(config(directory))
+        client._snapshot_wait_endpoint_available = wait_route
+        return AsyncSnapshot._from_response(client, SNAPSHOT_RESPONSE), client
+
+    async def test_wait_until_ready_holds_the_snapshot_wait_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory, wait_route=True)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=snapshot_response(status="ready")
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ) as sleep:
+                self.assertIs(await snapshot.wait_until_ready(), snapshot)
+            # One held request answers the moment capture is ready.
+            sleep.assert_not_awaited()
+            client._request.assert_awaited_once()
+            call = client._request.await_args
+            self.assertEqual(call.args, ("GET", "/sandbox-snapshots/snap-test/wait"))
+            window = call.kwargs["query"]["timeout_seconds"]
+            self.assertGreater(window, 0)
+            self.assertLessEqual(window, WAIT_WINDOW_MAX_SECONDS)
+            self.assertEqual(call.kwargs["timeout"], window + WAIT_REPLY_GRACE_SECONDS)
+            self.assertTrue(client._snapshot_wait_endpoint_available)
+            self.assertEqual(snapshot.status, SnapshotStatus.READY)
+            await client.close()
+
+    async def test_a_closed_snapshot_wait_window_reopens_without_sleeping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory, wait_route=True)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    snapshot_window_elapsed(),
+                    snapshot_window_elapsed(),
+                    snapshot_response(status="ready"),
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ) as sleep, mock.patch(
+                "thunder_sandbox.asynchronous._polling.asyncio.sleep",
+                new=mock.AsyncMock(),
+            ) as raw_sleep:
+                self.assertIs(await snapshot.wait_until_ready(), snapshot)
+            sleep.assert_not_awaited()
+            raw_sleep.assert_not_awaited()
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [("GET", "/sandbox-snapshots/snap-test/wait")] * 3,
+            )
+            await client.close()
+
+    async def test_a_missing_snapshot_wait_route_switches_the_client_to_polling(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory, wait_route=True)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    route_missing(),
+                    snapshot_response(),
+                    snapshot_response(status="ready"),
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ) as sleep:
+                self.assertIs(await snapshot.wait_until_ready(), snapshot)
+            sleep.assert_awaited_once()
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("GET", "/sandbox-snapshots/snap-test/wait"),
+                    ("GET", "/sandbox-snapshots/snap-test"),
+                    ("GET", "/sandbox-snapshots/snap-test"),
+                ],
+            )
+            self.assertFalse(client._snapshot_wait_endpoint_available)
+            # The sandbox wait is a separate route and is not affected.
+            self.assertTrue(client._wait_endpoint_available)
+            # Remembered per client: a second waiter, even on another handle,
+            # polls from the start and never tries the route again.
+            other = AsyncSnapshot._from_response(
+                client, snapshot_response(id="snap-other")
+            )
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=snapshot_response(id="snap-other", status="ready")
+            )
+            await other.wait_until_ready()
+            client._request.assert_awaited_once_with(
+                "GET", "/sandbox-snapshots/snap-other"
+            )
+            await client.close()
+
+    async def test_a_404_on_the_wait_route_and_the_read_reports_a_missing_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory, wait_route=True)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[route_missing(), route_missing()]
+            )
+            with self.assertRaises(NotFoundError):
+                await snapshot.wait_until_ready()
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("GET", "/sandbox-snapshots/snap-test/wait"),
+                    ("GET", "/sandbox-snapshots/snap-test"),
+                ],
+            )
+            # Not proof the route is missing, so the flag is kept.
+            self.assertTrue(client._snapshot_wait_endpoint_available)
+            await client.close()
+
+    async def test_create_from_snapshot_sends_its_id_instead_of_an_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            source = AsyncSnapshot._from_response(
+                client, snapshot_response(status="ready")
+            )
+            for snapshot in (source, "snap-test"):
+                with self.subTest(snapshot=type(snapshot).__name__):
+                    client.resolve_image = mock.AsyncMock()  # type: ignore[method-assign]
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        side_effect=[
+                            {"id": "sbx-test"},
+                            {
+                                **SANDBOX_RESPONSE,
+                                "snapshot_id": "snap-test",
+                                "image_id": "a" * 64,
+                            },
+                        ]
+                    )
+                    sandbox = await AsyncSandbox.create(
+                        snapshot=snapshot, client=client, name="restored"
+                    )
+                    client.resolve_image.assert_not_awaited()
+                    # Only the start and the read of the new sandbox: the
+                    # snapshot is not fetched first, the API sizes the disk.
+                    self.assertEqual(
+                        [call.args[:2] for call in client._request.await_args_list],
+                        [("POST", "/sandboxes/start"), ("GET", "/sandboxes/sbx-test")],
+                    )
+                    body = client._request.await_args_list[0].args[2]
+                    self.assertEqual(body["snapshot_id"], "snap-test")
+                    self.assertNotIn("image_id", body)
+                    self.assertEqual(body["name"], "restored")
+                    self.assertEqual(
+                        body["spec"],
+                        {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50},
+                    )
+                    self.assertEqual(sandbox.snapshot_id, "snap-test")
+                    self.assertEqual(sandbox.image_id, "a" * 64)
+            await client.close()
+
+    async def test_client_create_sandbox_forwards_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            with mock.patch.object(
+                AsyncSandbox, "create", new=mock.AsyncMock()
+            ) as create:
+                await client.create_sandbox(snapshot="snap-test")
+            self.assertEqual(create.await_args.kwargs["snapshot"], "snap-test")
+            self.assertIsNone(create.await_args.kwargs["image"])
+            await client.close()
+
+    async def test_invalid_snapshot_options_fail_before_any_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.resolve_image = mock.AsyncMock()  # type: ignore[method-assign]
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            for options in (
+                {"image": Image.from_registry("ubuntu:24.04"), "snapshot": "snap-test"},
+                {
+                    "image": Image.from_registry("ubuntu:24.04"),
+                    "snapshot": AsyncSnapshot._from_response(client, SNAPSHOT_RESPONSE),
+                },
+                {"snapshot": ""},
+                {"snapshot": 42},
+            ):
+                with self.subTest(options=sorted(options)):
+                    with self.assertRaises(InvalidRequestError):
+                        await AsyncSandbox.create(client=client, **options)  # type: ignore[arg-type]
+            client.resolve_image.assert_not_awaited()
+            client._request.assert_not_awaited()
+            await client.close()
+        # Validation runs before a client would even be created.
+        with mock.patch.object(AsyncClient, "from_cli") as from_cli:
+            with self.assertRaises(InvalidRequestError):
+                await AsyncSandbox.create(
+                    image=Image.from_registry("ubuntu:24.04"), snapshot="snap-test"
+                )
+        from_cli.assert_not_called()
+
+    async def test_sandbox_snapshot_captures_through_its_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            prepare_key(client.config.paths)
+            sandbox = AsyncSandbox._from_response(client, SANDBOX_RESPONSE)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=SNAPSHOT_RESPONSE
+            )
+            snapshot = await sandbox.snapshot(name="checkpoint")
+            client._request.assert_awaited_once_with(
+                "POST", "/sandboxes/sbx-test/snapshots", {"name": "checkpoint"}
+            )
+            self.assertIsInstance(snapshot, AsyncSnapshot)
+            self.assertIs(snapshot._client, client)
+            self.assertFalse(snapshot._owns_client)
+            self.assertEqual(snapshot.status, SnapshotStatus.CREATING)
+            self.assertEqual(snapshot.source_sandbox_id, "sbx-test")
+            # A JSON body is always sent, even without a name.
+            client._request.reset_mock()
+            await sandbox.snapshot()
+            client._request.assert_awaited_once_with(
+                "POST", "/sandboxes/sbx-test/snapshots", {}
+            )
+            await client.close()
+
+    async def test_client_snapshot_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[SNAPSHOT_RESPONSE, SNAPSHOT_RESPONSE, {}]
+            )
+            created = await client.create_snapshot("sbx/test")
+            fetched = await client.get_snapshot("snap/test")
+            await client.delete_snapshot("snap-test")
+            self.assertEqual(
+                [call.args for call in client._request.await_args_list],
+                [
+                    ("POST", "/sandboxes/sbx%2Ftest/snapshots", {}),
+                    ("GET", "/sandbox-snapshots/snap%2Ftest"),
+                    ("DELETE", "/sandbox-snapshots/snap-test"),
+                ],
+            )
+            self.assertEqual(created.id, "snap-test")
+            self.assertIs(fetched._client, client)
+            self.assertFalse(fetched._owns_client)
+            for call in (
+                client.get_snapshot(""),
+                client.delete_snapshot(""),
+                AsyncSnapshot.from_id("", client=client),
+            ):
+                with self.assertRaisesRegex(InvalidRequestError, "snapshot ID"):
+                    await call
+            self.assertEqual(client._request.await_count, 3)
+            await client.close()
+
+    async def test_wait_until_ready_polls_with_a_capped_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[snapshot_response()] * 6
+                + [
+                    snapshot_response(
+                        status="ready", ready_at="2026-11-04T12:05:00Z"
+                    )
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ) as sleep:
+                self.assertIs(await snapshot.wait_until_ready(timeout=None), snapshot)
+            self.assertEqual(snapshot.status, SnapshotStatus.READY)
+            self.assertEqual(
+                snapshot.info.ready_at,
+                datetime(2026, 11, 4, 12, 5, tzinfo=timezone.utc),
+            )
+            # Polling mode reads the snapshot itself, never the wait route.
+            self.assertEqual(
+                {call.args for call in client._request.await_args_list},
+                {("GET", "/sandbox-snapshots/snap-test")},
+            )
+            self.assertEqual(
+                [call.args[1] for call in sleep.await_args_list],
+                [1.0, 2.0, 4.0, 8.0, SNAPSHOT_POLL_MAX_SECONDS, SNAPSHOT_POLL_MAX_SECONDS],
+            )
+            self.assertEqual(SNAPSHOT_POLL_MAX_SECONDS, 10.0)
+            await client.close()
+
+    async def test_wait_until_ready_returns_without_sleeping_when_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=snapshot_response(status="ready")
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ) as sleep:
+                await snapshot.wait_until_ready()
+            sleep.assert_not_awaited()
+            client._request.assert_awaited_once()
+            await client.close()
+
+    async def test_wait_until_ready_raises_the_recorded_capture_failure(self) -> None:
+        for wait_route in (False, True):
+            with self.subTest(wait_route=wait_route), tempfile.TemporaryDirectory() as directory:
+                snapshot, client = self.snapshot(directory, wait_route=wait_route)
+                client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                    side_effect=[
+                        snapshot_response(),
+                        snapshot_response(
+                            status="failed",
+                            failure_code="sandbox_snapshot_upload_failed",
+                            failure="object storage rejected a chunk",
+                        ),
+                    ]
+                )
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                    new_callable=mock.AsyncMock,
+                ):
+                    with self.assertRaises(SnapshotFailedError) as raised:
+                        await snapshot.wait_until_ready()
+                error = raised.exception
+                self.assertEqual(error.code, "sandbox_snapshot_upload_failed")
+                self.assertIn("snap-test", str(error))
+                self.assertIn("object storage rejected a chunk", str(error))
+                self.assertEqual(snapshot.status, SnapshotStatus.FAILED)
+                await client.close()
+
+    async def test_wait_timeout_leaves_the_snapshot_in_place(self) -> None:
+        async def still_capturing(*args: object, **kwargs: object) -> dict:
+            return snapshot_response()
+
+        async def window_closes(*args: object, **kwargs: object) -> None:
+            await asyncio.sleep(0.02)
+            raise snapshot_window_elapsed()
+
+        for wait_route, answer, path in (
+            (False, still_capturing, "/sandbox-snapshots/snap-test"),
+            (True, window_closes, "/sandbox-snapshots/snap-test/wait"),
+        ):
+            with self.subTest(wait_route=wait_route), tempfile.TemporaryDirectory() as directory:
+                snapshot, client = self.snapshot(directory, wait_route=wait_route)
+                client._request = mock.AsyncMock(side_effect=answer)  # type: ignore[method-assign]
+                with self.assertRaisesRegex(
+                    SandboxTimeoutError, "this wait did not delete it"
+                ) as raised:
+                    await snapshot.wait_until_ready(timeout=0.1)
+                self.assertIsInstance(raised.exception, TimeoutError)
+                # Bounded by the deadline, and only reads: never a DELETE.
+                self.assertGreaterEqual(client._request.await_count, 2)
+                self.assertLess(client._request.await_count, 20)
+                self.assertEqual(
+                    {call.args for call in client._request.await_args_list},
+                    {("GET", path)},
+                )
+                await client.close()
+
+    async def test_wait_cancellation_leaves_the_snapshot_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=snapshot_response()
+            )
+            task = asyncio.create_task(snapshot.wait_until_ready(timeout=None))
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(
+                {call.args[0] for call in client._request.await_args_list}, {"GET"}
+            )
+            await client.close()
+
+    async def test_wait_reports_a_snapshot_deleted_underneath_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    snapshot_response(status="deleting"),
+                    NotFoundError("gone", code="not_found", status=404),
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous.snapshot._sleep_until_next_poll",
+                new_callable=mock.AsyncMock,
+            ):
+                with self.assertRaises(NotFoundError):
+                    await snapshot.wait_until_ready()
+            self.assertEqual(client._request.await_count, 2)
+            await client.close()
+
+    async def test_wait_survives_a_transient_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    ServiceUnavailableError("retry", retry_after=3),
+                    ConnectionError("reset"),
+                    snapshot_response(status="ready"),
+                ]
+            )
+            with mock.patch(
+                "thunder_sandbox.asynchronous._polling.asyncio.sleep",
+                new=mock.AsyncMock(),
+            ) as sleep, mock.patch(
+                "thunder_sandbox.asynchronous._polling.random.uniform", return_value=0
+            ):
+                self.assertIs(await snapshot.wait_until_ready(), snapshot)
+            self.assertEqual([call.args[0] for call in sleep.await_args_list], [3, 2.0])
+            await client.close()
+
+    async def test_wait_rejects_a_negative_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot, client = self.snapshot(directory)
+            client._request = mock.AsyncMock()  # type: ignore[method-assign]
+            for timeout in (-1, float("nan")):
+                with self.assertRaises(InvalidRequestError):
+                    await snapshot.wait_until_ready(timeout=timeout)
+            client._request.assert_not_awaited()
+            await client.close()
+
+    async def test_list_snapshots_follows_next_page_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {
+                        "snapshots": [
+                            snapshot_response(id="snap-one"),
+                            "not-an-object",
+                        ],
+                        "next_page_token": "page-2",
+                    },
+                    {"snapshots": [snapshot_response(id="snap-two")], "next_page_token": ""},
+                    {"snapshots": [], "next_page_token": None},
+                ]
+            )
+            snapshots = [snapshot async for snapshot in client.list_snapshots()]
+            self.assertEqual([s.id for s in snapshots], ["snap-one", "snap-two"])
+            self.assertEqual(
+                [call.kwargs["query"] for call in client._request.await_args_list[:2]],
+                [
+                    {"limit": 100, "status": None, "page_token": ""},
+                    {"limit": 100, "status": None, "page_token": "page-2"},
+                ],
+            )
+            self.assertEqual(
+                {call.args for call in client._request.await_args_list[:2]},
+                {("GET", "/sandbox-snapshots")},
+            )
+            # A null token ends the listing rather than requesting page "None".
+            filtered = [
+                snapshot
+                async for snapshot in client.list_snapshots(status=SnapshotStatus.READY)
+            ]
+            self.assertEqual(filtered, [])
+            self.assertEqual(client._request.await_count, 3)
+            self.assertEqual(
+                client._request.await_args.kwargs["query"]["status"], "ready"
+            )
+            await client.close()
+
+    async def test_null_listing_yields_nothing_from_one_request(self) -> None:
+        # A nil Go slice and an empty token both marshal to null.
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value={"snapshots": None, "next_page_token": None}
+            )
+            items = [item async for item in client.list_snapshots()]
+            self.assertEqual(items, [])
+            client._request.assert_awaited_once()
+            await client.close()
+
+    def test_timestamps_accept_any_number_of_fractional_digits(self) -> None:
+        # Go's RFC 3339 nanosecond format trims trailing zeros; Python 3.10's
+        # fromisoformat takes only 3 or 6 digits. Below a microsecond truncates.
+        for text, microsecond in (
+            ("2026-11-04T12:00:00.5Z", 500000),
+            ("2026-11-04T12:00:00.12345Z", 123450),
+            ("2026-11-04T12:00:00.123456Z", 123456),
+            ("2026-11-04T12:00:00.123456789Z", 123456),
+            ("2026-11-04T12:00:00.5+00:00", 500000),
+            ("2026-11-04T12:00:00.12345+00:00", 123450),
+            ("2026-11-04T12:00:00.123456+00:00", 123456),
+            ("2026-11-04T12:00:00.123456789+00:00", 123456),
+            ("2026-11-04T12:00:00Z", 0),
+            ("2026-11-04T12:00:00+00:00", 0),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    _datetime(text),
+                    datetime(2026, 11, 4, 12, 0, 0, microsecond, tzinfo=timezone.utc),
+                )
+        # A non-UTC offset keeps its offset and still normalises the fraction.
+        self.assertEqual(
+            _datetime("2026-11-04T22:00:00.123456789+10:00"),
+            datetime(2026, 11, 4, 12, 0, 0, 123456, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(_datetime(None, optional=True))
+        self.assertIsNone(_datetime("", optional=True))
+        info = _snapshot_from_response(
+            snapshot_response(
+                created_at="2026-11-04T12:00:00.1Z",
+                ready_at="2026-11-04T12:05:00.123456789Z",
+            )
+        )
+        self.assertEqual(info.created_at.microsecond, 100000)
+        self.assertEqual(info.ready_at.microsecond, 123456)  # type: ignore[union-attr]
+
+    async def test_an_implicit_client_is_closed_only_by_the_handle_that_owns_it(
+        self,
+    ) -> None:
+        # Mirrors Sandbox: from_id() without a client creates one and closes it
+        # on delete() or on a failed read; a handle on a borrowed client never does.
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.close = mock.AsyncMock()  # type: ignore[method-assign]
+            with mock.patch.object(AsyncClient, "from_cli", return_value=client):
+                with self.subTest(case="delete"):
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        side_effect=[snapshot_response(status="ready"), {}]
+                    )
+                    snapshot = await AsyncSnapshot.from_id("snap-test")
+                    client.close.assert_not_awaited()
+                    await snapshot.delete()
+                    self.assertEqual(
+                        client._request.await_args_list[-1].args,
+                        ("DELETE", "/sandbox-snapshots/snap-test"),
+                    )
+                    self.assertEqual(snapshot.status, SnapshotStatus.DELETING)
+                    client.close.assert_awaited_once_with()
+                with self.subTest(case="delete fails"):
+                    client.close.reset_mock()
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        side_effect=[snapshot_response(), ServiceUnavailableError("down")]
+                    )
+                    snapshot = await AsyncSnapshot.from_id("snap-test")
+                    with self.assertRaises(ServiceUnavailableError):
+                        await snapshot.delete()
+                    self.assertEqual(snapshot.status, SnapshotStatus.CREATING)
+                    client.close.assert_awaited_once_with()
+                with self.subTest(case="read fails"):
+                    client.close.reset_mock()
+                    client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                        side_effect=NotFoundError("gone", status=404)
+                    )
+                    with self.assertRaises(NotFoundError):
+                        await AsyncSnapshot.from_id("snap-test")
+                    client.close.assert_awaited_once_with()
+            with self.subTest(case="borrowed"):
+                client.close.reset_mock()
+                snapshot = AsyncSnapshot._from_response(client, SNAPSHOT_RESPONSE)
+                client._request = mock.AsyncMock(return_value={})  # type: ignore[method-assign]
+                await snapshot.delete()
+                client._request.assert_awaited_once_with(
+                    "DELETE", "/sandbox-snapshots/snap-test"
+                )
+                client.close.assert_not_awaited()
+
+    def test_snapshot_response_is_parsed_completely(self) -> None:
+        info = _snapshot_from_response(
+            snapshot_response(
+                status="failed",
+                ready_at="2026-11-04T12:05:00Z",
+                expires_at="2026-12-04T12:00:00+00:00",
+                failure_code="sandbox_snapshot_upload_failed",
+                failure="boom",
+            )
+        )
+        self.assertEqual(
+            info,
+            SnapshotInfo(
+                id="snap-test",
+                name="checkpoint",
+                status=SnapshotStatus.FAILED,
+                source_sandbox_id="sbx-test",
+                storage_gib=50,
+                created_at=datetime(2026, 11, 4, 12, tzinfo=timezone.utc),
+                image_id="a" * 64,
+                ready_at=datetime(2026, 11, 4, 12, 5, tzinfo=timezone.utc),
+                expires_at=datetime(2026, 12, 4, 12, tzinfo=timezone.utc),
+                failure_code="sandbox_snapshot_upload_failed",
+                failure="boom",
+            ),
+        )
+        self.assertTrue(SnapshotStatus.FAILED.terminal)
+        self.assertTrue(SnapshotStatus.READY.terminal)
+        self.assertFalse(SnapshotStatus.CREATING.terminal)
+        self.assertFalse(SnapshotStatus.DELETING.terminal)
+
+    def test_snapshot_response_tolerates_unknown_status_and_missing_fields(self) -> None:
+        info = _snapshot_from_response({"id": "snap-test", "status": "uploading"})
+        self.assertEqual(info.status, SnapshotStatus.UNKNOWN)
+        self.assertFalse(info.status.terminal)
+        self.assertEqual(info.name, "")
+        self.assertEqual(info.source_sandbox_id, "")
+        self.assertEqual(info.storage_gib, 0)
+        self.assertIsInstance(info.created_at, datetime)
+        for field in ("image_id", "ready_at", "expires_at", "failure_code", "failure"):
+            with self.subTest(field=field):
+                self.assertIsNone(getattr(info, field))
+        self.assertEqual(
+            _snapshot_from_response({"id": "snap-test", "storage_gib": "big"}).storage_gib,
+            0,
+        )
+        with self.assertRaises(ConnectionError):
+            _snapshot_from_response({"status": "ready"})
+
+
+class SnapshotErrorContractTest(unittest.TestCase):
+    def test_snapshot_error_codes_map_to_public_exceptions(self) -> None:
+        for code, status, expected in (
+            ("sandbox_snapshot_source_not_ready", 409, ConflictError),
+            ("sandbox_snapshot_not_ready", 409, ConflictError),
+            ("sandbox_snapshot_image_conflict", 400, InvalidRequestError),
+            ("sandbox_snapshot_failed", 409, SnapshotFailedError),
+            ("sandbox_snapshot_limit_exceeded", 409, ConflictError),
+        ):
+            with self.subTest(code=code):
+                error = _api_error(status, code, "message", {"Retry-After": "7"})
+                self.assertIs(type(error), expected)
+                self.assertEqual(error.code, code)
+                self.assertEqual(error.status, status)
+                self.assertEqual(error.retry_after, 7)
+        refused = _api_error(409, "sandbox_snapshot_failed", "failed", {})
+        self.assertIs(type(refused), SnapshotFailedError)
+        self.assertEqual(refused.code, "sandbox_snapshot_failed")
+        # A closed snapshot wait window is the internal "not yet" answer.
+        self.assertIs(_ERROR_CODES["sandbox_snapshot_wait_timeout"], _WaitWindowElapsedError)
+        window = _api_error(
+            408, "sandbox_snapshot_wait_timeout", "still capturing", {"Retry-After": "0"}
+        )
+        self.assertIsInstance(window, _WaitWindowElapsedError)
+        self.assertEqual(window.retry_after, 0)
+
+
+class SynchronousSnapshotTest(unittest.TestCase):
+    def client(self, directory: str) -> Client:
+        client = Client(config(directory))
+        prepare_key(client.config.paths)
+        return client
+
+    def native_snapshot(self, client: Client, **overrides: object) -> AsyncSnapshot:
+        return AsyncSnapshot._from_response(client._client, snapshot_response(**overrides))
+
+    def test_client_snapshot_methods_run_on_the_bridge_and_wrap_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            native = self.native_snapshot(client)
+            threads: list[int] = []
+
+            def recorded(result: object):
+                async def method(*args: object, **kwargs: object) -> object:
+                    threads.append(threading.get_ident())
+                    return result
+
+                return mock.AsyncMock(side_effect=method)
+
+            client._client.create_snapshot = recorded(native)  # type: ignore[method-assign]
+            client._client.get_snapshot = recorded(native)  # type: ignore[method-assign]
+            client._client.delete_snapshot = recorded(None)  # type: ignore[method-assign]
+            try:
+                created = client.create_snapshot("sbx-test", name="checkpoint")
+                fetched = client.get_snapshot("snap-test")
+                self.assertIsNone(client.delete_snapshot("snap-test"))
+                created_async = asyncio.run(
+                    client.create_snapshot_async("sbx-test", name="again")
+                )
+                fetched_async = asyncio.run(client.get_snapshot_async("snap-test"))
+                asyncio.run(client.delete_snapshot_async("snap-test"))
+            finally:
+                client.close()
+            for wrapped in (created, fetched, created_async, fetched_async):
+                self.assertIsInstance(wrapped, Snapshot)
+                self.assertIs(wrapped._snapshot, native)
+                self.assertIs(wrapped._client, client)
+                self.assertFalse(wrapped._owns_client)
+            self.assertEqual(
+                [call.args for call in client._client.create_snapshot.await_args_list],
+                [("sbx-test",), ("sbx-test",)],
+            )
+            self.assertEqual(
+                [call.kwargs for call in client._client.create_snapshot.await_args_list],
+                [{"name": "checkpoint"}, {"name": "again"}],
+            )
+            client._client.delete_snapshot.assert_awaited_with("snap-test")
+            self.assertEqual(len(threads), 6)
+            self.assertEqual(len(set(threads)), 1)
+            self.assertNotEqual(threads[0], threading.get_ident())
+
+    def test_list_snapshots_wraps_every_native_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            first = self.native_snapshot(client, id="snap-one")
+            second = self.native_snapshot(client, id="snap-two")
+            seen: list[object] = []
+
+            async def listing(*, status=None):
+                seen.append(status)
+                yield first
+                yield second
+
+            client._client.list_snapshots = listing  # type: ignore[method-assign]
+
+            async def collect() -> list[Snapshot]:
+                return [
+                    snapshot
+                    async for snapshot in client.list_snapshots_async(status="ready")
+                ]
+
+            try:
+                blocking = list(client.list_snapshots())
+                awaited = asyncio.run(collect())
+            finally:
+                client.close()
+            for result in (blocking, awaited):
+                self.assertEqual([s.id for s in result], ["snap-one", "snap-two"])
+                self.assertTrue(all(isinstance(s, Snapshot) for s in result))
+            self.assertEqual(seen, [None, "ready"])
+
+    def test_snapshot_methods_block_on_native_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            native = self.native_snapshot(client, status="ready")
+            snapshot = Snapshot._from_async(client, native)
+            native.refresh = mock.AsyncMock(return_value=native)  # type: ignore[method-assign]
+            native.wait_until_ready = mock.AsyncMock(return_value=native)  # type: ignore[method-assign]
+            native.delete = mock.AsyncMock()  # type: ignore[method-assign]
+
+            async def exercise_async() -> None:
+                self.assertIs(await snapshot.refresh_async(), snapshot)
+                self.assertIs(
+                    await snapshot.wait_until_ready_async(timeout=None), snapshot
+                )
+                await snapshot.delete_async()
+
+            try:
+                self.assertEqual(snapshot.id, "snap-test")
+                self.assertEqual(snapshot.name, "checkpoint")
+                self.assertEqual(snapshot.status, SnapshotStatus.READY)
+                self.assertEqual(snapshot.source_sandbox_id, "sbx-test")
+                self.assertEqual(snapshot.image_id, "a" * 64)
+                self.assertIs(snapshot.info, native.info)
+                self.assertIs(snapshot.refresh(), snapshot)
+                self.assertIs(snapshot.wait_until_ready(timeout=7), snapshot)
+                snapshot.delete()
+                asyncio.run(exercise_async())
+            finally:
+                client.close()
+            self.assertEqual(native.refresh.await_count, 2)  # type: ignore[attr-defined]
+            self.assertEqual(
+                [c.kwargs for c in native.wait_until_ready.await_args_list],  # type: ignore[attr-defined]
+                [{"timeout": 7}, {"timeout": None}],
+            )
+            self.assertEqual(native.delete.await_count, 2)  # type: ignore[attr-defined]
+
+    def test_snapshot_errors_propagate_through_the_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            native = self.native_snapshot(client)
+            snapshot = Snapshot._from_async(client, native)
+            native.wait_until_ready = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=SnapshotFailedError("failed", code="code")
+            )
+            try:
+                with self.assertRaises(SnapshotFailedError) as raised:
+                    snapshot.wait_until_ready()
+            finally:
+                client.close()
+            self.assertEqual(raised.exception.code, "code")
+
+    def test_from_id_without_a_client_owns_and_closes_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.subTest(case="delete"):
+                client = self.client(directory)
+                client._client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                    side_effect=[snapshot_response(status="ready"), {}]
+                )
+                with mock.patch.object(Client, "from_cli", return_value=client):
+                    snapshot = Snapshot.from_id("snap-test")
+                self.assertTrue(snapshot._owns_client)
+                self.assertFalse(snapshot._snapshot._owns_client)
+                snapshot.delete()
+                self.assertTrue(client._closed)
+                self.assertEqual(
+                    client._client._request.await_args_list[-1].args,
+                    ("DELETE", "/sandbox-snapshots/snap-test"),
+                )
+            with self.subTest(case="read fails"):
+                client = self.client(directory)
+                client._client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                    side_effect=NotFoundError("gone", status=404)
+                )
+                with mock.patch.object(Client, "from_cli", return_value=client):
+                    with self.assertRaises(NotFoundError):
+                        asyncio.run(Snapshot.from_id_async("snap-test"))
+                self.assertTrue(client._closed)
+
+    def test_sandbox_snapshot_wraps_the_native_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            native_sandbox = AsyncSandbox._from_response(
+                client._client, {**SANDBOX_RESPONSE, "snapshot_id": "snap-source"}
+            )
+            sandbox = Sandbox._from_async(client, native_sandbox)
+            native = self.native_snapshot(client)
+            native_sandbox.snapshot = mock.AsyncMock(return_value=native)  # type: ignore[method-assign]
+            try:
+                self.assertEqual(sandbox.snapshot_id, "snap-source")
+                blocking = sandbox.snapshot(name="checkpoint")
+                awaited = asyncio.run(sandbox.snapshot_async())
+            finally:
+                client.close()
+            for wrapped in (blocking, awaited):
+                self.assertIsInstance(wrapped, Snapshot)
+                self.assertIs(wrapped._snapshot, native)
+                self.assertIs(wrapped._client, client)
+            self.assertEqual(
+                [c.kwargs for c in native_sandbox.snapshot.await_args_list],  # type: ignore[attr-defined]
+                [{"name": "checkpoint"}, {"name": None}],
+            )
+
+    def test_create_passes_the_native_snapshot_or_id_through(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            native_sandbox = AsyncSandbox._from_response(client._client, SANDBOX_RESPONSE)
+            native = self.native_snapshot(client, status="ready")
+            wrapped = Snapshot._from_async(client, native)
+            try:
+                with mock.patch(
+                    "thunder_sandbox.synchronous.sandbox.NativeSandbox.create",
+                    new=mock.AsyncMock(return_value=native_sandbox),
+                ) as create:
+                    Sandbox.create(snapshot=wrapped, client=client)
+                    client.create_sandbox(snapshot="snap-test")
+                    asyncio.run(Sandbox.create_async(snapshot=wrapped, client=client))
+                    asyncio.run(client.create_sandbox_async(snapshot="snap-test"))
+            finally:
+                client.close()
+            snapshots = [call.kwargs["snapshot"] for call in create.await_args_list]
+            self.assertIs(snapshots[0], native)
+            self.assertEqual(snapshots[1], "snap-test")
+            self.assertIs(snapshots[2], native)
+            self.assertEqual(snapshots[3], "snap-test")
+            for call in create.await_args_list:
+                self.assertIs(call.kwargs["client"], client._client)
 
 
 class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
