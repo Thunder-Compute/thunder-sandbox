@@ -105,6 +105,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -124,9 +125,18 @@ class Sandbox:
         without running an initial command. Positional arguments launch a
         separate ``exec`` command after readiness; they do not override image
         defaults.
+
+        ``queue=True`` admits image builds and waits for sandbox capacity without
+        a scheduling timeout. Creation without positional commands returns a
+        handle while queued; use ``wait_until_ready(timeout=None)`` to wait
+        indefinitely. ``timeout`` remains the runtime TTL and, with positional
+        commands, the readiness wait limit. CPU-only sandboxes omit GPU options
+        or use ``GPUType.NONE`` with ``gpu_count=0``. ``cpu=1`` and ``cpu=2``
+        are supported, subject to the API resource catalog.
         """
         _validate_create_options(
             timeout=timeout,
+            queue=queue,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
@@ -143,13 +153,14 @@ class Sandbox:
                 "storage_gib": storage if storage is not None else 50,
                 **(
                     {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
-                    if gpu_type is not None
+                    if gpu_type is not None and gpu_type is not GPUType.NONE
                     else {}
                 ),
             }
             resolved_image = (
                 await resolved_client.resolve_image(
-                    image, gated_features=gated_features, spec=resource_spec
+                    image, gated_features=gated_features, spec=resource_spec,
+                    queue=queue,
                 )
                 if image is not None
                 else None
@@ -160,6 +171,7 @@ class Sandbox:
                 outbound_domain_allowlist,
             )
             request = {
+                **({"queue": True} if queue else {}),
                 "spec": resource_spec,
                 "env": {
                     key: value
@@ -279,6 +291,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._info.image_id
+
+    @property
+    def queued(self) -> bool:
+        """Whether the last observed state is waiting for capacity."""
+        return self._info.queued
 
     @property
     def info(self) -> SandboxInfo:
@@ -1587,6 +1604,8 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     spec: dict[str, object] = spec_value if isinstance(spec_value, dict) else {}
     policy_value = response.get("network_policy")
     gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
+    if gpu_type is GPUType.NONE:
+        gpu_type = None
     ssh_value = response.get("ssh")
     ssh = None
     if isinstance(ssh_value, dict) and ssh_value.get("host"):
@@ -1618,6 +1637,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         desired_network_policy_generation=_network_policy_generation(
             response.get("desired_network_policy_generation")
         ),
+        queued=response.get("queued") is True,
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
         ssh=ssh,
@@ -1693,6 +1713,7 @@ def _remember_host_key(sandbox_id: str, key: object) -> None:
 def _validate_create_options(
     *,
     timeout: int | None,
+    queue: bool,
     gpu_type: GPUType | None,
     gpu_count: int | None,
     image: Image | None,
@@ -1701,14 +1722,18 @@ def _validate_create_options(
     outbound_domain_allowlist: Sequence[str] | None,
 ) -> None:
 
+    if not isinstance(queue, bool):
+        raise InvalidRequestError("queue must be a boolean")
     if timeout is not None and timeout < 0:
         raise InvalidRequestError("timeout cannot be negative")
     if gpu_type is not None and not isinstance(gpu_type, GPUType):
         raise InvalidRequestError("gpu_type must be a GPUType")
-    if (gpu_type is None) != (gpu_count is None):
-        raise InvalidRequestError("gpu_type and gpu_count must be provided together")
-    if gpu_count is not None and gpu_count not in (1, 2, 4, 8):
-        raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
+    if gpu_type in (None, GPUType.NONE):
+        if gpu_count not in (None, 0):
+            raise InvalidRequestError("CPU-only sandboxes require gpu_count=0 or None")
+    else:
+        if gpu_count not in (1, 2, 4, 8):
+            raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
     if image is not None and not isinstance(image, Image):
         raise InvalidRequestError("image must be an Image")
     _validate_network_policy_options(

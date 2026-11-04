@@ -209,7 +209,8 @@ class Client:
             gpu={
                 gpu: rate(f"sandbox_{gpu.value.lower()}")
                 for gpu in GPUType
-                if gpu != GPUType.UNKNOWN and f"sandbox_{gpu.value.lower()}" in rates
+                if gpu not in (GPUType.NONE, GPUType.UNKNOWN)
+                and f"sandbox_{gpu.value.lower()}" in rates
             },
         )
 
@@ -220,16 +221,21 @@ class Client:
         timeout: float | None = 7200,
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
+        queue: bool = False,
     ) -> "ResolvedImage":
         """Build or import an image and wait until its managed image is ready.
 
         Optional ``spec`` supplies sandbox resources for a capacity check; it
         does not reserve resources. Omit it for standalone image preparation.
+        Set ``queue=True`` to admit builds without a sandbox capacity check.
+        Image preparation still waits for the build within ``timeout``.
         """
         from ..image import Image, _create_canonical_build_context
 
         if not isinstance(image, Image):
             raise InvalidRequestError("image must be created with Image.from_*()")
+        if not isinstance(queue, bool):
+            raise InvalidRequestError("queue must be a boolean")
         if timeout is not None and timeout <= 0:
             raise InvalidRequestError("image timeout must be positive or None")
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -246,6 +252,8 @@ class Client:
                     request_body["display_name"] = image._display_name
                 if gated_features is not None:
                     request_body["gatedFeatures"] = dict(gated_features)
+                if queue:
+                    request_body["queue"] = True
                 if spec is not None:
                     request_body["spec"] = dict(spec)
                 response = await self._request(
@@ -280,6 +288,8 @@ class Client:
                     request_body["display_name"] = image._display_name
                 if gated_features is not None:
                     request_body["gatedFeatures"] = dict(gated_features)
+                if queue:
+                    request_body["queue"] = True
                 if spec is not None:
                     request_body["spec"] = dict(spec)
                 response = await self._request(
@@ -477,6 +487,7 @@ class Client:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -495,6 +506,7 @@ class Client:
             env=env,
             gated_features=gated_features,
             timeout=timeout,
+            queue=queue,
             cpu=cpu,
             memory=memory,
             storage=storage,
