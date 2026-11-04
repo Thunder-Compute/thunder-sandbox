@@ -31,6 +31,31 @@ tnr login
 Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
 `TNR_API_URL`. API endpoints must use HTTPS.
 
+## CPU-only sandboxes and queueing
+
+Omit GPU options for a CPU-only sandbox, or explicitly pass `gpu_type=thunder.GPUType.NONE, gpu_count=0`. Both `cpu=1` and `cpu=2` are supported. Memory is specified in whole GiB, including `memory=1`; the API's configured resource catalog determines which combinations are available.
+
+```python
+sandbox = thunder.Sandbox.create(
+    cpu=1,
+    memory=1,
+    storage=10,
+    gpu_type=thunder.GPUType.NONE,
+    gpu_count=0,
+    queue=True,
+    timeout=900,
+)
+try:
+    print(sandbox.queued)  # Last observed waiting-for-capacity state.
+    sandbox.wait_until_ready(timeout=None)
+finally:
+    sandbox.terminate()
+```
+
+`queue=True` admits image builds/imports without checking future sandbox capacity and lets the sandbox wait for capacity without a scheduling timeout. When creating with `image=...`, the SDK passes this option to both image preparation and sandbox creation. Standalone preparation also accepts `client.resolve_image(image, queue=True)`. Validation, account limits, and infrastructure errors still apply; image builds still require Kubernetes workers. Omitting the flag preserves normal admission behavior.
+
+Creation without positional commands returns a handle while the sandbox is queued, after any image preparation finishes. Refresh the handle with `sandbox.refresh()` to update `sandbox.queued` and `sandbox.info.queued`. `terminate()` cancels a queued sandbox. The sandbox's runtime TTL (`timeout` on creation) starts at readiness for queue-admitted sandboxes; `wait_until_ready(timeout=None)` waits indefinitely. Positional commands still wait for readiness within the creation `timeout`, so use a handle followed by an explicit wait for long queue waits. Image preparation retains its own timeout (two hours by default). The same options work with the native async SDK and the sync SDK's async adapters.
+
 ## Quick start
 
 ```python

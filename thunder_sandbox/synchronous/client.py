@@ -60,6 +60,7 @@ class Client:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -78,6 +79,7 @@ class Client:
             env=env,
             gated_features=gated_features,
             timeout=timeout,
+            queue=queue,
             cpu=cpu,
             memory=memory,
             storage=storage,
@@ -105,12 +107,14 @@ class Client:
         timeout: float | None = 7200,
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
+        queue: bool = False,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return self._bridge.run(
             self._client.resolve_image(
-                image, timeout=timeout, gated_features=gated_features, spec=spec
+                image, timeout=timeout, gated_features=gated_features, spec=spec,
+                queue=queue,
             )
         )
 
@@ -121,12 +125,14 @@ class Client:
         timeout: float | None = 7200,
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
+        queue: bool = False,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return await self._bridge.run_async(
             self._client.resolve_image(
-                image, timeout=timeout, gated_features=gated_features, spec=spec
+                image, timeout=timeout, gated_features=gated_features, spec=spec,
+                queue=queue,
             )
         )
 
@@ -137,6 +143,7 @@ class Client:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -155,6 +162,7 @@ class Client:
             env=env,
             gated_features=gated_features,
             timeout=timeout,
+            queue=queue,
             cpu=cpu,
             memory=memory,
             storage=storage,

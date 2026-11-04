@@ -39,6 +39,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -57,6 +58,13 @@ class Sandbox:
         separate ``exec`` command after readiness; they do not override image
         defaults and require the container to still be running. Image-command
         exit leaves the sandbox VM running until termination or TTL expiry.
+
+        ``queue=True`` applies to image preparation and sandbox allocation.
+        Without positional commands, creation returns a handle while queued;
+        use ``wait_until_ready(timeout=None)`` to wait indefinitely. ``timeout``
+        remains the runtime TTL and the readiness limit for positional commands.
+        CPU-only sandboxes omit GPU options or use ``GPUType.NONE`` with
+        ``gpu_count=0``. ``cpu=1`` and ``cpu=2`` follow the API resource catalog.
         """
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -68,6 +76,7 @@ class Sandbox:
                     env=env,
                     gated_features=gated_features,
                     timeout=timeout,
+                    queue=queue,
                     cpu=cpu,
                     memory=memory,
                     storage=storage,
@@ -95,6 +104,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -116,6 +126,7 @@ class Sandbox:
                     env=env,
                     gated_features=gated_features,
                     timeout=timeout,
+                    queue=queue,
                     cpu=cpu,
                     memory=memory,
                     storage=storage,
@@ -219,6 +230,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._sandbox.image_id
+
+    @property
+    def queued(self) -> bool:
+        """Whether the last observed state is waiting for capacity."""
+        return self._sandbox.queued
 
     @property
     def info(self) -> SandboxInfo:

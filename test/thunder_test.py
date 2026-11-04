@@ -1323,23 +1323,23 @@ class SynchronousClientTest(unittest.TestCase):
                 image = Image.from_registry("ubuntu:24.04")
                 features = {"image_feature": True}
                 self.assertEqual(
-                    client.resolve_image(image, timeout=42, gated_features=features),
+                    client.resolve_image(image, timeout=42, gated_features=features, queue=True),
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features, spec=None
+                    image, timeout=42, gated_features=features, spec=None, queue=True
                 )
                 client._client.resolve_image.reset_mock()
                 self.assertEqual(
                     asyncio.run(
                         client.resolve_image_async(
-                            image, timeout=42, gated_features=features
+                            image, timeout=42, gated_features=features, queue=True
                         )
                     ),
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features, spec=None
+                    image, timeout=42, gated_features=features, spec=None, queue=True
                 )
             finally:
                 client.close()
@@ -1403,6 +1403,29 @@ class SynchronousClientTest(unittest.TestCase):
 
 
 class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_is_forwarded_to_registry_and_dockerfile_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            for image, endpoint in (
+                (Image.from_registry("ubuntu:24.04"), "from-registry"),
+                (Image.from_dockerfile(root), "from-dockerfile"),
+            ):
+                with self.subTest(endpoint=endpoint):
+                    client = AsyncClient(config(directory))
+                    client._request = mock.AsyncMock(return_value={
+                        "id": "image-id", "state": "READY",
+                        "managed_reference": "registry.example/image@sha256:digest",
+                        "managed_digest": "sha256:digest",
+                    })
+                    try:
+                        await client.resolve_image(image, queue=True)
+                        call = client._request.await_args
+                        self.assertEqual(call.args[:2], ("POST", "/sandbox-images/" + endpoint))
+                        self.assertIs(call.kwargs["body"]["queue"], True)
+                    finally:
+                        await client.close()
+
     async def test_registry_image_is_imported_and_returned_when_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
@@ -1621,6 +1644,42 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_and_cpu_only_resources_reach_image_and_start_requests(self) -> None:
+        for cpu, gpu_type, gpu_count in ((1, None, None), (2, None, 0), (1, GPUType.NONE, 0)):
+            with self.subTest(cpu=cpu, gpu_type=gpu_type, gpu_count=gpu_count):
+                with tempfile.TemporaryDirectory() as directory:
+                    client = AsyncClient(config(directory))
+                    image = Image.from_registry("ubuntu:24.04")
+                    client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                        "image-id", "registry.example/image@sha256:digest", "sha256:digest"
+                    ))
+                    spec = {"cpu_count": cpu, "memory_gib": 1, "storage_gib": 10}
+                    client._request = mock.AsyncMock(side_effect=[
+                        {"id": "sbx-test"},
+                        {**SANDBOX_RESPONSE, "status": "created", "queued": True, "spec": spec},
+                        {**SANDBOX_RESPONSE, "queued": False, "spec": spec},
+                    ])
+                    try:
+                        sandbox = await client.create_sandbox(
+                            image=image, queue=True, cpu=cpu, memory=1, storage=10,
+                            gpu_type=gpu_type, gpu_count=gpu_count,
+                        )
+                        client.resolve_image.assert_awaited_once_with(
+                            image, gated_features=None, spec=spec, queue=True
+                        )
+                        body = client._request.await_args_list[0].args[2]
+                        self.assertIs(body["queue"], True)
+                        self.assertEqual(body["spec"], spec)
+                        self.assertTrue(sandbox.queued)
+                        self.assertTrue(sandbox.info.queued)
+                        self.assertIsNone(sandbox.info.resources.gpu_type)
+                        self.assertEqual(sandbox.info.resources.gpu_count, 0)
+                        self.assertEqual(sandbox.info.resources.cpu, cpu)
+                        await sandbox.refresh()
+                        self.assertFalse(sandbox.queued)
+                    finally:
+                        await client.close()
+
     def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
         client = AsyncClient(config(directory))
         prepare_key(client.config.paths)
@@ -1643,6 +1702,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 timeout: float | None = 7200,
                 gated_features=None,
                 spec=None,
+                queue=False,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
                 self.assertEqual(timeout, 7200)
@@ -3068,7 +3128,32 @@ else:
                 await sandbox.wait_until_ready()
             await client.close()
 
-    async def test_terminate_waits_for_startup_before_stopping(self) -> None:
+    async def test_terminate_stops_created_sandbox_without_waiting_for_capacity(self) -> None:
+        # Older responses can omit queued, and a queued sandbox may already
+        # have placement. Cancellation must not depend on the cached flag.
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                with tempfile.TemporaryDirectory() as directory:
+                    client = AsyncClient(config(directory))
+                    sandbox = AsyncSandbox._from_response(client, {
+                        **SANDBOX_RESPONSE, "status": "created", "queued": queued, "ssh": None,
+                    })
+                    client._request = mock.AsyncMock(side_effect=[
+                        {}, {**SANDBOX_RESPONSE, "status": "finished", "queued": False},
+                    ])
+                    try:
+                        with mock.patch.object(sandbox, "_wait_for_startup", new=mock.AsyncMock()) as wait:
+                            await sandbox.terminate(timeout=0.01)
+                        wait.assert_not_awaited()
+                        self.assertEqual([call.args for call in client._request.await_args_list], [
+                            ("POST", "/sandboxes/sbx-test/stop"),
+                            ("GET", "/sandboxes/sbx-test"),
+                        ])
+                        self.assertEqual(sandbox.status, SandboxStatus.FINISHED)
+                    finally:
+                        await client.close()
+
+    async def test_terminate_waits_only_when_api_requires_startup_before_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             sandbox = AsyncSandbox._from_response(
@@ -3076,6 +3161,7 @@ else:
             )
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[
+                    ConflictError("not ready", code="sandbox_not_ready", status=409),
                     still_starting(),
                     SANDBOX_RESPONSE,
                     {},
@@ -3090,6 +3176,7 @@ else:
             self.assertEqual(
                 [call.args for call in client._request.await_args_list],
                 [
+                    ("POST", "/sandboxes/sbx-test/stop"),
                     ("GET", "/sandboxes/sbx-test/wait"),
                     ("GET", "/sandboxes/sbx-test/wait"),
                     ("POST", "/sandboxes/sbx-test/stop"),
@@ -3441,6 +3528,26 @@ else:
 
 
 class SynchronousSandboxTest(unittest.TestCase):
+    def test_queue_is_forwarded_through_sync_and_async_creation_adapters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client, native = self.sandbox(directory)
+            native._info = AsyncSandbox._from_response(client._client, {
+                **SANDBOX_RESPONSE, "status": "created", "queued": True,
+            }).info
+            try:
+                with mock.patch.object(AsyncSandbox, "create", new=mock.AsyncMock(return_value=native)) as create:
+                    created = client.create_sandbox(queue=True, cpu=1, memory=1, gpu_type=GPUType.NONE, gpu_count=0)
+                    self.assertTrue(created.queued)
+                    self.assertIs(create.await_args.kwargs["queue"], True)
+                    self.assertEqual(create.await_args.kwargs["cpu"], 1)
+                    create.reset_mock()
+                    created = asyncio.run(client.create_sandbox_async(queue=True, cpu=2, memory=1))
+                    self.assertTrue(created.queued)
+                    self.assertIs(create.await_args.kwargs["queue"], True)
+                    self.assertEqual(create.await_args.kwargs["cpu"], 2)
+            finally:
+                client.close()
+
     def sandbox(self, directory: str) -> tuple[Sandbox, Client, AsyncSandbox]:
         client = Client(config(directory))
         prepare_key(client.config.paths)

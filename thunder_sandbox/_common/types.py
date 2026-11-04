@@ -37,6 +37,7 @@ class SandboxStatus(str, Enum):
 
 
 class GPUType(str, Enum):
+    NONE = "none"
     A6000 = "A6000"
     A100 = "A100"       # NVIDIA A100 40 GiB
     A100XL = "A100XL"   # NVIDIA A100 80 GiB
@@ -136,3 +137,4 @@ class SandboxInfo:
     image_id: str | None = None
     network_policy_generation: int | None = None
     desired_network_policy_generation: int | None = None
+    queued: bool = False
