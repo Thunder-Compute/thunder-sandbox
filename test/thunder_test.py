@@ -54,6 +54,9 @@ from thunder_sandbox.asynchronous._jobs import (
     new_job_id,
     submission_command,
 )
+from thunder_sandbox.asynchronous._transfer import (
+    parse_transfer_path as _parse_transfer_path,
+)
 from thunder_sandbox.asynchronous._ssh import (
     SSH_CONNECT_TIMEOUT_SECONDS,
     SSHConnectionManager,
@@ -2147,6 +2150,18 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             await sandbox._retry_scp(transfer, name="transfer")
             self.assertEqual(transfer.await_count, 2)
             await client.close()
+
+    def test_contents_of_the_root_keep_the_root_path(self) -> None:
+        for path, separator, expected in (
+            ("/.", "/", "/"),
+            ("/logs/.", "/", "/logs"),
+            ("logs/.", "/", "logs"),
+            ("C:\\.", "\\", "C:\\"),
+        ):
+            with self.subTest(path=path):
+                parsed = _parse_transfer_path(path, separator=separator)
+                self.assertTrue(parsed.contents_only)
+                self.assertEqual(parsed.path, expected)
 
     async def test_contents_download_requests_the_directory_itself(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
