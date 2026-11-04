@@ -3111,7 +3111,7 @@ else:
             with mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.asyncio.sleep", new=mock.AsyncMock()
             ) as sleep, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.random.uniform", return_value=0
+                "thunder_sandbox.asynchronous._polling.random.uniform", return_value=0
             ):
                 self.assertIs(await sandbox.wait_until_ready(), sandbox)
             sleep.assert_awaited_once_with(3)

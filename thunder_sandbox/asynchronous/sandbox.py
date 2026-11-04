@@ -6,7 +6,6 @@ import asyncio
 import math
 import os
 import posixpath
-import random
 import shlex
 import shutil
 import tempfile
@@ -18,7 +17,6 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast, overload
-from urllib.parse import quote
 
 import asyncssh
 
@@ -47,7 +45,6 @@ from ..image import Image
 from . import credentials
 from ._jobs import (
     JobSpec,
-    JobState,
     JobStatus,
     RemoteJobPaths,
     cleanup_command,
@@ -56,6 +53,16 @@ from ._jobs import (
     signal_command,
     submission_command,
     validate_job_id,
+)
+from ._polling import (
+    OUTAGE_GRACE_SECONDS,
+    WAIT_REPLY_GRACE_SECONDS,
+    WAIT_WINDOW_MAX_SECONDS,  # noqa: F401  (kept importable from this module)
+    _datetime,
+    _earliest_deadline,
+    _path_segment,
+    _sleep_until_next_poll,
+    _wait_window,
 )
 from ._ssh import (
     RetryableSSHOperationError,
@@ -71,12 +78,6 @@ from ._transfer import (
 from .client import Client
 from .process import Process
 
-OUTAGE_GRACE_SECONDS = 30.0
-# The API refuses a readiness wait held open longer than this per request.
-WAIT_WINDOW_MAX_SECONDS = 30.0
-# How much longer than its window one wait request may take to answer before
-# the client gives up on it, covering transit and a server that has stalled.
-WAIT_REPLY_GRACE_SECONDS = 15.0
 _CONTAINER_NAME = "thunder-sandbox"
 _CONTAINER_BUSYBOX = "/busybox"
 
@@ -1543,39 +1544,11 @@ fi
                 await self._client.close()
 
 
-def _path_segment(value: str) -> str:
-    if not value:
-        raise InvalidRequestError("sandbox ID cannot be empty")
-    return quote(value, safe="")
-
-
-def _earliest_deadline(first: float | None, second: float | None) -> float | None:
-    if first is None:
-        return second
-    if second is None:
-        return first
-    return min(first, second)
-
-
 def _decode_status(value: str, *, context: str) -> JobStatus:
     try:
         return JobStatus.from_json(value.strip())
     except ValueError as exc:
         raise SandboxFailedError(context) from exc
-
-
-@overload
-def _datetime(value: object, optional: Literal[False] = False) -> datetime: ...
-
-
-@overload
-def _datetime(value: object, optional: Literal[True]) -> datetime | None: ...
-
-
-def _datetime(value: object, optional: bool = False) -> datetime | None:
-    if value in (None, ""):
-        return None if optional else datetime.fromtimestamp(0).astimezone()
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
 def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> SandboxInfo:
@@ -1652,8 +1625,6 @@ def _network_policy_from_response(value: object) -> NetworkPolicy:
     )
 
 
-def _known_host_name(ssh: SSHConnection) -> str:
-    return ssh.host if ssh.port == 22 else f"[{ssh.host}]:{ssh.port}"
 # Host keys are remembered only for the life of this process. A sandbox is
 # short-lived and nothing verifies the key on the first connection, so a file
 # would add staleness and an unwritable-home failure mode without buying any
@@ -1752,32 +1723,6 @@ def _network_policy_request(
         else ["*"]
     )
     return "restricted", cidrs, domains
-
-
-def _wait_window(deadline: float | None) -> float:
-    """Seconds to ask the API to hold one readiness wait open.
-
-    The client deadline, not the server's maximum, is the binding bound once
-    it is nearer. Rounded to the millisecond so the query string stays plain,
-    and never below one: the API rejects a window of zero, and a deadline that
-    has just passed is reported by the caller, not by a 400.
-    """
-    window = WAIT_WINDOW_MAX_SECONDS
-    if deadline is not None:
-        window = min(window, deadline - time.monotonic())
-    window = max(0.001, round(window, 3))
-    assert 0.0 < window <= WAIT_WINDOW_MAX_SECONDS, window
-    return window
-
-
-async def _sleep_until_next_poll(
-    deadline: float | None, delay: float, retry_after: float | None = None
-) -> None:
-    delay = max(delay, retry_after or 0.0)
-    delay += random.uniform(0.0, min(delay * 0.2, 1.0))
-    if deadline is not None:
-        delay = max(0.0, min(delay, deadline - time.monotonic()))
-    await asyncio.sleep(delay)
 
 
 async def _stop_sandbox(
