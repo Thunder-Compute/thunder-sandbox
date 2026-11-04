@@ -1545,14 +1545,21 @@ fi
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self.status == SandboxStatus.CREATED:
+            if self.status.terminal:
+                return
+            try:
+                await _stop_sandbox(self._client, self.id, deadline=deadline)
+            except ConflictError as exc:
+                # Queued sandboxes can stop before readiness. Only fall back
+                # to waiting if the API explicitly requires startup to finish.
+                if exc.code != "sandbox_not_ready" or self.status != SandboxStatus.CREATED:
+                    raise
                 if not await self._wait_for_startup(deadline):
                     raise SandboxTimeoutError(
                         f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
-                    )
-            if self.status.terminal:
-                return
-            await _stop_sandbox(self._client, self.id, deadline=deadline)
+                    ) from exc
+                if not self.status.terminal:
+                    await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
         finally:
             await self._close_connection()

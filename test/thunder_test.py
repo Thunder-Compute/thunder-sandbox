@@ -3128,7 +3128,32 @@ else:
                 await sandbox.wait_until_ready()
             await client.close()
 
-    async def test_terminate_waits_for_startup_before_stopping(self) -> None:
+    async def test_terminate_stops_created_sandbox_without_waiting_for_capacity(self) -> None:
+        # Older responses can omit queued, and a queued sandbox may already
+        # have placement. Cancellation must not depend on the cached flag.
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                with tempfile.TemporaryDirectory() as directory:
+                    client = AsyncClient(config(directory))
+                    sandbox = AsyncSandbox._from_response(client, {
+                        **SANDBOX_RESPONSE, "status": "created", "queued": queued, "ssh": None,
+                    })
+                    client._request = mock.AsyncMock(side_effect=[
+                        {}, {**SANDBOX_RESPONSE, "status": "finished", "queued": False},
+                    ])
+                    try:
+                        with mock.patch.object(sandbox, "_wait_for_startup", new=mock.AsyncMock()) as wait:
+                            await sandbox.terminate(timeout=0.01)
+                        wait.assert_not_awaited()
+                        self.assertEqual([call.args for call in client._request.await_args_list], [
+                            ("POST", "/sandboxes/sbx-test/stop"),
+                            ("GET", "/sandboxes/sbx-test"),
+                        ])
+                        self.assertEqual(sandbox.status, SandboxStatus.FINISHED)
+                    finally:
+                        await client.close()
+
+    async def test_terminate_waits_only_when_api_requires_startup_before_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             sandbox = AsyncSandbox._from_response(
@@ -3136,6 +3161,7 @@ else:
             )
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[
+                    ConflictError("not ready", code="sandbox_not_ready", status=409),
                     still_starting(),
                     SANDBOX_RESPONSE,
                     {},
@@ -3150,6 +3176,7 @@ else:
             self.assertEqual(
                 [call.args for call in client._request.await_args_list],
                 [
+                    ("POST", "/sandboxes/sbx-test/stop"),
                     ("GET", "/sandboxes/sbx-test/wait"),
                     ("GET", "/sandboxes/sbx-test/wait"),
                     ("POST", "/sandboxes/sbx-test/stop"),
