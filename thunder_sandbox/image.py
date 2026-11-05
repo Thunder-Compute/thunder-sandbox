@@ -24,12 +24,13 @@ _RECIPE_DOMAIN = b"thunder-sandbox-dockerfile-recipe-v1\0"
 class Image:
     """A lazily resolved container image for a sandbox."""
 
-    _source: Literal["registry", "dockerfile"]
+    _source: Literal["registry", "dockerfile", "id"]
     _registry_url: str | None = None
     _registry_username: str | None = None
     _registry_password: str | None = None
     _context_directory: Path | None = None
     _display_name: str | None = None
+    _image_id: str | None = None
 
     @staticmethod
     def from_registry(
@@ -83,10 +84,24 @@ class Image:
             _display_name=display_name,
         )
 
+    @staticmethod
+    def from_id(image_id: str) -> "Image":
+        """Refer to an existing Thunder-managed image by its ID.
+
+        Nothing is built or imported: sandbox creation reads the image once
+        and requires it to be ready. A snapshot's pinned image is available
+        as ``snapshot.image_id``.
+        """
+        if not isinstance(image_id, str) or not image_id.strip():
+            raise InvalidRequestError("image ID must be a non-empty string")
+        return Image(_source="id", _image_id=image_id)
+
     def __repr__(self) -> str:
         if self._source == "registry":
             credentials = ", credentials=<redacted>" if self._registry_username else ""
             return f"Image.from_registry({self._registry_url!r}{credentials})"
+        if self._source == "id":
+            return f"Image.from_id({self._image_id!r})"
         return f"Image.from_dockerfile({str(self._context_directory)!r})"
 
 

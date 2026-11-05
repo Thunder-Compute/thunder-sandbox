@@ -15,6 +15,7 @@ from ._common.exceptions import (
     SandboxTimeoutError,
     ServiceUnavailableError,
     SnapshotFailedError,
+    SnapshotTimeoutError,
     ThunderError,
     UnsupportedFeatureError,
 )
@@ -37,6 +38,6 @@ __all__ = [
     "NetworkPolicy", "NotFoundError", "Pricing", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
-    "SnapshotFailedError", "SnapshotInfo", "SnapshotStatus",
+    "SnapshotFailedError", "SnapshotInfo", "SnapshotStatus", "SnapshotTimeoutError",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError",
 ]

@@ -10,9 +10,12 @@ from .client import Client
 class Snapshot:
     """A durable disk snapshot of a sandbox.
 
-    It holds the source sandbox's disk only: restoring it creates a new
-    sandbox with those files, not the source's memory, processes, or GPU
-    state. It outlives its source sandbox until it is deleted.
+    It holds the source sandbox's whole disk, including the container's
+    changes to its image, but not the image itself, which it pins as
+    :attr:`image_id`. Restoring it creates a new sandbox with those files, not
+    the source's memory, processes, or GPU state. It outlives its source
+    sandbox until it is deleted. A snapshot is not an image and cannot be
+    passed as ``image=``.
     """
 
     def __init__(
@@ -78,6 +81,11 @@ class Snapshot:
 
     @property
     def image_id(self) -> str | None:
+        """The image this snapshot is pinned to, which a restore attaches.
+
+        A restore always runs on this image, inferred by the backend;
+        ``Sandbox.create`` rejects any ``image`` passed with ``snapshot``.
+        """
         return self._snapshot.image_id
 
     @property
@@ -92,20 +100,20 @@ class Snapshot:
         await self._client._bridge.run_async(self._snapshot.refresh())
         return self
 
-    def wait_until_ready(self, *, timeout: float | None = 300) -> "Snapshot":
-        """Wait until capture finishes; ``timeout`` of ``None`` waits indefinitely.
+    def wait_until_ready(self, *, timeout: float | None = None) -> "Snapshot":
+        """Wait until capture finishes; by default, for as long as it takes.
 
         Holds the API's snapshot wait open where it is offered and polls where
         it is not, remembering which per client. Raises
-        ``SnapshotFailedError`` when capture fails and ``SandboxTimeoutError``
-        when ``timeout`` passes first. Neither a timeout nor cancellation
-        deletes the snapshot.
+        ``SnapshotFailedError`` when capture fails and ``SnapshotTimeoutError``
+        when ``timeout`` seconds pass first. Neither a timeout nor
+        cancellation deletes the snapshot.
         """
         self._client._bridge.run(self._snapshot.wait_until_ready(timeout=timeout))
         return self
 
     async def wait_until_ready_async(
-        self, *, timeout: float | None = 300
+        self, *, timeout: float | None = None
     ) -> "Snapshot":
         await self._client._bridge.run_async(
             self._snapshot.wait_until_ready(timeout=timeout)

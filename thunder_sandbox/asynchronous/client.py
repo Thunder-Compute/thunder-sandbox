@@ -239,6 +239,13 @@ class Client:
 
         Optional ``spec`` supplies sandbox resources for a capacity check; it
         does not reserve resources. Omit it for standalone image preparation.
+
+        An :meth:`Image.from_id` image is read once, not built or waited for:
+        a ready image resolves, one still building raises
+        :class:`ConflictError` with code ``sandbox_image_not_ready``, a failed
+        one raises :class:`SandboxFailedError`, and a missing one
+        :class:`NotFoundError`. ``gated_features`` and ``spec`` do not apply
+        to it.
         """
         from ..image import Image, _create_canonical_build_context
 
@@ -247,6 +254,21 @@ class Client:
         if timeout is not None and timeout <= 0:
             raise InvalidRequestError("image timeout must be positive or None")
         deadline = None if timeout is None else time.monotonic() + timeout
+
+        if image._source == "id":
+            assert image._image_id is not None
+            response = await self._request(
+                "GET",
+                f"/sandbox-images/{_path_segment(image._image_id)}",
+                timeout=self._request_timeout(deadline),
+            )
+            if response.get("state") == "BUILDING":
+                raise ConflictError(
+                    f"image {image._image_id} is not ready yet",
+                    code="sandbox_image_not_ready",
+                )
+            # Ready, failed, or unknown: each is answered without polling.
+            return await self._wait_for_image(response, deadline=deadline)
 
         context = None
         try:

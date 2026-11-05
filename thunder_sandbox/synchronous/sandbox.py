@@ -62,8 +62,12 @@ class Sandbox:
         exit leaves the sandbox VM running until termination or TTL expiry.
 
         ``snapshot`` (a :class:`Snapshot` or its ID) restores a ready
-        snapshot's disk into the new sandbox instead of starting from an
-        image; it cannot be combined with ``image``.
+        snapshot's disk into the new sandbox, which runs the image the
+        snapshot was taken on. Omit ``image``: the backend infers it from the
+        snapshot, and passing both raises ``InvalidRequestError``. A
+        :class:`Snapshot` is never accepted as ``image``. Every other option
+        applies as for a fresh sandbox, and a ``storage`` below the
+        snapshot's size is grown to fit it.
         """
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -491,7 +495,11 @@ class Sandbox:
         )
 
     def snapshot(self, *, name: str | None = None) -> Snapshot:
-        """Start a durable snapshot of this ready sandbox's disk.
+        """Start a durable snapshot of this ready sandbox's whole disk.
+
+        The snapshot captures the sandbox's entire disk, including files
+        outside the container, and pins the sandbox's image; memory and
+        running processes are not captured. This sandbox keeps running.
 
         Returns as soon as capture starts; wait for it with
         :meth:`Snapshot.wait_until_ready`. The snapshot uses this sandbox's

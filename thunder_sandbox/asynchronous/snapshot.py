@@ -10,8 +10,8 @@ from .._common.exceptions import (
     InvalidRequestError,
     NotFoundError,
     RetryableError,
-    SandboxTimeoutError,
     SnapshotFailedError,
+    SnapshotTimeoutError,
     _WaitWindowElapsedError,
 )
 from .._common.types import SnapshotInfo, SnapshotStatus
@@ -34,9 +34,12 @@ SNAPSHOT_POLL_MAX_SECONDS = 10.0
 class Snapshot:
     """A native asynchronous handle to a durable sandbox disk snapshot.
 
-    A snapshot holds the source sandbox's disk only: restoring it creates a
-    new sandbox with those files, not the source's memory, processes, or GPU
-    state. It outlives its source sandbox until it is deleted.
+    A snapshot holds the source sandbox's whole disk, including the
+    container's changes to its image, but not the image itself, which it pins
+    as :attr:`image_id`. Restoring it creates a new sandbox with those files,
+    not the source's memory, processes, or GPU state. It outlives its source
+    sandbox until it is deleted. A snapshot is not an image and cannot be
+    passed as ``image=``.
     """
 
     def __init__(
@@ -86,6 +89,11 @@ class Snapshot:
 
     @property
     def image_id(self) -> str | None:
+        """The image this snapshot is pinned to, which a restore attaches.
+
+        A restore always runs on this image, inferred by the backend;
+        ``Sandbox.create`` rejects any ``image`` passed with ``snapshot``.
+        """
         return self._info.image_id
 
     @property
@@ -97,16 +105,17 @@ class Snapshot:
         self._info = _snapshot_from_response(response)
         return self
 
-    async def wait_until_ready(self, *, timeout: float | None = 300) -> "Snapshot":
-        """Wait until capture finishes; ``timeout`` of ``None`` waits indefinitely.
+    async def wait_until_ready(self, *, timeout: float | None = None) -> "Snapshot":
+        """Wait until capture finishes; by default, for as long as it takes.
 
         Holds the API's snapshot wait open where it is offered and polls where
         it is not, remembering which per client. Raises
         :class:`SnapshotFailedError` when capture fails and
-        :class:`SandboxTimeoutError` when ``timeout`` passes first. Neither a
-        timeout nor cancellation deletes the snapshot: capture continues
-        server-side and a later wait can pick it up. A snapshot deleted while
-        this waits surfaces as :class:`NotFoundError` from the next read.
+        :class:`SnapshotTimeoutError` when ``timeout`` seconds pass first.
+        Neither a timeout nor cancellation deletes the snapshot: capture
+        continues server-side and a later wait can pick it up. A snapshot
+        deleted while this waits surfaces as :class:`NotFoundError` from the
+        next read.
         """
         if timeout is not None and not timeout >= 0:
             raise InvalidRequestError("snapshot timeout cannot be negative")
@@ -152,8 +161,8 @@ class Snapshot:
             await _sleep_until_next_poll(deadline, delay)
             delay = min(SNAPSHOT_POLL_MAX_SECONDS, delay * 2.0)
 
-    def _timeout_error(self, timeout: float | None) -> SandboxTimeoutError:
-        return SandboxTimeoutError(
+    def _timeout_error(self, timeout: float | None) -> SnapshotTimeoutError:
+        return SnapshotTimeoutError(
             f"snapshot {self.id} did not become ready within {timeout} seconds "
             f"(status: {self.status.value}); this wait did not delete it"
         )

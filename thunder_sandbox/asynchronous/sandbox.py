@@ -129,10 +129,12 @@ class Sandbox:
         defaults.
 
         ``snapshot`` (a :class:`Snapshot` or its ID) restores a ready
-        snapshot's disk into the new sandbox, which runs the source's image;
-        it cannot be combined with ``image``. Every other option applies as
-        for a fresh sandbox, and a ``storage`` below the snapshot's size is
-        grown to fit it.
+        snapshot's disk into the new sandbox, which runs the image the
+        snapshot was taken on. Omit ``image``: the backend infers it from the
+        snapshot, and passing both raises :class:`InvalidRequestError`. A
+        :class:`Snapshot` is never accepted as ``image``. Every other option
+        applies as for a fresh sandbox, and a ``storage`` below the
+        snapshot's size is grown to fit it.
         """
         _validate_create_options(
             timeout=timeout,
@@ -1369,13 +1371,17 @@ fi
         await self._ssh_manager.close()
 
     async def snapshot(self, *, name: str | None = None) -> Snapshot:
-        """Start a durable snapshot of this ready sandbox's disk.
+        """Start a durable snapshot of this ready sandbox's whole disk.
+
+        The snapshot captures the sandbox's entire disk, including files
+        outside the container, and pins the sandbox's image; memory and
+        running processes are not captured. This sandbox keeps running.
 
         Returns as soon as capture starts; wait for it with
-        :meth:`Snapshot.wait_until_ready`. Only the disk is captured, not
-        memory or running processes. The snapshot uses this sandbox's client,
-        so a sandbox that owns its client closes it on :meth:`terminate`:
-        finish with the snapshot handle first, or pass a client explicitly.
+        :meth:`Snapshot.wait_until_ready`. The snapshot uses this sandbox's
+        client, so a sandbox that owns its client closes it on
+        :meth:`terminate`: finish with the snapshot handle first, or pass a
+        client explicitly.
         """
         return await self._client.create_snapshot(self.id, name=name)
 
@@ -1721,15 +1727,12 @@ def _validate_create_options(
     if image is not None and not isinstance(image, Image):
         raise InvalidRequestError("image must be an Image")
     if snapshot is not None:
-        if image is not None:
-            raise InvalidRequestError(
-                "image and snapshot cannot be combined: a restored sandbox "
-                "uses its snapshot's image"
-            )
         if not isinstance(snapshot, Snapshot) and (
             not isinstance(snapshot, str) or not snapshot
         ):
             raise InvalidRequestError("snapshot must be a Snapshot or a snapshot ID")
+        if image is not None:
+            raise InvalidRequestError("pass snapshot or image, not both")
     _validate_network_policy_options(
         block_network=block_network,
         outbound_cidr_allowlist=outbound_cidr_allowlist,

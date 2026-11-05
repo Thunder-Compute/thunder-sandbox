@@ -89,6 +89,14 @@ class SnapshotFailedError(ThunderError):
     """
 
 
+class SnapshotTimeoutError(ThunderError, TimeoutError):
+    """A wait for a sandbox snapshot exceeded its timeout.
+
+    The wait never deletes the snapshot: capture continues server-side, and a
+    later wait can pick it up.
+    """
+
+
 class _WaitWindowElapsedError(ThunderError):
     """One bounded server-side readiness wait ended with the sandbox still starting.
 

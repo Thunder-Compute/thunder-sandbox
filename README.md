@@ -323,6 +323,8 @@ finally:
 
 `Image.from_registry(...)` uses the same image-command behavior. Inherited defaults count too: a base image's shell or interpreter command can exit immediately when started without interactive input.
 
+`Image.from_id(image_id)` refers to an image Thunder has already prepared, such as the `id` returned by `client.resolve_image(...)`. Nothing is built: creation reads the image once and raises `ConflictError` while it is still building.
+
 If both `ENTRYPOINT` and `CMD` are absent or empty, the sandbox stays available for `sandbox.exec(...)` without running an initial command. To prevent an inherited command from running, clear both defaults:
 
 ```dockerfile
@@ -349,7 +351,7 @@ agent = sandbox.exec("id", user="1000:1000")
 
 ## Snapshots
 
-A snapshot is a durable copy of a ready sandbox's disk. Restoring it creates a new sandbox whose files match the source at capture time. It outlives the source sandbox, so you can terminate the source once the snapshot is ready:
+A sandbox with an image runs that image as a container inside a VM, in two layers. The image is the lower layer: Thunder attaches it read-only from its image store and never writes to it. Everything the container changes (files added, replaced, or deleted) is the upper layer, stored on the VM's root disk alongside the guest OS and `/home/ubuntu`. A snapshot is a durable copy of that whole root disk, upper layer included, but not of the image. It records the image it was taken on as `snapshot.image_id`, and a restore attaches that image again underneath the restored disk. Because the upper layer only describes changes to that one image, a snapshot cannot be restored onto a different image.
 
 ```python
 with thunder.Client.from_cli() as client:
@@ -358,12 +360,10 @@ with thunder.Client.from_cli() as client:
     source.exec("sh", "-c", "pip install numpy > /root/setup.log").wait()
 
     snapshot = source.snapshot(name="numpy-ready")
-    snapshot.wait_until_ready(timeout=1800)
+    snapshot.wait_until_ready()
     source.terminate()
 
-    restored = client.create_sandbox(
-        snapshot=snapshot, gpu_type=thunder.GPUType.H100, gpu_count=1
-    )
+    restored = client.create_sandbox(snapshot=snapshot)
     try:
         restored.wait_until_ready()
         process = restored.exec("cat", "/root/setup.log")
@@ -373,24 +373,49 @@ with thunder.Client.from_cli() as client:
         restored.terminate()
 ```
 
-Snapshots capture disk state only. They do not capture memory, running processes, open connections, or GPU state. A restored sandbox starts fresh from that disk: its image command runs again, and `wait_until_ready()` behaves as it does for any new sandbox.
+`snapshot()` starts capturing the sandbox's whole disk and returns at once; the source keeps running. Snapshotting a sandbox that is not ready raises `ConflictError`, as does exceeding the organization's snapshot limit; delete a snapshot before creating another.
 
-`create_sandbox(snapshot=...)` accepts a `Snapshot` or its ID and cannot be combined with `image`, which raises `InvalidRequestError` before any request. The restored sandbox uses the source's image. Every other option applies as usual, including a different GPU type or count. A `storage` value smaller than the snapshot is grown to fit it. Restoring a snapshot that is not yet ready raises `ConflictError`.
+`wait_until_ready()` waits until capture finishes, with no deadline unless you pass `timeout`. It holds the request open on the API where it offers a snapshot wait and polls otherwise. A failed capture raises `SnapshotFailedError`, whose `code` is the recorded failure code. When `timeout` passes first, it raises `SnapshotTimeoutError`. A timeout or cancellation does not delete the snapshot: capture continues server-side, and a later wait picks it up. A snapshot deleted while waiting raises `NotFoundError`.
 
-`wait_until_ready()` waits until capture finishes, holding the request open on the API where it offers a snapshot wait and polling otherwise. A failed capture raises `SnapshotFailedError`, whose `failure_code` and `failure` give the recorded reason. When `timeout` passes first, it raises `SandboxTimeoutError`. A timeout or cancellation does not delete the snapshot: capture continues server-side, and a later wait picks it up. A snapshot deleted while waiting raises `NotFoundError`.
+A snapshot outlives its source, so you can terminate the source once the snapshot is ready. A snapshot uses the client of the sandbox that created it, and a sandbox created without an explicit client closes its own client on `terminate()`. In that case, wait on the snapshot before terminating the source, or use a shared `Client` as shown above.
 
-A snapshot uses the client of the sandbox that created it. A sandbox created without an explicit client closes its own client on `terminate()`. In that case, wait on the snapshot before terminating the source, or use a shared `Client` as shown above.
+`create_sandbox(snapshot=...)` accepts a `Snapshot` or its ID and starts a new sandbox from that disk. Restoring a snapshot that is not yet ready raises `ConflictError`. You do not pass `image`: the snapshot's own image is used and reported as `image_id` on the restored sandbox. Passing `image` together with `snapshot` raises `InvalidRequestError`. A `Snapshot` is not an image and is rejected as `image=`.
+
+One snapshot can start any number of sandboxes, each with its own copy of the disk:
+
+```python
+workers = [client.create_sandbox(snapshot=snapshot) for _ in range(4)]
+```
+
+To restore in a later process, store the snapshot's ID and reload it. `Snapshot.from_id` reads the snapshot once, so its `status` is current:
+
+```python
+snapshot_id = snapshot.id  # keep this in your own database or config
+
+with thunder.Client.from_cli() as client:
+    snapshot = thunder.Snapshot.from_id(snapshot_id, client=client)
+    restored = client.create_sandbox(snapshot=snapshot)
+```
+
+Keep these limits in mind:
+
+- Snapshots capture disk state only. They do not capture memory, running processes, open connections, or GPU state. A restored sandbox starts fresh from that disk: its image command runs again, and `wait_until_ready()` behaves as it does for any new sandbox.
+- The whole disk is captured, including writes made in the VM outside the container.
+- Capture is crash-consistent, like a sudden power loss: a file that a process is still writing may be incomplete. Stop your own processes, or have them flush their files, before calling `snapshot()`.
+- The image is pinned. It is inferred from the snapshot (`snapshot.image_id`) and cannot be passed or swapped for another image.
+
+Every other create option applies to a restore as usual, including a different GPU type or count, for example `create_sandbox(snapshot=snapshot, gpu_type=thunder.GPUType.H100, gpu_count=1)`. A `storage` value smaller than the snapshot (`snapshot.info.storage_gib`) is grown to fit it.
 
 ```python
 with thunder.Client.from_cli() as client:
     for snapshot in client.list_snapshots(status=thunder.SnapshotStatus.READY):
-        print(snapshot.id, snapshot.name, snapshot.info.storage_gib)
+        print(snapshot.id, snapshot.name, snapshot.image_id)
 
     snapshot = client.get_snapshot("snap-your-id")
     snapshot.delete()
 ```
 
-`delete()` works in any state and cancels a capture in progress. Creating a snapshot of a sandbox that is not ready raises `ConflictError`. Exceeding the organization's snapshot limit raises `ConflictError`; delete a snapshot before creating another. Every method has an `_async` twin, and the native asynchronous API offers the same operations on `thunder_sandbox.asynchronous.Snapshot`.
+`delete()` works in any state and cancels a capture in progress. Every method has an `_async` twin, and the native asynchronous API offers the same operations on `thunder_sandbox.asynchronous.Snapshot`.
 
 ## Configuration
 
