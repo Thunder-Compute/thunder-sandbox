@@ -196,6 +196,10 @@ the entire remote process group, and reconnects safely if the SSH
 acknowledgement is lost. Jobs which do not exit after a five-second `SIGTERM`
 grace period are stopped with `SIGKILL`; `wait()` then returns `143` or `137`.
 
+Each argument or environment value must be under 128 KiB, the Linux limit; `exec` raises `InvalidRequestError` above that. Upload larger input as a file.
+
+If the connection fails, the SDK reconnects and retries. An operation which keeps failing for ten minutes raises `ConnectionError`; a durable command keeps running, and `get_process()` can recover it.
+
 Commands can set a working directory, environment variables, a timeout, or a
 pseudo-terminal:
 
@@ -209,6 +213,15 @@ process = sandbox.exec(
 )
 ```
 
+To make creation safe to retry, give the sandbox a unique `name`. Names are unique among live sandboxes, so if a create request is interrupted and you can't tell whether it succeeded, `Sandbox.from_name(name)` finds the sandbox if it exists:
+
+```python
+try:
+    sandbox = thunder.Sandbox.create(name=run_name, timeout=900)
+except thunder.ConnectionError:
+    sandbox = thunder.Sandbox.from_name(run_name)
+```
+
 ## Transfer files
 
 ```python
@@ -219,7 +232,7 @@ sandbox.download("/home/ubuntu/results.json", "results.json")
 sandbox.download("/home/ubuntu/checkpoints", "checkpoints", recursive=True)
 ```
 
-Transfers retry from the beginning after a lost connection. Files appear at their destination only after their contents have transferred successfully, so an interrupted transfer does not expose partially transferred files. Directory transfers merge with the destination after the network transfer completes.
+Pass `timeout=` to bound a transfer in seconds; it raises `SandboxTimeoutError` when it expires. Transfers retry from the beginning after a lost connection. Files appear at their destination only after their contents have transferred successfully, so an interrupted transfer does not expose partially transferred files. Directory transfers merge with the destination after the network transfer completes.
 
 ## Network policies
 
@@ -237,6 +250,8 @@ restricted = thunder.Sandbox.create(
 ```
 
 CIDR and domain allowlists are independent. Supply both when restricted workloads need both direct IP and DNS-based access.
+
+Domain allowlists cover TLS connections only, matched on the server name. Plain HTTP to an allowed domain fails, so allow the destination's CIDR as well for tools that need it, such as `apt` with `http://` mirrors.
 
 For policy updates, `None` leaves that dimension unrestricted, while an empty sequence blocks it. Each call replaces the complete policy rather than merging with the previous allowlists.
 

@@ -420,34 +420,42 @@ class Sandbox:
 
     def upload(
         self, local_path: str | os.PathLike[str], remote_path: str, *,
-        recursive: bool = False,
+        recursive: bool = False, timeout: float | None = None,
     ) -> None:
         self._client._bridge.run(
-            self._sandbox.upload(local_path, remote_path, recursive=recursive)
+            self._sandbox.upload(
+                local_path, remote_path, recursive=recursive, timeout=timeout
+            )
         )
 
     async def upload_async(
         self, local_path: str | os.PathLike[str], remote_path: str, *,
-        recursive: bool = False,
+        recursive: bool = False, timeout: float | None = None,
     ) -> None:
         await self._client._bridge.run_async(
-            self._sandbox.upload(local_path, remote_path, recursive=recursive)
+            self._sandbox.upload(
+                local_path, remote_path, recursive=recursive, timeout=timeout
+            )
         )
 
     def download(
         self, remote_path: str, local_path: str | os.PathLike[str], *,
-        recursive: bool = False,
+        recursive: bool = False, timeout: float | None = None,
     ) -> None:
         self._client._bridge.run(
-            self._sandbox.download(remote_path, local_path, recursive=recursive)
+            self._sandbox.download(
+                remote_path, local_path, recursive=recursive, timeout=timeout
+            )
         )
 
     async def download_async(
         self, remote_path: str, local_path: str | os.PathLike[str], *,
-        recursive: bool = False,
+        recursive: bool = False, timeout: float | None = None,
     ) -> None:
         await self._client._bridge.run_async(
-            self._sandbox.download(remote_path, local_path, recursive=recursive)
+            self._sandbox.download(
+                remote_path, local_path, recursive=recursive, timeout=timeout
+            )
         )
 
     def update_network_policy(

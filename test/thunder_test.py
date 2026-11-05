@@ -54,9 +54,13 @@ from thunder_sandbox.asynchronous._jobs import (
     new_job_id,
     submission_command,
 )
+from thunder_sandbox.asynchronous._transfer import (
+    parse_transfer_path as _parse_transfer_path,
+)
 from thunder_sandbox.asynchronous._ssh import (
     SSH_CONNECT_TIMEOUT_SECONDS,
     SSHConnectionManager,
+    SSH_RETRY_BUDGET_SECONDS,
 )
 from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
@@ -618,6 +622,46 @@ class SSHConnectionManagerTest(unittest.IsolatedAsyncioTestCase):
                 mock.AsyncMock(), name="bounded operation", deadline=10.3
             )
         self.assertEqual(opened.await_count, 3)
+
+    async def test_retry_budget_bounds_a_failure_with_no_deadline(self) -> None:
+        now = [0.0]
+
+        async def sleep(delay: float) -> None:
+            now[0] += delay
+
+        manager = SSHConnectionManager(
+            mock.AsyncMock(side_effect=OSError("connection reset")),  # type: ignore[arg-type]
+            sleep=sleep,
+            clock=lambda: now[0],
+            jitter=lambda _start, _end: 0.0,
+        )
+        with self.assertRaisesRegex(ConnectionError, "kept failing"):
+            await manager.run(mock.AsyncMock(), name="oversized request")
+        self.assertGreaterEqual(now[0], SSH_RETRY_BUDGET_SECONDS)
+
+    async def test_long_attempt_starts_a_new_retry_budget(self) -> None:
+        now = [0.0]
+
+        async def sleep(delay: float) -> None:
+            now[0] += delay
+
+        attempts = 0
+
+        async def operation(_connection: object) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                now[0] += SSH_RETRY_BUDGET_SECONDS + 1
+                raise OSError("connection lost mid-transfer")
+            return "done"
+
+        manager = SSHConnectionManager(
+            mock.AsyncMock(return_value=FakeSSHConnection()),  # type: ignore[arg-type]
+            sleep=sleep,
+            clock=lambda: now[0],
+            jitter=lambda _start, _end: 0.0,
+        )
+        self.assertEqual(await manager.run(operation, name="transfer"), "done")
 
     async def test_authentication_failure_is_not_retried(self) -> None:
         opened = mock.AsyncMock(
@@ -2069,49 +2113,16 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 await sandbox.get_process("../escape")
             await client.close()
 
-    async def test_output_sftp_reconnects_and_replays_the_same_byte_offset(self) -> None:
-        class RemoteFile:
-            def __init__(self, outcome: bytes | BaseException) -> None:
-                self.outcome = outcome
-                self.reads: list[tuple[int, int]] = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args: object) -> None:
-                return None
-
-            async def read(self, size: int, offset: int) -> bytes:
-                self.reads.append((size, offset))
-                if isinstance(self.outcome, BaseException):
-                    raise self.outcome
-                return self.outcome
-
-        class SFTPClient:
-            def __init__(self, remote: RemoteFile) -> None:
-                self.remote = remote
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args: object) -> None:
-                return None
-
-            def open(self, _path: str, mode: str) -> RemoteFile:
-                self.assert_mode = mode
-                return self.remote
-
+    async def test_output_read_reconnects_and_replays_the_same_byte_offset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
-            failed_file = RemoteFile(SSHDisconnected("SFTP connection lost"))
-            recovered_file = RemoteFile(b"resumed")
             first = FakeSSHConnection()
             second = FakeSSHConnection()
-            first.start_sftp_client = mock.Mock(  # type: ignore[attr-defined]
-                return_value=SFTPClient(failed_file)
+            first.run = mock.AsyncMock(  # type: ignore[attr-defined]
+                side_effect=SSHDisconnected("connection lost")
             )
-            second.start_sftp_client = mock.Mock(  # type: ignore[attr-defined]
-                return_value=SFTPClient(recovered_file)
+            second.run = mock.AsyncMock(  # type: ignore[attr-defined]
+                return_value=mock.Mock(returncode=0, stdout=b"resumed")
             )
             sandbox._ssh_manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
@@ -2125,10 +2136,119 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(value, b"resumed")
-            self.assertEqual(failed_file.reads, [(4096, 8192)])
-            self.assertEqual(recovered_file.reads, [(4096, 8192)])
-            self.assertTrue(first.closed)
-            await sandbox._close_connection()
+            for connection in (first, second):
+                command = connection.run.await_args.args[0]  # type: ignore[attr-defined]
+                self.assertIn("skip=8192 count=4096", command)
+            await client.close()
+
+    async def test_output_read_reports_a_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            connection = FakeSSHConnection()
+            connection.run = mock.AsyncMock(  # type: ignore[attr-defined]
+                return_value=mock.Mock(returncode=1, stdout=b"")
+            )
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            with self.assertRaisesRegex(SandboxFailedError, "unavailable"):
+                await sandbox._read_job_output("d" * 32, "stderr", offset=0, size=16)
+            await client.close()
+
+    async def test_exec_rejects_an_argument_linux_cannot_accept(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            with self.assertRaisesRegex(InvalidRequestError, "upload larger"):
+                await sandbox.exec("echo", "x" * (128 * 1024))
+            await client.close()
+
+    async def test_large_command_is_submitted_over_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            result = mock.Mock(
+                returncode=0,
+                stdout=JobStatus(JobState.RUNNING, pid=1).to_json(),
+                stderr="",
+            )
+            connection = FakeSSHConnection()
+            connection.run = mock.AsyncMock(return_value=result)  # type: ignore[attr-defined]
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            await sandbox._launch_detached_job(
+                ("echo", "x" * 125_000), workdir=None, env=None
+            )
+            call = connection.run.await_args  # type: ignore[attr-defined]
+            self.assertEqual(call.args, ("sh -s",))
+            self.assertGreater(len(call.kwargs["input"]), 250_000)
+            await client.close()
+
+    async def test_failed_transfer_on_a_live_connection_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            connection = FakeSSHConnection()
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            transfer = mock.AsyncMock(
+                side_effect=asyncssh.SFTPFileIsADirectory("scp failed")
+            )
+            with self.assertRaisesRegex(SandboxFailedError, "scp failed"):
+                await sandbox._retry_scp(transfer, name="transfer")
+            transfer.assert_awaited_once()
+            await client.close()
+
+    async def test_lost_transfer_connection_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            connection = FakeSSHConnection()
+            sandbox._ssh_manager = SSHConnectionManager(
+                mock.AsyncMock(return_value=connection),  # type: ignore[arg-type]
+                sleep=mock.AsyncMock(),
+                jitter=lambda _start, _end: 0.0,
+            )
+            transfer = mock.AsyncMock(
+                side_effect=[asyncssh.SFTPConnectionLost("lost"), None]
+            )
+            await sandbox._retry_scp(transfer, name="transfer")
+            self.assertEqual(transfer.await_count, 2)
+            await client.close()
+
+    def test_contents_of_the_root_keep_the_root_path(self) -> None:
+        for path, separator, expected in (
+            ("/.", "/", "/"),
+            ("/logs/.", "/", "/logs"),
+            ("logs/.", "/", "logs"),
+            ("C:\\.", "\\", "C:\\"),
+        ):
+            with self.subTest(path=path):
+                parsed = _parse_transfer_path(path, separator=separator)
+                self.assertTrue(parsed.contents_only)
+                self.assertEqual(parsed.path, expected)
+
+    async def test_contents_download_requests_the_directory_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            sandbox._ssh_manager._connection = FakeSSHConnection()  # type: ignore[assignment]
+            target = Path(directory) / "target"
+            target.mkdir()
+            requested: list[str] = []
+
+            async def scp(source: tuple[object, str], stage: str, **_kwargs: object) -> None:
+                requested.append(source[1])
+                Path(stage).mkdir()
+                (Path(stage) / "result.txt").write_text("done", encoding="utf-8")
+
+            with mock.patch("thunder_sandbox.asynchronous.sandbox.asyncssh.scp", scp):
+                await sandbox._download_from_guest("/logs/.", target, recursive=True)
+
+            self.assertEqual(requested, ["/logs"])
+            self.assertEqual((target / "result.txt").read_text(encoding="utf-8"), "done")
+            await client.close()
+
+    async def test_upload_timeout_raises_sandbox_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            async def never(*_args: object, **_kwargs: object) -> None:
+                await asyncio.Event().wait()
+
+            with mock.patch.object(sandbox, "_upload", never):
+                with self.assertRaisesRegex(SandboxTimeoutError, "did not finish"):
+                    await sandbox.upload("a", "/b", timeout=0.01)
             await client.close()
 
     async def test_job_cleanup_is_idempotent_after_a_lost_acknowledgement(self) -> None:
@@ -2310,12 +2430,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(spec.job_id, "f" * 32)
             self.assertEqual(status, acknowledgement)
-            submitted = connection.run.await_args.args[0]
+            submitted = connection.run.await_args.kwargs["input"]
             self.assertIn("nohup setsid", submitted)
             self.assertIn("workdir", submitted)
             self.assertIn("echo hello", submitted)
             connection.run.assert_awaited_once_with(
-                submitted, check=False, encoding="utf-8"
+                "sh -s", input=submitted, check=False, encoding="utf-8"
             )
             await client.close()
 
@@ -2342,7 +2462,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(process.is_durable)
 
-            submitted = connection.run.await_args.args[0]
+            submitted = connection.run.await_args.kwargs["input"]
             self.assertIn(
                 "sudo --non-interactive docker exec --interactive", submitted
             )
@@ -2392,8 +2512,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, acknowledgement)
             self.assertTrue(first.closed)
             self.assertEqual(opened.await_count, 2)
-            first_submission = first.run.await_args.args[0]  # type: ignore[attr-defined]
-            second_submission = second.run.await_args.args[0]  # type: ignore[attr-defined]
+            first_submission = first.run.await_args.kwargs["input"]  # type: ignore[attr-defined]
+            second_submission = second.run.await_args.kwargs["input"]  # type: ignore[attr-defined]
             for submitted in (first_submission, second_submission):
                 self.assertIn("/33333333333333333333333333333333", submitted)
                 self.assertIn("touch", submitted)
