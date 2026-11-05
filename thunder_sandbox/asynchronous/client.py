@@ -65,7 +65,6 @@ _ERROR_CODES: dict[str, type[ThunderError]] = {
     # A cap on stored snapshots, like the instance snapshot cap: retrying
     # cannot succeed until one is deleted.
     "sandbox_snapshot_limit_exceeded": ConflictError,
-    "sandbox_snapshot_wait_timeout": _WaitWindowElapsedError,
 }
 
 _ERROR_STATUSES: dict[int, type[ThunderError]] = {
@@ -110,9 +109,6 @@ class Client:
         # property of the API this client talks to: an older API then costs
         # one extra read per client rather than one per wait.
         self._wait_endpoint_available = True
-        # The same, separately, for the snapshot wait: an API can offer one
-        # wait route without the other.
-        self._snapshot_wait_endpoint_available = True
 
     @classmethod
     def from_cli(cls) -> "Client":

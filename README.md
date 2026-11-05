@@ -375,7 +375,7 @@ with thunder.Client.from_cli() as client:
 
 `snapshot()` starts capturing the sandbox's whole disk and returns at once; the source keeps running. Snapshotting a sandbox that is not ready raises `ConflictError`, as does exceeding the organization's snapshot limit; delete a snapshot before creating another.
 
-`wait_until_ready()` waits until capture finishes, with no deadline unless you pass `timeout`. It holds the request open on the API where it offers a snapshot wait and polls otherwise. A failed capture raises `SnapshotFailedError`, whose `code` is the recorded failure code. When `timeout` passes first, it raises `SnapshotTimeoutError`. A timeout or cancellation does not delete the snapshot: capture continues server-side, and a later wait picks it up. A snapshot deleted while waiting raises `NotFoundError`.
+`wait_until_ready()` waits until capture finishes, with no deadline unless you pass `timeout`. It polls the snapshot with a capped backoff, so it may notice a finished capture a few seconds late. A failed capture raises `SnapshotFailedError`, whose `code` is the recorded failure code. When `timeout` passes first, it raises `SnapshotTimeoutError`. A timeout or cancellation does not delete the snapshot: capture continues server-side, and a later wait picks it up. A snapshot deleted while waiting raises `NotFoundError`.
 
 A snapshot outlives its source, so you can terminate the source once the snapshot is ready. A snapshot uses the client of the sandbox that created it, and a sandbox created without an explicit client closes its own client on `terminate()`. In that case, wait on the snapshot before terminating the source, or use a shared `Client` as shown above.
 

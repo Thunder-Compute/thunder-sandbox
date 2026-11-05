@@ -103,8 +103,7 @@ class Snapshot:
     def wait_until_ready(self, *, timeout: float | None = None) -> "Snapshot":
         """Wait until capture finishes; by default, for as long as it takes.
 
-        Holds the API's snapshot wait open where it is offered and polls where
-        it is not, remembering which per client. Raises
+        Polls the snapshot with a capped backoff. Raises
         ``SnapshotFailedError`` when capture fails and ``SnapshotTimeoutError``
         when ``timeout`` seconds pass first. Neither a timeout nor
         cancellation deletes the snapshot.

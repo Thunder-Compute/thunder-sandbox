@@ -8,26 +8,22 @@ from dataclasses import replace
 from .._common.exceptions import (
     ConnectionError,
     InvalidRequestError,
-    NotFoundError,
     RetryableError,
     SnapshotFailedError,
     SnapshotTimeoutError,
-    _WaitWindowElapsedError,
 )
 from .._common.types import SnapshotInfo, SnapshotStatus
 from ._polling import (
     OUTAGE_GRACE_SECONDS,
-    WAIT_REPLY_GRACE_SECONDS,
     _datetime,
     _path_segment,
     _sleep_until_next_poll,
-    _wait_window,
 )
 from .client import Client
 
-# Where the API lacks the snapshot wait route, readiness is polled. Capture
-# takes minutes, so a longer cap than the sandbox waiter's keeps a long capture
-# from spending the read rate limit; a few seconds of latency do not matter.
+# Capture takes minutes, so a longer cap than the sandbox waiter's keeps a long
+# capture from spending the read rate limit; a few seconds of latency do not
+# matter.
 SNAPSHOT_POLL_MAX_SECONDS = 10.0
 
 
@@ -108,8 +104,7 @@ class Snapshot:
     async def wait_until_ready(self, *, timeout: float | None = None) -> "Snapshot":
         """Wait until capture finishes; by default, for as long as it takes.
 
-        Holds the API's snapshot wait open where it is offered and polls where
-        it is not, remembering which per client. Raises
+        Polls the snapshot with a capped backoff. Raises
         :class:`SnapshotFailedError` when capture fails and
         :class:`SnapshotTimeoutError` when ``timeout`` seconds pass first.
         Neither a timeout nor cancellation deletes the snapshot: capture
@@ -124,15 +119,7 @@ class Snapshot:
         delay = 1.0
         while True:
             try:
-                await self._read_capture_state(deadline)
-            except _WaitWindowElapsedError:
-                # A full server-side window passed with capture still running.
-                # That is the wait's normal answer, so open the next at once.
-                failing_since = None
-                delay = 1.0
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise self._timeout_error(timeout) from None
-                continue
+                await self.refresh()
             except (ConnectionError, RetryableError) as exc:
                 now = time.monotonic()
                 failing_since = now if failing_since is None else failing_since
@@ -155,45 +142,15 @@ class Snapshot:
                     code=info.failure_code,
                 )
             if deadline is not None and time.monotonic() >= deadline:
-                raise self._timeout_error(timeout)
+                raise SnapshotTimeoutError(
+                    f"snapshot {self.id} did not become ready within {timeout} "
+                    f"seconds (status: {self.status.value}); this wait did not "
+                    "delete it"
+                )
             # The sleep stops at the deadline and one last read follows it,
             # so readiness arriving during the pause is still seen.
             await _sleep_until_next_poll(deadline, delay)
             delay = min(SNAPSHOT_POLL_MAX_SECONDS, delay * 2.0)
-
-    def _timeout_error(self, timeout: float | None) -> SnapshotTimeoutError:
-        return SnapshotTimeoutError(
-            f"snapshot {self.id} did not become ready within {timeout} seconds "
-            f"(status: {self.status.value}); this wait did not delete it"
-        )
-
-    async def _read_capture_state(self, deadline: float | None) -> None:
-        """Refresh once, holding the request open server-side where the API allows.
-
-        Raises ``_WaitWindowElapsedError`` when capture is still running at the
-        end of the window.
-        """
-        client = self._client
-        if not client._snapshot_wait_endpoint_available:
-            await self.refresh()
-            return
-        window = _wait_window(deadline)
-        try:
-            response = await client._request(
-                "GET",
-                f"{_snapshot_path(self.id)}/wait",
-                query={"timeout_seconds": window},
-                timeout=window + WAIT_REPLY_GRACE_SECONDS,
-            )
-        except NotFoundError:
-            # An API without the route answers 404 exactly as it does for a
-            # missing snapshot. A plain read settles it: it raises the same
-            # NotFoundError if the snapshot is gone, and otherwise doubles as
-            # the first poll of the fallback.
-            await self.refresh()
-            client._snapshot_wait_endpoint_available = False
-            return
-        self._info = _snapshot_from_response(response)
 
     async def delete(self) -> None:
         """Delete the snapshot in any state, cancelling a capture in progress."""
