@@ -1202,8 +1202,12 @@ fi
 
         HTTP requests and polling yield to the event loop. ``timeout`` bounds
         the whole operation; ``None`` waits indefinitely. Timeout or cancellation
-        does not undo an accepted update. ``None`` leaves an allowlist dimension
-        unrestricted; an empty sequence blocks that dimension.
+        does not undo an accepted update.
+
+        Each call replaces the complete policy; previous rules are not
+        preserved. Unless ``block_network=True``, passing both allowlists
+        as ``None`` allows unrestricted outbound access. Otherwise, an
+        omitted or empty allowlist permits nothing through that dimension.
         """
         _validate_network_policy_options(
             block_network=block_network,
