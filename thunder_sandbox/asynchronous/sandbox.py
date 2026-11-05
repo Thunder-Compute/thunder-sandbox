@@ -6,6 +6,7 @@ import asyncio
 import math
 import os
 import posixpath
+import re
 import random
 import shlex
 import shutil
@@ -107,6 +108,7 @@ class Sandbox:
         env: Mapping[str, str | None] | None = None,
         gated_features: Mapping[str, object] | None = None,
         timeout: int | None = 300,
+        queue: bool = False,
         cpu: int | None = None,
         memory: int | None = None,
         storage: int | None = None,
@@ -126,9 +128,18 @@ class Sandbox:
         without running an initial command. Positional arguments launch a
         separate ``exec`` command after readiness; they do not override image
         defaults.
+
+        ``queue=True`` admits image builds and waits for sandbox capacity without
+        a scheduling timeout. Creation without positional commands returns a
+        handle while queued; use ``wait_until_ready(timeout=None)`` to wait
+        indefinitely. ``timeout`` remains the runtime TTL and, with positional
+        commands, the readiness wait limit. CPU-only sandboxes omit GPU options
+        or use ``GPUType.NONE`` with ``gpu_count=0``. ``cpu=1`` and ``cpu=2``
+        are supported, subject to the API resource catalog.
         """
         _validate_create_options(
             timeout=timeout,
+            queue=queue,
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
@@ -145,13 +156,14 @@ class Sandbox:
                 "storage_gib": storage if storage is not None else 50,
                 **(
                     {"gpu_type": gpu_type.value, "gpu_count": gpu_count}
-                    if gpu_type is not None
+                    if gpu_type is not None and gpu_type is not GPUType.NONE
                     else {}
                 ),
             }
             resolved_image = (
                 await resolved_client.resolve_image(
-                    image, gated_features=gated_features, spec=resource_spec
+                    image, gated_features=gated_features, spec=resource_spec,
+                    queue=queue,
                 )
                 if image is not None
                 else None
@@ -162,6 +174,7 @@ class Sandbox:
                 outbound_domain_allowlist,
             )
             request = {
+                **({"queue": True} if queue else {}),
                 "spec": resource_spec,
                 "env": {
                     key: value
@@ -281,6 +294,11 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._info.image_id
+
+    @property
+    def queued(self) -> bool:
+        """Whether the last observed state is waiting for capacity."""
+        return self._info.queued
 
     @property
     def info(self) -> SandboxInfo:
@@ -1573,14 +1591,22 @@ fi
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self.status == SandboxStatus.CREATED:
+            if self.status.terminal:
+                return
+            try:
+                await _stop_sandbox(self._client, self.id, deadline=deadline)
+            except ConflictError as exc:
+                # Queued sandboxes can stop before readiness. Only fall back
+                # to waiting if the API explicitly requires startup to finish.
+                if exc.code != "sandbox_not_ready" or self.status != SandboxStatus.CREATED:
+                    raise
                 if not await self._wait_for_startup(deadline):
                     raise SandboxTimeoutError(
                         f"sandbox {self.id} did not become ready to stop within {timeout} seconds"
-                    )
-            if self.status.terminal:
-                return
-            await _stop_sandbox(self._client, self.id, deadline=deadline)
+                    ) from exc
+                if self.status.terminal:
+                    return
+                await _stop_sandbox(self._client, self.id, deadline=deadline)
             await self.refresh()
         finally:
             await self._close_connection()
@@ -1643,6 +1669,8 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     spec: dict[str, object] = spec_value if isinstance(spec_value, dict) else {}
     policy_value = response.get("network_policy")
     gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
+    if gpu_type is GPUType.NONE:
+        gpu_type = None
     ssh_value = response.get("ssh")
     ssh = None
     if isinstance(ssh_value, dict) and ssh_value.get("host"):
@@ -1674,6 +1702,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         desired_network_policy_generation=_network_policy_generation(
             response.get("desired_network_policy_generation")
         ),
+        queued=response.get("queued") is True,
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
         ssh=ssh,
@@ -1749,6 +1778,7 @@ def _remember_host_key(sandbox_id: str, key: object) -> None:
 def _validate_create_options(
     *,
     timeout: int | None,
+    queue: bool,
     gpu_type: GPUType | None,
     gpu_count: int | None,
     image: Image | None,
@@ -1757,14 +1787,18 @@ def _validate_create_options(
     outbound_domain_allowlist: Sequence[str] | None,
 ) -> None:
 
+    if not isinstance(queue, bool):
+        raise InvalidRequestError("queue must be a boolean")
     if timeout is not None and timeout < 0:
         raise InvalidRequestError("timeout cannot be negative")
     if gpu_type is not None and not isinstance(gpu_type, GPUType):
         raise InvalidRequestError("gpu_type must be a GPUType")
-    if (gpu_type is None) != (gpu_count is None):
-        raise InvalidRequestError("gpu_type and gpu_count must be provided together")
-    if gpu_count is not None and gpu_count not in (1, 2, 4, 8):
-        raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
+    if gpu_type in (None, GPUType.NONE):
+        if gpu_count not in (None, 0):
+            raise InvalidRequestError("CPU-only sandboxes require gpu_count=0 or None")
+    else:
+        if gpu_count not in (1, 2, 4, 8):
+            raise InvalidRequestError("gpu_count must be one of 1, 2, 4, or 8")
     if image is not None and not isinstance(image, Image):
         raise InvalidRequestError("image must be an Image")
     _validate_network_policy_options(
@@ -1874,31 +1908,59 @@ def _remote_command(
     return " ".join(parts)
 
 
-# BusyBox's shell prefers its own applets to PATH, even for ``exec``, so a bare
-# ``sh`` or ``ls`` would run BusyBox rather than the image's program. A path with
-# a slash is always executed as written, so look the command up in PATH first.
-# BusyBox remains the fallback for images which lack the command altogether.
-_CONTAINER_EXEC_IMAGE_COMMAND = """case "$1" in
-*/*) ;;
-*)
+# Names the wrapper sets in the shell that execs the payload. Anything it sets
+# there would overwrite an inherited variable of the same name, so they are
+# prefixed. The search runs in a subshell and leaves IFS and globbing alone.
+_CONTAINER_RESOLVE_COMMAND = """__thunder_name=$1
+shift
+__thunder_path=$(
     set -f
-    old_ifs=$IFS
     IFS=:
+    case "$__thunder_name" in
+    */*) exit 0 ;;
+    esac
     for directory in ${PATH:-}; do
-        candidate=${directory:-.}/$1
+        candidate=${directory:-.}/$__thunder_name
         if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-            shift
-            IFS=$old_ifs
-            set +f
-            exec "$candidate" "$@"
+            printf '%s' "$candidate"
+            exit 0
         fi
     done
-    IFS=$old_ifs
-    set +f
-    ;;
-esac
-exec "$@"
+)
 """
+_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _container_exec_script(unset: Sequence[str], container_busybox: str) -> str:
+    """Exec the payload, preferring the image's program to a BusyBox applet.
+
+    BusyBox's shell prefers its own applets to PATH, even for ``exec``, so a bare
+    ``sh`` or ``ls`` would run BusyBox rather than the image's program. A path
+    with a slash is always executed as written, so the command is looked up in
+    PATH first, and ``exec -a`` keeps the name the caller used as ``argv[0]``.
+    BusyBox remains the fallback for images which lack the command altogether.
+
+    ``unset`` in this shell aborts it on a name which isn't a valid identifier,
+    so ``env -u`` removes those, at the cost of ``argv[0]`` becoming the path.
+    """
+
+    script = _CONTAINER_RESOLVE_COMMAND
+    invalid = [key for key in unset if not _SHELL_NAME.fullmatch(key)]
+    script += "".join(f"unset {key}\n" for key in unset if key not in invalid)
+    if invalid:
+        removals = " ".join(f"-u {shlex.quote(key)}" for key in invalid)
+        return (
+            script
+            + f"exec {shlex.quote(container_busybox)} env {removals} "
+            + '"${__thunder_path:-$__thunder_name}" "$@"\n'
+        )
+    return (
+        script
+        + 'if [ -n "$__thunder_path" ]; then\n'
+        + '    exec -a "$__thunder_name" "$__thunder_path" "$@"\n'
+        + "fi\n"
+        + 'exec "$__thunder_name" "$@"\n'
+    )
 
 
 def _container_session_waiter(container_busybox: str) -> str:
@@ -1990,11 +2052,10 @@ def _container_remote_command(
         container_job = str(container_job_directory(job_id))
         inner = (
             "set -eu\n"
-            f"job={shlex.quote(container_job)}\n"
-            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$job"\n'
-            'printf \'%s\\n\' "$$" >"$job/pid"\n'
-            + "".join(f"unset {shlex.quote(key)} || :\n" for key in unset)
-            + _CONTAINER_EXEC_IMAGE_COMMAND
+            f"__thunder_job={shlex.quote(container_job)}\n"
+            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$__thunder_job"\n'
+            'printf \'%s\\n\' "$$" >"$__thunder_job/pid"\n'
+            + _container_exec_script(unset, _CONTAINER_BUSYBOX)
         )
         # Do not make setsid the docker-exec process. If that process is already
         # a process-group leader, BusyBox forks and lets the observed parent
