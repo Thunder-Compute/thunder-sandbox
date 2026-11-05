@@ -1917,7 +1917,7 @@ __thunder_path=$(
     set -f
     IFS=:
     case "$__thunder_name" in
-    */*) exit 0 ;;
+    (*/*) exit 0 ;;
     esac
     for directory in ${PATH:-}; do
         candidate=${directory:-.}/$__thunder_name

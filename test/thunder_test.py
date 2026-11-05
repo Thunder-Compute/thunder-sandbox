@@ -2223,7 +2223,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(parsed.contents_only)
                 self.assertEqual(parsed.path, expected)
 
-    @unittest.skipUnless(shutil.which("bash"), "requires a shell with exec -a")
+    @unittest.skipUnless(
+        os.name == "posix" and shutil.which("bash"), "requires a POSIX shell with exec -a"
+    )
     def test_container_exec_runs_the_image_program_and_keeps_the_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_bin = Path(directory) / "image bin"
