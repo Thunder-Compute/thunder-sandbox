@@ -196,6 +196,14 @@ the entire remote process group, and reconnects safely if the SSH
 acknowledgement is lost. Jobs which do not exit after a five-second `SIGTERM`
 grace period are stopped with `SIGKILL`; `wait()` then returns `143` or `137`.
 
+In an image-backed sandbox, a command given by bare name runs the image's own program, as it would under `docker exec`. So `sh` is the image's shell, which is dash on Ubuntu and Debian and doesn't support `[[ ]]`, `set -o pipefail` or `source`; use `bash` for scripts that need them. If the image has no such program, the sandbox's BusyBox provides it when it can.
+
+`wait()` returns when the command itself exits, so a command can leave a background service running and return immediately. In an image-backed sandbox, redirect the service's output if you start it with `&`; otherwise it holds the container's output stream open and `wait()` lasts as long as the service:
+
+```python
+sandbox.exec("sh", "-c", "my-server >/var/log/my-server.log 2>&1 </dev/null &").wait()
+```
+
 Each argument or environment value must be under 128 KiB, the Linux limit; `exec` raises `InvalidRequestError` above that. Upload larger input as a file.
 
 If the connection fails, the SDK reconnects and retries. An operation which keeps failing for ten minutes raises `ConnectionError`; a durable command keeps running, and `get_process()` can recover it.
@@ -249,11 +257,11 @@ restricted = thunder.Sandbox.create(
 )
 ```
 
-CIDR and domain allowlists are independent. Supply both when restricted workloads need both direct IP and DNS-based access.
+Passing either allowlist restricts outbound traffic to what you list; an allowlist you leave out allows nothing. Supply both when restricted workloads need both direct IP and DNS-based access. To allow everything through one dimension, say so explicitly with `outbound_cidr_allowlist=["0.0.0.0/0"]` or `outbound_domain_allowlist=["*"]`. Passing neither leaves the sandbox open.
 
 Domain allowlists cover TLS connections only, matched on the server name. Plain HTTP to an allowed domain fails, so allow the destination's CIDR as well for tools that need it, such as `apt` with `http://` mirrors.
 
-For policy updates, `None` leaves that dimension unrestricted, while an empty sequence blocks it. Each call replaces the complete policy rather than merging with the previous allowlists.
+Each call replaces the complete policy rather than merging with the previous allowlists.
 
 Replace the complete outbound policy of a running sandbox with the same options used at creation:
 

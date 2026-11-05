@@ -6,6 +6,7 @@ import asyncio
 import math
 import os
 import posixpath
+import re
 import random
 import shlex
 import shutil
@@ -1201,8 +1202,12 @@ fi
 
         HTTP requests and polling yield to the event loop. ``timeout`` bounds
         the whole operation; ``None`` waits indefinitely. Timeout or cancellation
-        does not undo an accepted update. ``None`` leaves an allowlist dimension
-        unrestricted; an empty sequence blocks that dimension.
+        does not undo an accepted update.
+
+        Each call replaces the complete policy; previous rules are not
+        preserved. Unless ``block_network=True``, passing both allowlists
+        as ``None`` allows unrestricted outbound access. Otherwise, an
+        omitted or empty allowlist permits nothing through that dimension.
         """
         _validate_network_policy_options(
             block_network=block_network,
@@ -1830,17 +1835,13 @@ def _network_policy_request(
         return "closed", [], []
     if outbound_cidr_allowlist is None and outbound_domain_allowlist is None:
         return "open", [], []
-    cidrs = (
-        list(outbound_cidr_allowlist)
-        if outbound_cidr_allowlist is not None
-        else ["0.0.0.0/0"]
+    # Naming one allowlist restricts egress to it. Leaving the other open would
+    # silently undo the restriction the caller asked for.
+    return (
+        "restricted",
+        list(outbound_cidr_allowlist or ()),
+        list(outbound_domain_allowlist or ()),
     )
-    domains = (
-        list(outbound_domain_allowlist)
-        if outbound_domain_allowlist is not None
-        else ["*"]
-    )
-    return "restricted", cidrs, domains
 
 
 def _wait_window(deadline: float | None) -> float:
@@ -1909,6 +1910,61 @@ def _remote_command(
                 parts.append(f"{shlex.quote(key)}={shlex.quote(value)}")
     parts.extend(shlex.quote(arg) for arg in args)
     return " ".join(parts)
+
+
+# Names the wrapper sets in the shell that execs the payload. Anything it sets
+# there would overwrite an inherited variable of the same name, so they are
+# prefixed. The search runs in a subshell and leaves IFS and globbing alone.
+_CONTAINER_RESOLVE_COMMAND = """__thunder_name=$1
+shift
+__thunder_path=$(
+    set -f
+    IFS=:
+    case "$__thunder_name" in
+    (*/*) exit 0 ;;
+    esac
+    for directory in ${PATH:-}; do
+        candidate=${directory:-.}/$__thunder_name
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            exit 0
+        fi
+    done
+)
+"""
+_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _container_exec_script(unset: Sequence[str], container_busybox: str) -> str:
+    """Exec the payload, preferring the image's program to a BusyBox applet.
+
+    BusyBox's shell prefers its own applets to PATH, even for ``exec``, so a bare
+    ``sh`` or ``ls`` would run BusyBox rather than the image's program. A path
+    with a slash is always executed as written, so the command is looked up in
+    PATH first, and ``exec -a`` keeps the name the caller used as ``argv[0]``.
+    BusyBox remains the fallback for images which lack the command altogether.
+
+    ``unset`` in this shell aborts it on a name which isn't a valid identifier,
+    so ``env -u`` removes those, at the cost of ``argv[0]`` becoming the path.
+    """
+
+    script = _CONTAINER_RESOLVE_COMMAND
+    invalid = [key for key in unset if not _SHELL_NAME.fullmatch(key)]
+    script += "".join(f"unset {key}\n" for key in unset if key not in invalid)
+    if invalid:
+        removals = " ".join(f"-u {shlex.quote(key)}" for key in invalid)
+        return (
+            script
+            + f"exec {shlex.quote(container_busybox)} env {removals} "
+            + '"${__thunder_path:-$__thunder_name}" "$@"\n'
+        )
+    return (
+        script
+        + 'if [ -n "$__thunder_path" ]; then\n'
+        + '    exec -a "$__thunder_name" "$__thunder_path" "$@"\n'
+        + "fi\n"
+        + 'exec "$__thunder_name" "$@"\n'
+    )
 
 
 def _container_session_waiter(container_busybox: str) -> str:
@@ -1989,23 +2045,21 @@ def _container_remote_command(
         else:
             parts.extend(("--env", f"{key}={value}"))
     parts.append(_CONTAINER_NAME)
-    payload: list[str] = []
-    if unset:
-        payload.extend((_CONTAINER_BUSYBOX, "env"))
-        for key in unset:
-            payload.extend(("-u", key))
-    payload.extend(args)
     if job_id is None:
-        parts.extend(payload)
+        if unset:
+            parts.extend((_CONTAINER_BUSYBOX, "env"))
+            for key in unset:
+                parts.extend(("-u", key))
+        parts.extend(args)
     else:
         validate_job_id(job_id)
         container_job = str(container_job_directory(job_id))
         inner = (
             "set -eu\n"
-            f"job={shlex.quote(container_job)}\n"
-            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$job"\n'
-            'printf \'%s\\n\' "$$" >"$job/pid"\n'
-            'exec "$@"\n'
+            f"__thunder_job={shlex.quote(container_job)}\n"
+            f'{shlex.quote(_CONTAINER_BUSYBOX)} mkdir -m 700 -- "$__thunder_job"\n'
+            'printf \'%s\\n\' "$$" >"$__thunder_job/pid"\n'
+            + _container_exec_script(unset, _CONTAINER_BUSYBOX)
         )
         # Do not make setsid the docker-exec process. If that process is already
         # a process-group leader, BusyBox forks and lets the observed parent
@@ -2025,7 +2079,7 @@ def _container_remote_command(
                 "sh",
             )
         )
-        parts.extend(payload)
+        parts.extend(args)
     command = " ".join(shlex.quote(part) for part in parts)
     if job_id is not None:
         prepare = _container_job_prepare_script(

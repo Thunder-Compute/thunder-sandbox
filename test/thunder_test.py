@@ -62,7 +62,10 @@ from thunder_sandbox.asynchronous._ssh import (
     SSHConnectionManager,
     SSH_RETRY_BUDGET_SECONDS,
 )
-from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
+from thunder_sandbox.asynchronous.sandbox import (
+    WAIT_WINDOW_MAX_SECONDS,
+    _container_exec_script,
+)
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import (
     _container_session_waiter,
@@ -2220,6 +2223,50 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(parsed.contents_only)
                 self.assertEqual(parsed.path, expected)
 
+    @unittest.skipUnless(
+        os.name == "posix" and shutil.which("bash"), "requires a POSIX shell with exec -a"
+    )
+    def test_container_exec_runs_the_image_program_and_keeps_the_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_bin = Path(directory) / "image bin"
+            image_bin.mkdir()
+            program = image_bin / "tool"
+            program.write_text('#!/bin/sh\necho "image:$1"\n', encoding="utf-8")
+            program.chmod(0o755)
+            (image_bin / "plain").write_text("", encoding="utf-8")
+            environment = {
+                "PATH": f"/nonexistent:{image_bin}:/usr/bin:/bin",
+                "directory": "mine",
+                "candidate": "mine",
+                "old_ifs": "mine",
+                "REMOVE": "gone",
+            }
+
+            def run(*command: str, unset: tuple[str, ...] = ()) -> str:
+                return subprocess.run(
+                    ["bash", "-c", _container_exec_script(unset, "/usr/bin/env"), "sh", *command],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+
+            self.assertEqual(run("tool", "a  b"), "image:a  b\n")
+            self.assertEqual(run(str(program), "x"), "image:x\n")
+            self.assertEqual(run("printf", "%s", "fallback"), "fallback")
+            self.assertEqual(run("bash", "-c", 'echo "$0"'), "bash\n")
+            for name in ("directory", "candidate", "old_ifs"):
+                self.assertEqual(run("printenv", name), "mine\n")
+            self.assertEqual(
+                run("bash", "-c", 'echo "[${REMOVE:-unset}]"', unset=("REMOVE",)), "[unset]\n"
+            )
+
+    def test_container_exec_script_removes_invalid_names_without_unset(self) -> None:
+        script = _container_exec_script(("VALID", "NOT-A-NAME"), "/busybox")
+        self.assertIn("unset VALID\n", script)
+        self.assertNotIn("unset NOT-A-NAME", script)
+        self.assertIn("/busybox env -u NOT-A-NAME ", script)
+
     async def test_contents_download_requests_the_directory_itself(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -2704,15 +2751,15 @@ else:
                     job_id="a" * 32, user="root",
                 )
             inner = next(token for token in shlex.split(command)
-                         if token.startswith("set -eu\njob="))
+                         if token.startswith("set -eu\n__thunder_job="))
             rejected = subprocess.run(
-                ["sh", "-c", inner, "sh", "true"], text=True, capture_output=True
+                ["bash", "-c", inner, "sh", "true"], text=True, capture_output=True
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertEqual((victim / "pid").read_text(), "unchanged")
             job.unlink()
             accepted = subprocess.run(
-                ["sh", "-c", inner, "sh", "true"], text=True, capture_output=True
+                ["bash", "-c", inner, "sh", "true"], text=True, capture_output=True
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertEqual(job.stat().st_mode & 0o7777, 0o700)
@@ -3379,17 +3426,17 @@ else:
                 {"outbound_cidr_allowlist": ["203.0.113.7/24"]},
                 "restricted",
                 ["203.0.113.7/24"],
-                ["*"],
+                [],
                 ["203.0.113.0/24"],
-                ["*"],
+                [],
             ),
             (
                 "domain restricted",
                 {"outbound_domain_allowlist": ["PACKAGES.EXAMPLE.COM"]},
                 "restricted",
-                ["0.0.0.0/0"],
+                [],
                 ["PACKAGES.EXAMPLE.COM"],
-                ["0.0.0.0/0"],
+                [],
                 ["packages.example.com"],
             ),
         ]
