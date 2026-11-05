@@ -23,6 +23,9 @@ def parse_transfer_path(path: str, *, separator: str) -> ParsedTransferPath:
 
     contents_only = path.endswith(separator + ".")
     stripped = path[:-2] if contents_only else path
+    if contents_only and (not stripped or stripped.endswith(":")):
+        # The root's contents: the separator is the whole path, not a suffix.
+        stripped += separator
     name = (
         "contents"
         if contents_only
