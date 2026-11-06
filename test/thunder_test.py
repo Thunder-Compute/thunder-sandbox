@@ -4233,7 +4233,7 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
             client = AsyncClient(config(directory))
             client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
                 {"id": "sbx-test"}, SANDBOX_RESPONSE,
-                {"id": "sbx-test", "workspace_id": "ws-a1"},
+                {"id": "sbx-test"},  # A minimal start response is enough.
                 {**SANDBOX_RESPONSE, "workspace_id": "ws-a1"},
             ])
             main = await client.create_sandbox()
@@ -4247,10 +4247,12 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
     async def test_create_stops_a_sandbox_an_old_api_put_in_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
-            client._request = mock.AsyncMock(side_effect=[{"id": "sbx-test"}, {}])  # type: ignore[method-assign]
+            client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                {"id": "sbx-test", "workspace_id": "ws-a1"}, SANDBOX_RESPONSE, {},
+            ])
             with self.assertRaisesRegex(SandboxFailedError, "ws-a1"):
                 await client.create_sandbox(workspace="ws-a1")
-            stop = client._request.await_args_list[1].args
+            stop = client._request.await_args_list[2].args
             self.assertEqual(stop, ("POST", "/sandboxes/sbx-test/stop"))
             await client.close()
 

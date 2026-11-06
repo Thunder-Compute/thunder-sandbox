@@ -223,19 +223,19 @@ class Sandbox:
             sandbox_id = str(response.get("id", ""))
             if not sandbox_id:
                 raise SandboxFailedError("Thunder did not return a sandbox ID")
+            sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
+            sandbox._owns_client = owns_client
             # An API from before workspaces ignores the selector and starts the
             # sandbox in main. Stop it (below) rather than leave it where the
             # caller did not ask for it.
             if (
                 workspace_id != MAIN_WORKSPACE_ID
-                and response.get("workspace_id") != workspace_id
+                and sandbox.workspace_id != workspace_id
             ):
                 raise SandboxFailedError(
                     f"this Thunder API did not start the sandbox in workspace "
                     f"{workspace_id!r}; it may not support workspaces"
                 )
-            sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
-            sandbox._owns_client = owns_client
             if args:
                 await sandbox.wait_until_ready(timeout=timeout)
                 sandbox._main_process = await sandbox.exec(*args)
