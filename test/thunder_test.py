@@ -1435,7 +1435,7 @@ class SynchronousClientTest(unittest.TestCase):
                 client._client, {**SANDBOX_RESPONSE, "id": "sbx-two"}
             )
 
-            async def listing(*, status="active"):
+            async def listing(*, status="active", workspace=None):
                 yield first
                 yield second
 
@@ -4144,6 +4144,269 @@ class CredentialTest(unittest.IsolatedAsyncioTestCase):
             )
             await client.close()
 
+
+
+class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
+    """A workspace is chosen per call, and a guest only trusts its own."""
+
+    LISTED = [
+        {"id": "main", "name": "main", "role": "developer"},
+        {"id": "ws-a1", "name": "Research", "role": "viewer"},
+    ]
+
+    def client(self, directory: str) -> AsyncClient:
+        client = AsyncClient(config(directory))
+        client._request_json = mock.AsyncMock(return_value=self.LISTED)  # type: ignore[method-assign]
+        return client
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("TNR_WORKSPACE", None)
+
+    async def test_main_and_ids_resolve_without_a_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            for reference, expected in (
+                (None, "main"), ("", "main"), ("main", "main"), ("MAIN", "main"),
+                ("ws-other", "ws-other"),
+            ):
+                self.assertEqual(await client._resolve_workspace(reference), expected)
+            client._request_json.assert_not_awaited()  # type: ignore[attr-defined]
+            await client.close()
+
+    async def test_a_name_resolves_ignoring_case_and_is_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            self.assertEqual(await client._resolve_workspace("research"), "ws-a1")
+            self.assertEqual(await client._resolve_workspace("RESEARCH"), "ws-a1")
+            client._request_json.assert_awaited_once()  # type: ignore[attr-defined]
+            await client.close()
+
+    async def test_a_renamed_main_resolves_by_either_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            client._request_json.return_value = [{"id": "main", "name": "prod"}]  # type: ignore[attr-defined]
+            self.assertEqual(await client._resolve_workspace("prod"), "main")
+            self.assertEqual(await client._resolve_workspace("main"), "main")
+            await client.close()
+
+    async def test_a_new_name_rereads_the_cached_list_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            await client._resolve_workspace("research")
+            client._request_json.return_value = [  # type: ignore[attr-defined]
+                *self.LISTED, {"id": "ws-b2", "name": "labs"},
+            ]
+            self.assertEqual(await client._resolve_workspace("labs"), "ws-b2")
+            self.assertEqual(client._request_json.await_count, 2)  # type: ignore[attr-defined]
+            await client.close()
+
+    async def test_an_unknown_name_lists_what_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            with self.assertRaisesRegex(NotFoundError, "main, Research"):
+                await client._resolve_workspace("missing")
+            await client.close()
+
+    async def test_the_argument_wins_over_the_environment(self) -> None:
+        os.environ["TNR_WORKSPACE"] = "ws-env"
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            self.assertEqual(await client._resolve_workspace(None), "ws-env")
+            self.assertEqual(await client._resolve_workspace("ws-arg"), "ws-arg")
+            self.assertEqual(await client._resolve_workspace("main"), "main")
+            await client.close()
+
+    async def test_list_workspaces_reports_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.client(directory)
+            workspaces = await client.list_workspaces()
+            self.assertEqual(
+                workspaces[1], thunder.Workspace(id="ws-a1", name="Research", role="viewer")
+            )
+            await client.close()
+
+    async def test_create_sends_the_selector_only_for_a_private_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                {"id": "sbx-test"}, SANDBOX_RESPONSE,
+                {"id": "sbx-test", "workspace_id": "ws-a1"},
+                {**SANDBOX_RESPONSE, "workspace_id": "ws-a1"},
+            ])
+            main = await client.create_sandbox()
+            self.assertEqual(main.workspace_id, "main")
+            self.assertNotIn("workspace_id", client._request.await_args_list[0].args[2])
+            private = await client.create_sandbox(workspace="ws-a1")
+            self.assertEqual(private.workspace_id, "ws-a1")
+            self.assertEqual(client._request.await_args_list[2].args[2]["workspace_id"], "ws-a1")
+            await client.close()
+
+    async def test_create_stops_a_sandbox_an_old_api_put_in_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(side_effect=[{"id": "sbx-test"}, {}])  # type: ignore[method-assign]
+            with self.assertRaisesRegex(SandboxFailedError, "ws-a1"):
+                await client.create_sandbox(workspace="ws-a1")
+            stop = client._request.await_args_list[1].args
+            self.assertEqual(stop, ("POST", "/sandboxes/sbx-test/stop"))
+            await client.close()
+
+    async def test_listing_and_lookup_by_name_are_scoped(self) -> None:
+        os.environ["TNR_WORKSPACE"] = "ws-env"
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(return_value={  # type: ignore[method-assign]
+                "sandboxes": [{**SANDBOX_RESPONSE, "workspace_id": "ws-env"}],
+            })
+            listed = [item async for item in client.list_sandboxes()]
+            self.assertEqual(listed[0].workspace_id, "ws-env")
+            self.assertEqual(client._request.await_args.kwargs["query"]["workspace_id"], "ws-env")
+            await client.get_sandbox_by_name(SANDBOX_RESPONSE["name"], workspace="ws-a1")
+            self.assertEqual(client._request.await_args.kwargs["query"]["workspace_id"], "ws-a1")
+            [item async for item in client.list_sandboxes(workspace="main")]
+            self.assertNotIn("workspace_id", client._request.await_args.kwargs["query"])
+            await client.close()
+
+    async def test_a_response_without_a_workspace_belongs_to_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(client, SANDBOX_RESPONSE)
+            self.assertEqual(sandbox.workspace_id, "main")
+            self.assertEqual(sandbox.ssh.certificate_path, client.config.paths.ssh_certificate)
+            await client.close()
+
+    async def test_a_viewer_is_told_about_the_role_not_the_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(side_effect=AuthenticationError(  # type: ignore[method-assign]
+                "forbidden", code="forbidden", status=403
+            ))
+            with self.assertRaisesRegex(AuthenticationError, "developer access to workspace 'ws-a1'"):
+                await client._credentials_for("ws-a1").ensure(client)
+            await client.close()
+
+    async def test_each_workspace_has_its_own_certificate_over_one_key(self) -> None:
+        ca = asyncssh.generate_private_key("ssh-ed25519")
+        allowed = {
+            workspace: asyncssh.import_authorized_keys(
+                f'cert-authority,principals="{workspace}" '
+                + ca.export_public_key().decode().strip() + "\n"
+            )
+            for workspace in ("thunder-org-org-1", "ws-a1", "ws-b2")
+        }
+
+        async def handler(process):
+            process.stdout.write("ok\n")
+            process.exit(0)
+
+        servers = {
+            workspace: await asyncssh.listen(
+                "127.0.0.1", 0,
+                server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+                authorized_client_keys=keys,
+                process_factory=handler,
+            )
+            for workspace, keys in allowed.items()
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                requested: list[str | None] = []
+
+                async def issue(method, path, body=None, query=None):
+                    requested.append(body.get("workspace_id"))
+                    signed = ca.generate_user_certificate(
+                        asyncssh.import_public_key(body["ssh_public_key"]),
+                        "thunder",
+                        principals=[body.get("workspace_id", "thunder-org-org-1")],
+                        valid_before=int(time.time() + 3600),
+                    )
+                    return {
+                        "ssh_certificate": signed.export_certificate().decode("ascii").strip(),
+                        "expires_at": datetime.fromtimestamp(
+                            time.time() + 3600, timezone.utc
+                        ).isoformat(),
+                    }
+
+                client._request = mock.AsyncMock(side_effect=issue)  # type: ignore[method-assign]
+
+                def sandbox(identifier: str, workspace: str | None, server) -> AsyncSandbox:
+                    port = server.sockets[0].getsockname()[1]
+                    return AsyncSandbox._from_response(client, {
+                        **SANDBOX_RESPONSE, "id": identifier,
+                        **({"workspace_id": workspace} if workspace else {}),
+                        "ssh": {"host": "127.0.0.1", "port": port, "user": "ubuntu"},
+                    })
+
+                async def opens(item: AsyncSandbox) -> None:
+                    connection = await item._open_connection()
+                    self.assertEqual((await connection.run("x")).stdout, "ok\n")
+                    connection.close()
+
+                await opens(sandbox("sbx-ws-main", None, servers["thunder-org-org-1"]))
+                await opens(sandbox("sbx-ws-a", "ws-a1", servers["ws-a1"]))
+                await opens(sandbox("sbx-ws-b", "ws-b2", servers["ws-b2"]))
+                self.assertEqual(requested, [None, "ws-a1", "ws-b2"])
+
+                paths = client.config.paths
+                certificates = [
+                    paths.workspace_ssh_certificate(item) for item in ("main", "ws-a1", "ws-b2")
+                ]
+                self.assertEqual(certificates[0], paths.ssh_certificate)
+                self.assertEqual(len(set(certificates)), 3)
+                for certificate in certificates:
+                    self.assertTrue(certificate.is_file())
+                keys = {
+                    (await client._credentials_for(item).ensure(client)).key.export_public_key()
+                    for item in ("main", "ws-a1", "ws-b2")
+                }
+                self.assertEqual(len(keys), 1)
+
+                # A guest refuses another workspace's certificate. It renews once,
+                # which still names the sandbox's own workspace, then gives up.
+                misplaced = sandbox("sbx-ws-wrong", "ws-a1", servers["ws-b2"])
+                with self.assertRaises(asyncssh.PermissionDenied):
+                    await misplaced._open_connection()
+                self.assertEqual(requested[-1], "ws-a1")
+
+                self.assertEqual(
+                    sandbox("sbx-ws-c", "ws-b2", servers["ws-b2"]).ssh.certificate_path,
+                    paths.workspace_ssh_certificate("ws-b2"),
+                )
+                await client.close()
+        finally:
+            for server in servers.values():
+                server.close()
+                await server.wait_closed()
+
+
+class SynchronousWorkspaceTest(unittest.TestCase):
+    def test_blocking_client_forwards_the_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            os.environ.pop("TNR_WORKSPACE", None)
+            client = synchronous.Client(config(directory))
+            client._client._request_json = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value=WorkspaceTest.LISTED
+            )
+            client._client._request = mock.AsyncMock(return_value={  # type: ignore[method-assign]
+                "sandboxes": [{**SANDBOX_RESPONSE, "workspace_id": "ws-a1"}],
+            })
+            try:
+                self.assertEqual(client.list_workspaces()[1].id, "ws-a1")
+                sandboxes = list(client.list_sandboxes(workspace="research"))
+                self.assertEqual(sandboxes[0].workspace_id, "ws-a1")
+                self.assertEqual(
+                    client._client._request.await_args.kwargs["query"]["workspace_id"], "ws-a1"
+                )
+                client.get_sandbox_by_name(SANDBOX_RESPONSE["name"], workspace="ws-b2")
+                self.assertEqual(
+                    client._client._request.await_args.kwargs["query"]["workspace_id"], "ws-b2"
+                )
+            finally:
+                client.close()
 
 
 class CertificateAuthenticationTest(unittest.IsolatedAsyncioTestCase):

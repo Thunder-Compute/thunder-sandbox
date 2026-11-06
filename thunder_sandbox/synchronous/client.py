@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common.config import ClientConfig
 from .._common.exceptions import ConnectionError
-from .._common.types import GPUType, Pricing, SandboxStatus
+from .._common.types import GPUType, Pricing, SandboxStatus, Workspace
 from ..asynchronous.client import Client as NativeClient
 from ._bridge import AsyncBridge
 
@@ -70,6 +70,7 @@ class Client:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
     ) -> "Sandbox":
         from .sandbox import Sandbox
 
@@ -89,6 +90,7 @@ class Client:
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
+            workspace=workspace,
             client=self,
         )
 
@@ -153,6 +155,7 @@ class Client:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
     ) -> "Sandbox":
         from .sandbox import Sandbox
 
@@ -172,6 +175,7 @@ class Client:
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
+            workspace=workspace,
             client=self,
         )
 
@@ -192,24 +196,37 @@ class Client:
         sandbox = await self._bridge.run_async(self._client.get_sandbox(sandbox_id))
         return self._wrap_sandbox(sandbox)
 
-    def get_sandbox_by_name(self, name: str) -> "Sandbox":
+    def get_sandbox_by_name(
+        self, name: str, *, workspace: str | None = None
+    ) -> "Sandbox":
 
         sandbox = self._bridge.run(
-            self._client.get_sandbox_by_name(name)
+            self._client.get_sandbox_by_name(name, workspace=workspace)
         )
         return self._wrap_sandbox(sandbox)
 
-    async def get_sandbox_by_name_async(self, name: str) -> "Sandbox":
+    async def get_sandbox_by_name_async(
+        self, name: str, *, workspace: str | None = None
+    ) -> "Sandbox":
         sandbox = await self._bridge.run_async(
-            self._client.get_sandbox_by_name(name)
+            self._client.get_sandbox_by_name(name, workspace=workspace)
         )
         return self._wrap_sandbox(sandbox)
+
+    def list_workspaces(self) -> list[Workspace]:
+        return self._bridge.run(self._client.list_workspaces())
+
+    async def list_workspaces_async(self) -> list[Workspace]:
+        return await self._bridge.run_async(self._client.list_workspaces())
 
     def list_sandboxes(
-        self, *, status: str | SandboxStatus = "active"
+        self,
+        *,
+        status: str | SandboxStatus = "active",
+        workspace: str | None = None,
     ) -> Iterator["Sandbox"]:
 
-        iterator = self._client.list_sandboxes(status=status)
+        iterator = self._client.list_sandboxes(status=status, workspace=workspace)
         try:
             while True:
                 try:
@@ -221,9 +238,12 @@ class Client:
             self._bridge.run(iterator.aclose())
 
     async def list_sandboxes_async(
-        self, *, status: str | SandboxStatus = "active"
+        self,
+        *,
+        status: str | SandboxStatus = "active",
+        workspace: str | None = None,
     ) -> AsyncGenerator["Sandbox", None]:
-        iterator = self._client.list_sandboxes(status=status)
+        iterator = self._client.list_sandboxes(status=status, workspace=workspace)
         try:
             while True:
                 try:

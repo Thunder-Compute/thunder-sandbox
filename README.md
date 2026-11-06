@@ -89,7 +89,7 @@ poll. Its `timeout` is enforced on the client: each held request is bounded
 here and retried until the sandbox is ready, fails, or the timeout passes. An
 API without this endpoint is polled instead.
 
-Sandboxes are addressed by `id`. SSH connections use an Ed25519 key and a renewable organization certificate shared across the organization's sandboxes. The SDK creates credentials and renews certificates as needed, caching them under `~/.thunder/sandbox_keys/` when writable.
+Sandboxes are addressed by `id`. SSH connections use an Ed25519 key and a renewable certificate shared across a workspace's sandboxes. The SDK creates credentials and renews certificates as needed, caching them under `~/.thunder/sandbox_keys/` when writable.
 
 A `name` is an optional label. It must be free of any other *live* sandbox in
 the organization, and it is released once a sandbox finishes, so the same label
@@ -105,6 +105,36 @@ print(sandbox.id, sandbox.name)
 # Looking one up searches live sandboxes; prefer Sandbox.from_id.
 same = thunder.Sandbox.from_name("training-run")
 ```
+
+## Workspaces
+
+Workspaces divide an organization's sandboxes, and each member has a role in each workspace. Choose one by name or by its `ws-` ID:
+
+```python
+with thunder.Client.from_cli() as client:
+    for workspace in client.list_workspaces():
+        print(workspace.id, workspace.name, workspace.role)
+
+    sandbox = client.create_sandbox(workspace="research", cpu=4, memory=16)
+    print(sandbox.workspace_id)
+
+    for sandbox in client.list_sandboxes(workspace="research"):
+        print(sandbox.id)
+
+    sandbox = client.get_sandbox_by_name("worker", workspace="research")
+```
+
+Clients are not tied to a workspace. Each call uses the first of:
+
+1. The `workspace` argument.
+2. The `TNR_WORKSPACE` environment variable.
+3. `main`, which every organization has. Code that never mentions a workspace uses it.
+
+This applies to creating sandboxes, listing them and finding them by name. A sandbox ID needs no workspace, so `client.get_sandbox(id)` finds a sandbox in any workspace you can access, and everything you then do with it follows that sandbox. Sandbox images belong to the organization and work in all of its workspaces.
+
+Viewers can read a workspace's sandboxes. Starting, stopping and connecting to them takes the developer role.
+
+`list_sandboxes` covers one workspace. Names can change, so anything long-lived, such as a cleanup job, should store workspace IDs.
 
 ## Live pricing
 
@@ -404,6 +434,8 @@ Configuration is resolved from the following sources:
 4. The default Thunder API endpoint.
 
 Set `TNR_HOME` to use a different directory for CLI state and sandbox SSH keys.
+
+Set `TNR_WORKSPACE` to choose the workspace for calls that do not name one. See [Workspaces](#workspaces).
 
 ## License
 

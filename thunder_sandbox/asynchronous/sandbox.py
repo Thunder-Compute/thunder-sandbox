@@ -36,6 +36,7 @@ from .._common.exceptions import (
     _WaitWindowElapsedError,
 )
 from .._common.types import (
+    MAIN_WORKSPACE_ID,
     GPUType,
     NetworkPolicy,
     OutputMode,
@@ -118,6 +119,7 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         """Create a sandbox, resolving an optional image before allocation.
@@ -136,6 +138,9 @@ class Sandbox:
         commands, the readiness wait limit. CPU-only sandboxes omit GPU options
         or use ``GPUType.NONE`` with ``gpu_count=0``. ``cpu=1`` and ``cpu=2``
         are supported, subject to the API resource catalog.
+
+        ``workspace`` is a workspace name or ID. Without one, ``TNR_WORKSPACE``
+        applies, and then main.
         """
         _validate_create_options(
             timeout=timeout,
@@ -150,6 +155,7 @@ class Sandbox:
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
+            workspace_id = await resolved_client._resolve_workspace(workspace)
             resource_spec: dict[str, object] = {
                 "cpu_count": cpu if cpu is not None else 4,
                 "memory_gib": memory if memory is not None else 32,
@@ -175,6 +181,11 @@ class Sandbox:
             )
             request = {
                 **({"queue": True} if queue else {}),
+                **(
+                    {"workspace_id": workspace_id}
+                    if workspace_id != MAIN_WORKSPACE_ID
+                    else {}
+                ),
                 "spec": resource_spec,
                 "env": {
                     key: value
@@ -212,6 +223,17 @@ class Sandbox:
             sandbox_id = str(response.get("id", ""))
             if not sandbox_id:
                 raise SandboxFailedError("Thunder did not return a sandbox ID")
+            # An API from before workspaces ignores the selector and starts the
+            # sandbox in main. Stop it (below) rather than leave it where the
+            # caller did not ask for it.
+            if (
+                workspace_id != MAIN_WORKSPACE_ID
+                and response.get("workspace_id") != workspace_id
+            ):
+                raise SandboxFailedError(
+                    f"this Thunder API did not start the sandbox in workspace "
+                    f"{workspace_id!r}; it may not support workspaces"
+                )
             sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
             sandbox._owns_client = owns_client
             if args:
@@ -250,14 +272,16 @@ class Sandbox:
 
     @staticmethod
     async def from_name(
-        name: str, *, client: Client | None = None
+        name: str, *, workspace: str | None = None, client: Client | None = None
     ) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
             matches = [
                 sandbox
-                async for sandbox in resolved_client.list_sandboxes(status="active")
+                async for sandbox in resolved_client.list_sandboxes(
+                    status="active", workspace=workspace
+                )
                 if sandbox.name == name
             ]
             if not matches:
@@ -294,6 +318,10 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._info.image_id
+
+    @property
+    def workspace_id(self) -> str:
+        return self._info.workspace_id
 
     @property
     def queued(self) -> bool:
@@ -1356,15 +1384,14 @@ fi
         # one's port. Pin per sandbox instead.
         pinned = _pinned_host_key(self.id)
         known_hosts = ([pinned], [], []) if pinned is not None else None
-        credential = await self._client._credentials.ensure(self._client)
+        store = self._client._credentials_for(self.workspace_id)
+        credential = await store.ensure(self._client)
         try:
             connection = await self._open(ssh, credential, known_hosts)
         except asyncssh.PermissionDenied:
             # An unexpired certificate may belong to another environment or a
             # rotated authority. Renew the rejected credential exactly once.
-            credential = await self._client._credentials.renew(
-                self._client, rejected=credential
-            )
+            credential = await store.renew(self._client, rejected=credential)
             connection = await self._open(ssh, credential, known_hosts)
         if pinned is None:
             try:
@@ -1386,8 +1413,8 @@ fi
             ssh.port,
             username=ssh.user,
             # The sandbox trusts the authority that signed this, not the key
-            # itself, so the same credential opens every sandbox the
-            # organization owns.
+            # itself, so the same credential opens every sandbox in the
+            # workspace.
             client_keys=[(credential.key, credential.certificate)],
             known_hosts=known_hosts,
             agent_path=None,
@@ -1675,6 +1702,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     gpu_type = GPUType(str(spec["gpu_type"])) if spec.get("gpu_type") else None
     if gpu_type is GPUType.NONE:
         gpu_type = None
+    workspace_id = str(response.get("workspace_id") or MAIN_WORKSPACE_ID)
     ssh_value = response.get("ssh")
     ssh = None
     if isinstance(ssh_value, dict) and ssh_value.get("host"):
@@ -1683,7 +1711,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             port=int(ssh_value.get("port", 22)),
             user=str(ssh_value.get("user", "ubuntu")),
             private_key_path=paths.ssh_key,
-            certificate_path=paths.ssh_certificate,
+            certificate_path=paths.workspace_ssh_certificate(workspace_id),
         )
         host_key = ssh_value.get("host_key")
         if host_key:
@@ -1707,6 +1735,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
             response.get("desired_network_policy_generation")
         ),
         queued=response.get("queued") is True,
+        workspace_id=workspace_id,
         created_at=_datetime(response.get("created_at")),
         expires_at=_datetime(response.get("expires_at"), optional=True),
         ssh=ssh,

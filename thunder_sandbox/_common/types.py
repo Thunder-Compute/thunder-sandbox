@@ -85,12 +85,29 @@ class NetworkPolicy:
         return self.internet_access == "closed"
 
 
+MAIN_WORKSPACE_ID = "main"
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """A workspace the caller can access.
+
+    ``id`` is permanent, and ``name`` is unique within the organization but can
+    be changed, so anything long-lived should hold the ID.
+    """
+
+    id: str
+    name: str
+    # The caller's own role, "viewer" or "developer". Older APIs do not report it.
+    role: str | None = None
+
+
 @dataclass(frozen=True)
 class SSHConnection:
     host: str
     port: int
     user: str
-    # Where the organization credential is cached, for callers that shell out
+    # Where the workspace's credential is cached, for callers that shell out
     # to ssh. The SDK's own connections do not read these: it holds the key and
     # certificate as values, so a client whose cache is unwritable still works.
     private_key_path: Path | None = None
@@ -138,3 +155,4 @@ class SandboxInfo:
     network_policy_generation: int | None = None
     desired_network_policy_generation: int | None = None
     queued: bool = False
+    workspace_id: str = MAIN_WORKSPACE_ID
