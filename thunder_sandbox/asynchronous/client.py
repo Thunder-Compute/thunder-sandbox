@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 import asyncssh
 
-from .._common.config import ClientConfig
+from .._common.config import WORKSPACE_ENV_VAR, ClientConfig
 from .._common.exceptions import (
     AuthenticationError,
     CapacityError,
@@ -28,7 +29,7 @@ from .._common.exceptions import (
     ThunderError,
     _WaitWindowElapsedError,
 )
-from .._common.types import GPUType, Pricing, SandboxStatus
+from .._common.types import MAIN_WORKSPACE_ID, GPUType, Pricing, SandboxStatus, Workspace
 from .._version import __version__
 from .credentials import CredentialStore
 
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
     from .sandbox import Sandbox
 
 USER_AGENT = f"thunder-python-sdk/{__version__}"
+
+WORKSPACE_ID_PREFIX = "ws-"
+WORKSPACE_CACHE_SECONDS = 60.0
 
 _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_capacity_unavailable": CapacityError,
@@ -92,7 +96,11 @@ class Client:
         if not self.config.api_token:
             raise AuthenticationError("no authentication token found; run 'tnr login'")
         self._session: aiohttp.ClientSession | None = None
-        self._credentials = CredentialStore(self.config.paths)
+        self._credential_lock = asyncio.Lock()
+        self._credentials = CredentialStore(self.config.paths, lock=self._credential_lock)
+        self._workspace_credentials = {MAIN_WORKSPACE_ID: self._credentials}
+        self._workspace_ids: dict[str, str] = {}
+        self._workspace_ids_at = 0.0
         self._closed = False
         # Whether the API offers the blocking readiness wait. Assumed until a
         # request proves otherwise, and remembered here because it is a
@@ -128,7 +136,21 @@ class Client:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Send one API request.
+        result = await self._request_json(method, path, body, query, timeout=timeout)
+        if not isinstance(result, dict):
+            raise ConnectionError("Thunder returned an unexpected response")
+        return result
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        query: dict[str, object] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Send one API request and return its decoded JSON.
 
         ``timeout`` bounds this request alone, in seconds, for calls the server
         deliberately holds open longer than the session default allows.
@@ -173,12 +195,65 @@ class Client:
         if not payload:
             return {}
         try:
-            result = json.loads(payload)
+            return json.loads(payload)
         except json.JSONDecodeError as exc:
             raise ConnectionError("Thunder returned an invalid JSON response") from exc
-        if not isinstance(result, dict):
+
+    async def list_workspaces(self) -> list[Workspace]:
+        """List the workspaces this credential can access, main first."""
+        response = await self._request_json("GET", "/workspaces")
+        if not isinstance(response, list):
             raise ConnectionError("Thunder returned an unexpected response")
-        return result
+        workspaces = [
+            Workspace(
+                id=str(item.get("id", "")),
+                name=str(item.get("name", "")),
+                role=str(item["role"]) if item.get("role") else None,
+            )
+            for item in response
+            if isinstance(item, dict) and item.get("id")
+        ]
+        self._workspace_ids = {item.name.lower(): item.id for item in workspaces}
+        self._workspace_ids.update({item.id.lower(): item.id for item in workspaces})
+        self._workspace_ids_at = time.monotonic()
+        return workspaces
+
+    async def _resolve_workspace(self, reference: str | None) -> str:
+        """Turn a workspace name or ID into its ID.
+
+        The argument wins, then ``TNR_WORKSPACE``, then main. Main and ``ws-`` IDs
+        need no request, so a client that never names a workspace makes none. The
+        list is shared by the whole organization's rate limit, so it is cached, and
+        reread once when a name is missing in case it is new.
+        """
+        chosen = (reference or os.environ.get(WORKSPACE_ENV_VAR) or "").strip()
+        key = chosen.lower()
+        if not chosen or key == MAIN_WORKSPACE_ID:
+            return MAIN_WORKSPACE_ID
+        if key.startswith(WORKSPACE_ID_PREFIX):
+            return chosen
+        if time.monotonic() - self._workspace_ids_at < WORKSPACE_CACHE_SECONDS:
+            cached = self._workspace_ids.get(key)
+            if cached is not None:
+                return cached
+        workspaces = await self.list_workspaces()
+        resolved = self._workspace_ids.get(key)
+        if resolved is None:
+            available = ", ".join(item.name for item in workspaces) or "none"
+            raise NotFoundError(
+                f"no workspace named {chosen!r} is available to this credential; "
+                f"available workspaces: {available}"
+            )
+        return resolved
+
+    def _credentials_for(self, workspace_id: str) -> CredentialStore:
+        store = self._workspace_credentials.get(workspace_id)
+        if store is None:
+            store = CredentialStore(
+                self.config.paths, workspace_id=workspace_id, lock=self._credential_lock
+            )
+            self._workspace_credentials[workspace_id] = store
+        return store
 
     async def get_pricing(self) -> Pricing:
         """Fetch current USD/hour resource rates, subject to API-side caching.
@@ -497,6 +572,7 @@ class Client:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
     ) -> "Sandbox":
         from .sandbox import Sandbox
 
@@ -516,6 +592,7 @@ class Client:
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
+            workspace=workspace,
             client=self,
         )
 
@@ -524,23 +601,31 @@ class Client:
 
         return await Sandbox.from_id(sandbox_id, client=self)
 
-    async def get_sandbox_by_name(self, name: str) -> "Sandbox":
+    async def get_sandbox_by_name(
+        self, name: str, *, workspace: str | None = None
+    ) -> "Sandbox":
         from .sandbox import Sandbox
 
-        return await Sandbox.from_name(name, client=self)
+        return await Sandbox.from_name(name, workspace=workspace, client=self)
 
     async def list_sandboxes(
-        self, *, status: str | SandboxStatus = "active"
+        self,
+        *,
+        status: str | SandboxStatus = "active",
+        workspace: str | None = None,
     ) -> AsyncGenerator["Sandbox", None]:
+        """List one workspace's sandboxes: ``workspace``, ``TNR_WORKSPACE``, or main."""
         from .sandbox import Sandbox
 
         wanted = status.value if isinstance(status, SandboxStatus) else str(status)
+        workspace_id = await self._resolve_workspace(workspace)
+        scope = {} if workspace_id == MAIN_WORKSPACE_ID else {"workspace_id": workspace_id}
         page_token = ""
         while True:
             response = await self._request(
                 "GET",
                 "/sandboxes",
-                query={"limit": 100, "status": wanted, "page_token": page_token},
+                query={"limit": 100, "status": wanted, "page_token": page_token, **scope},
             )
             for item in response.get("sandboxes", []):
                 if isinstance(item, dict):

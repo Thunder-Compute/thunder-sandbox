@@ -1,8 +1,9 @@
-"""The SSH credential a client presents to its organization's sandboxes.
+"""The SSH credential a client presents to a workspace's sandboxes.
 
 One key is generated on this machine and never leaves it. Thunder signs its
-public half into a certificate that every sandbox in the organization accepts,
-so a machine that created no sandbox can still reach them all.
+public half into a certificate that every sandbox in one workspace accepts, so
+a machine that created no sandbox can still reach them all. A guest trusts only
+its own workspace, so each workspace has its own certificate over that key.
 
 The credential is cached under TNR_HOME so it survives across processes, but
 only ever as an optimisation: a read-only home or a container with no writable
@@ -21,7 +22,8 @@ from typing import TYPE_CHECKING
 import asyncssh
 
 from .._common.config import ThunderPaths
-from .._common.exceptions import SandboxError
+from .._common.exceptions import AuthenticationError, SandboxError
+from .._common.types import MAIN_WORKSPACE_ID
 
 if TYPE_CHECKING:
     from .client import Client
@@ -54,12 +56,25 @@ class SSHCredential:
 
 
 class CredentialStore:
-    """Resolves the organization credential, minting or renewing as needed."""
+    """Resolves one workspace's credential, minting or renewing as needed.
 
-    def __init__(self, paths: ThunderPaths) -> None:
+    Stores for different workspaces share a lock, because the first mint on a
+    machine generates the key they all use.
+    """
+
+    def __init__(
+        self,
+        paths: ThunderPaths,
+        *,
+        workspace_id: str = MAIN_WORKSPACE_ID,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
         self._paths = paths
+        self._workspace_id = workspace_id
+        self._certificate_path = paths.workspace_ssh_certificate(workspace_id)
+        self._certificate_meta_path = paths.workspace_ssh_certificate_meta(workspace_id)
         self._current: SSHCredential | None = None
-        self._lock = asyncio.Lock()
+        self._lock = lock or asyncio.Lock()
 
     async def ensure(self, client: "Client") -> SSHCredential:
         """Reuse the process credential, then the cached one, then mint."""
@@ -110,9 +125,9 @@ class CredentialStore:
             return None
         try:
             certificate = asyncssh.import_certificate(
-                self._paths.ssh_certificate.read_bytes()
+                self._certificate_path.read_bytes()
             )
-            meta = json.loads(self._paths.ssh_certificate_meta.read_text(encoding="utf-8"))
+            meta = json.loads(self._certificate_meta_path.read_text(encoding="utf-8"))
             expires_at = float(meta["expires_at"])
         except (OSError, asyncssh.Error, ValueError, KeyError, TypeError):
             # The key is still good; only the certificate needs reissuing.
@@ -132,9 +147,24 @@ class CredentialStore:
             "ssh-ed25519", comment="thunder-sandbox"
         )
         public_key = key.export_public_key().decode("utf-8").strip()
-        response = await client._request(
-            "POST", "/sandboxes/ssh-certificate", {"ssh_public_key": public_key}
-        )
+        request = {"ssh_public_key": public_key}
+        if self._workspace_id != MAIN_WORKSPACE_ID:
+            request["workspace_id"] = self._workspace_id
+        try:
+            response = await client._request(
+                "POST", "/sandboxes/ssh-certificate", request
+            )
+        except AuthenticationError as exc:
+            # A role that cannot connect is not a bad token, which is what this
+            # error type otherwise suggests.
+            if exc.code != "forbidden":
+                raise
+            raise AuthenticationError(
+                f"developer access to workspace {self._workspace_id!r} is required "
+                "to connect to its sandboxes",
+                code=exc.code,
+                status=exc.status,
+            ) from exc
         line = str(response.get("ssh_certificate", "")).strip()
         if not line:
             raise SandboxError("Thunder did not return an SSH certificate")
@@ -190,11 +220,11 @@ class CredentialStore:
             if replace_key:
                 self._paths.ssh_key.write_bytes(key.export_private_key())
                 self._paths.ssh_key.chmod(0o600)
-            self._paths.ssh_certificate.write_text(certificate + "\n", encoding="utf-8")
+            self._certificate_path.write_text(certificate + "\n", encoding="utf-8")
             # The expiry is recorded beside the certificate rather than read
             # back out of it: AsyncSSH does not expose the validity window as
             # public API, and depending on its internals would break silently.
-            self._paths.ssh_certificate_meta.write_text(
+            self._certificate_meta_path.write_text(
                 json.dumps({"expires_at": expires_at}), encoding="utf-8"
             )
         except OSError:

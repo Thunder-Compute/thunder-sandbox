@@ -25,6 +25,7 @@ from ._common.types import (
     SandboxInfo,
     SandboxStatus,
     SSHConnection,
+    Workspace,
 )
 from .image import Image, ResolvedImage
 
@@ -34,5 +35,5 @@ __all__ = [
     "NetworkPolicy", "NotFoundError", "Pricing", "RateLimitError", "Resources", "RetryableError",
     "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
-    "ThunderError", "ThunderPaths", "UnsupportedFeatureError",
+    "ThunderError", "ThunderPaths", "UnsupportedFeatureError", "Workspace",
 ]

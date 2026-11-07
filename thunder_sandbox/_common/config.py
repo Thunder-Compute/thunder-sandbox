@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .exceptions import AuthenticationError, InvalidRequestError
+from .types import MAIN_WORKSPACE_ID
 
 DEFAULT_API_URL = "https://api.thundercompute.com:8443"
+# The workspace for calls that do not name one, like MODAL_ENVIRONMENT for Modal.
+WORKSPACE_ENV_VAR = "TNR_WORKSPACE"
 
 
 class ThunderPaths:
@@ -44,6 +48,19 @@ class ThunderPaths:
     def ssh_certificate_meta(self) -> Path:
         return self.sandbox_keys / "id_ed25519-cert.json"
 
+    # A guest in a private workspace trusts only that workspace, so each has its
+    # own certificate over the one key. Main keeps the paths above, so existing
+    # caches and older SDKs on this machine keep working.
+    def workspace_ssh_certificate(self, workspace_id: str) -> Path:
+        if workspace_id == MAIN_WORKSPACE_ID:
+            return self.ssh_certificate
+        return self.sandbox_keys / f"id_ed25519-{_workspace_key(workspace_id)}-cert.pub"
+
+    def workspace_ssh_certificate_meta(self, workspace_id: str) -> Path:
+        if workspace_id == MAIN_WORKSPACE_ID:
+            return self.ssh_certificate_meta
+        return self.sandbox_keys / f"id_ed25519-{_workspace_key(workspace_id)}-cert.json"
+
 
 class ClientConfig:
     """Resolved credentials. Explicit values, env, then CLI state win."""
@@ -74,6 +91,11 @@ class ClientConfig:
         if not config.api_token:
             raise AuthenticationError("no authentication token found; run 'tnr login'")
         return config
+
+
+def _workspace_key(workspace_id: str) -> str:
+    # Workspace IDs come from the API, so they never become part of a path as is.
+    return hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
 
 
 def _read_json(path: Path) -> dict[str, object]:

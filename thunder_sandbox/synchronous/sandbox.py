@@ -49,6 +49,7 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         """Create a sandbox, resolving an optional image before allocation.
@@ -65,6 +66,9 @@ class Sandbox:
         remains the runtime TTL and the readiness limit for positional commands.
         CPU-only sandboxes omit GPU options or use ``GPUType.NONE`` with
         ``gpu_count=0``. ``cpu=1`` and ``cpu=2`` follow the API resource catalog.
+
+        ``workspace`` is a workspace name or ID. Without one, ``TNR_WORKSPACE``
+        applies, and then main.
         """
         owns_client = client is None
         resolved_client = client or Client.from_cli()
@@ -86,6 +90,7 @@ class Sandbox:
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
+                    workspace=workspace,
                     client=resolved_client._client,
                 )
             )
@@ -114,6 +119,7 @@ class Sandbox:
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
+        workspace: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
         owns_client = client is None
@@ -136,6 +142,7 @@ class Sandbox:
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
+                    workspace=workspace,
                     client=resolved_client._client,
                 )
             )
@@ -182,12 +189,16 @@ class Sandbox:
         return wrapped
 
     @staticmethod
-    def from_name(name: str, *, client: Client | None = None) -> "Sandbox":
+    def from_name(
+        name: str, *, workspace: str | None = None, client: Client | None = None
+    ) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
             sandbox = resolved_client._bridge.run(
-                NativeSandbox.from_name(name, client=resolved_client._client)
+                NativeSandbox.from_name(
+                    name, workspace=workspace, client=resolved_client._client
+                )
             )
         except BaseException:
             if owns_client:
@@ -199,13 +210,15 @@ class Sandbox:
 
     @staticmethod
     async def from_name_async(
-        name: str, *, client: Client | None = None
+        name: str, *, workspace: str | None = None, client: Client | None = None
     ) -> "Sandbox":
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
             sandbox = await resolved_client._bridge.run_async(
-                NativeSandbox.from_name(name, client=resolved_client._client)
+                NativeSandbox.from_name(
+                    name, workspace=workspace, client=resolved_client._client
+                )
             )
         except BaseException:
             if owns_client:
@@ -230,6 +243,10 @@ class Sandbox:
     @property
     def image_id(self) -> str | None:
         return self._sandbox.image_id
+
+    @property
+    def workspace_id(self) -> str:
+        return self._sandbox.workspace_id
 
     @property
     def queued(self) -> bool:
