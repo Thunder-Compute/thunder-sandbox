@@ -110,13 +110,14 @@ class Client:
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
+        workspace: str | None = None,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return self._bridge.run(
             self._client.resolve_image(
                 image, timeout=timeout, gated_features=gated_features, spec=spec,
-                queue=queue,
+                queue=queue, workspace=workspace,
             )
         )
 
@@ -128,13 +129,14 @@ class Client:
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
+        workspace: str | None = None,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return await self._bridge.run_async(
             self._client.resolve_image(
                 image, timeout=timeout, gated_features=gated_features, spec=spec,
-                queue=queue,
+                queue=queue, workspace=workspace,
             )
         )
 

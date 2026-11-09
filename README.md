@@ -130,9 +130,11 @@ Clients are not tied to a workspace. Each call uses the first of:
 2. The `TNR_WORKSPACE` environment variable.
 3. `main`, which every organization has. Code that never mentions a workspace uses it.
 
-This applies to creating sandboxes, listing them and finding them by name. A sandbox ID needs no workspace, so `client.get_sandbox(id)` finds a sandbox in any workspace you can access, and everything you then do with it follows that sandbox. Sandbox images belong to the organization and work in all of its workspaces.
+This applies to creating sandboxes, listing them and finding them by name. A sandbox ID needs no workspace, so `client.get_sandbox(id)` finds a sandbox in any workspace you can access, and everything you then do with it follows that sandbox.
 
-Viewers can read a workspace's sandboxes. Starting, stopping and connecting to them takes the developer role.
+Images are built or imported in a workspace too: `Sandbox.create(image=...)` uses the workspace the sandbox starts in, and `client.resolve_image(image, workspace="research")` prepares one ahead of time. The organization builds each recipe once, so a Dockerfile or registry digest already built in another workspace comes back as the same image, ready at once, and is then listed in yours as well. Starting a sandbox from an image ID that another workspace lists, as the REST API allows, takes the developer role in a workspace that lists it and adds the image to the sandbox's workspace; otherwise the start fails with `NotFoundError`.
+
+Viewers can read a workspace's sandboxes. Starting, stopping and connecting to them, and building or importing images there, takes the developer role.
 
 `list_sandboxes` covers one workspace. Names can change, so anything long-lived, such as a cleanup job, should store workspace IDs.
 

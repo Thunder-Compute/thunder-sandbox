@@ -297,6 +297,7 @@ class Client:
         gated_features: Mapping[str, object] | None = None,
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
+        workspace: str | None = None,
     ) -> "ResolvedImage":
         """Build or import an image and wait until its managed image is ready.
 
@@ -304,6 +305,13 @@ class Client:
         does not reserve resources. Omit it for standalone image preparation.
         Set ``queue=True`` to admit builds without a sandbox capacity check.
         Image preparation still waits for the build within ``timeout``.
+
+        The image is listed in ``workspace``, a workspace name or ID. Without
+        one, ``TNR_WORKSPACE`` applies, and then main. Building or importing
+        takes the developer role there. The organization builds each recipe
+        once, so a Dockerfile or registry digest already built in another
+        workspace returns the same image, ready at once. An API from before
+        workspaces ignores the selector and lists images organization-wide.
         """
         from ..image import Image, _create_canonical_build_context
 
@@ -313,6 +321,8 @@ class Client:
             raise InvalidRequestError("queue must be a boolean")
         if timeout is not None and timeout <= 0:
             raise InvalidRequestError("image timeout must be positive or None")
+        workspace_id = await self._resolve_workspace(workspace)
+        scope = {} if workspace_id == MAIN_WORKSPACE_ID else {"workspace_id": workspace_id}
         deadline = None if timeout is None else time.monotonic() + timeout
 
         context = None
@@ -322,6 +332,7 @@ class Client:
                     "reference": image._registry_url,
                     "username": image._registry_username,
                     "password": image._registry_password,
+                    **scope,
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
@@ -331,11 +342,11 @@ class Client:
                     request_body["queue"] = True
                 if spec is not None:
                     request_body["spec"] = dict(spec)
-                response = await self._request(
-                    "POST",
+                response = await self._start_image(
                     "/sandbox-images/from-registry",
-                    body=request_body,
-                    timeout=self._request_timeout(deadline),
+                    request_body,
+                    deadline=deadline,
+                    workspace_id=workspace_id,
                 )
             else:
                 if image._context_directory is None:
@@ -358,6 +369,7 @@ class Client:
                     "build_options_hash": context.build_options_hash,
                     "archive_bytes": context.archive_bytes,
                     "ssh_public_key": upload_public_key,
+                    **scope,
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
@@ -367,11 +379,11 @@ class Client:
                     request_body["queue"] = True
                 if spec is not None:
                     request_body["spec"] = dict(spec)
-                response = await self._request(
-                    "POST",
+                response = await self._start_image(
                     "/sandbox-images/from-dockerfile",
-                    body=request_body,
-                    timeout=self._request_timeout(deadline),
+                    request_body,
+                    deadline=deadline,
+                    workspace_id=workspace_id,
                 )
                 upload = response.get("upload")
                 if upload is not None:
@@ -384,10 +396,37 @@ class Client:
                         deadline=deadline,
                     )
                 del upload_key
-            return await self._wait_for_image(response, deadline=deadline)
+            return await self._wait_for_image(
+                response, deadline=deadline, workspace_id=workspace_id
+            )
         finally:
             if context is not None:
                 await asyncio.to_thread(context.close)
+
+    async def _start_image(
+        self,
+        path: str,
+        body: dict[str, object],
+        *,
+        deadline: float | None,
+        workspace_id: str,
+    ) -> dict[str, Any]:
+        try:
+            return await self._request(
+                "POST", path, body=body, timeout=self._request_timeout(deadline)
+            )
+        except AuthenticationError as exc:
+            # A role that cannot build is not a bad token, which is what this
+            # error type otherwise suggests. Gated features are refused with
+            # the same code for a different reason, so that denial stays as is.
+            if exc.code != "forbidden" or "gatedFeatures" in body:
+                raise
+            raise AuthenticationError(
+                f"developer access to workspace {workspace_id!r} is required "
+                "to build or import its images",
+                code=exc.code,
+                status=exc.status,
+            ) from exc
 
     def _request_timeout(self, deadline: float | None) -> float:
         if deadline is None:
@@ -516,10 +555,19 @@ class Client:
             await connection.wait_closed()
 
     async def _wait_for_image(
-        self, response: dict[str, Any], *, deadline: float | None
+        self,
+        response: dict[str, Any],
+        *,
+        deadline: float | None,
+        workspace_id: str,
     ) -> "ResolvedImage":
         from ..image import ResolvedImage
 
+        # Without the selector, an image only a private workspace lists is not
+        # found while it builds.
+        scope: dict[str, object] = (
+            {} if workspace_id == MAIN_WORKSPACE_ID else {"workspace_id": workspace_id}
+        )
         while True:
             state = response.get("state")
             image_id = response.get("id")
@@ -535,7 +583,12 @@ class Client:
                     or not digest
                 ):
                     raise ConnectionError("Thunder returned an incomplete ready image")
-                return ResolvedImage(image_id, reference, digest)
+                return ResolvedImage(
+                    image_id,
+                    reference,
+                    digest,
+                    str(response.get("workspace_id") or workspace_id),
+                )
             if state == "FAILED":
                 code = response.get("failure_code")
                 detail = response.get("failure") or "image preparation failed"
@@ -552,6 +605,7 @@ class Client:
             response = await self._request(
                 "GET",
                 f"/sandbox-images/{image_id}",
+                query=scope,
                 timeout=self._request_timeout(deadline),
             )
 

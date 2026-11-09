@@ -1370,11 +1370,15 @@ class SynchronousClientTest(unittest.TestCase):
                 image = Image.from_registry("ubuntu:24.04")
                 features = {"image_feature": True}
                 self.assertEqual(
-                    client.resolve_image(image, timeout=42, gated_features=features, queue=True),
+                    client.resolve_image(
+                        image, timeout=42, gated_features=features, queue=True,
+                        workspace="research",
+                    ),
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features, spec=None, queue=True
+                    image, timeout=42, gated_features=features, spec=None, queue=True,
+                    workspace="research",
                 )
                 client._client.resolve_image.reset_mock()
                 self.assertEqual(
@@ -1386,7 +1390,8 @@ class SynchronousClientTest(unittest.TestCase):
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
-                    image, timeout=42, gated_features=features, spec=None, queue=True
+                    image, timeout=42, gated_features=features, spec=None, queue=True,
+                    workspace=None,
                 )
             finally:
                 client.close()
@@ -1450,6 +1455,12 @@ class SynchronousClientTest(unittest.TestCase):
 
 
 class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("TNR_WORKSPACE", None)
+
     async def test_queue_is_forwarded_to_registry_and_dockerfile_admission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1495,6 +1506,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                     image, gated_features={"image_feature": True}
                 )
                 self.assertEqual(resolved.id, "image-id")
+                self.assertEqual(resolved.workspace_id, "main")
                 client._request.assert_awaited_once()
                 request = client._request.await_args
                 self.assertEqual(request.args[:2], ("POST", "/sandbox-images/from-registry"))
@@ -1562,6 +1574,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(body["archive_bytes"], 0)
                 self.assertEqual(body["display_name"], "Training image")
                 self.assertEqual(body["gatedFeatures"], {"image_feature": True})
+                self.assertNotIn("workspace_id", body)
                 upload_public_key = asyncssh.import_public_key(body["ssh_public_key"])
                 archived_context = client._upload_image_context.await_args.args[0]
                 upload_private_key = client._upload_image_context.await_args.kwargs[
@@ -1578,6 +1591,7 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     status_call.args[:2], ("GET", "/sandbox-images/image-id")
                 )
+                self.assertEqual(status_call.kwargs["query"], {})
                 client._upload_image_context.assert_awaited_once()
             finally:
                 await client.close()
@@ -1712,7 +1726,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                             gpu_type=gpu_type, gpu_count=gpu_count,
                         )
                         client.resolve_image.assert_awaited_once_with(
-                            image, gated_features=None, spec=spec, queue=True
+                            image, gated_features=None, spec=spec, queue=True,
+                            workspace="main",
                         )
                         body = client._request.await_args_list[0].args[2]
                         self.assertIs(body["queue"], True)
@@ -1750,9 +1765,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 gated_features=None,
                 spec=None,
                 queue=False,
+                workspace=None,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
                 self.assertEqual(timeout, 7200)
+                self.assertEqual(workspace, "ws-a1")
                 self.assertEqual(gated_features, {"image_feature": True})
                 self.assertEqual(
                     spec, {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50}
@@ -1772,8 +1789,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     assert isinstance(body, dict)
                     self.assertEqual(body["image_id"], resolved.id)
                     self.assertEqual(body["gatedFeatures"], {"image_feature": True})
+                    self.assertEqual(body["workspace_id"], "ws-a1")
                     return {"id": "sbx-test"}
-                return {**SANDBOX_RESPONSE, "image_id": resolved.id}
+                return {
+                    **SANDBOX_RESPONSE, "image_id": resolved.id, "workspace_id": "ws-a1"
+                }
 
             client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=resolve
@@ -1782,7 +1802,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 side_effect=request
             )
             sandbox = await AsyncSandbox.create(
-                image=image, client=client, gated_features={"image_feature": True}
+                image=image, client=client, gated_features={"image_feature": True},
+                workspace="ws-a1",
             )
             self.assertEqual(sandbox.id, "sbx-test")
             self.assertEqual(sandbox.image_id, resolved.id)
@@ -4254,6 +4275,55 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
                 await client.create_sandbox(workspace="ws-a1")
             stop = client._request.await_args_list[2].args
             self.assertEqual(stop, ("POST", "/sandboxes/sbx-test/stop"))
+            await client.close()
+
+    async def test_an_image_builds_and_polls_in_a_private_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            for image, endpoint in (
+                (Image.from_registry("ubuntu:24.04"), "from-registry"),
+                (Image.from_dockerfile(directory), "from-dockerfile"),
+            ):
+                with self.subTest(endpoint=endpoint):
+                    client = self.client(directory)
+                    client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                        {"id": "image-id", "state": "BUILDING"},
+                        {
+                            "id": "image-id", "state": "READY", "workspace_id": "ws-a1",
+                            "managed_reference": "registry.example/image@sha256:digest",
+                            "managed_digest": "sha256:digest",
+                        },
+                    ])
+                    with mock.patch(
+                        "thunder_sandbox.asynchronous.client.asyncio.sleep",
+                        new=mock.AsyncMock(),
+                    ):
+                        resolved = await client.resolve_image(image, workspace="research")
+                    self.assertEqual(resolved.workspace_id, "ws-a1")
+                    build, poll = client._request.await_args_list
+                    self.assertEqual(build.args[1], "/sandbox-images/" + endpoint)
+                    self.assertEqual(build.kwargs["body"]["workspace_id"], "ws-a1")
+                    self.assertEqual(poll.kwargs["query"], {"workspace_id": "ws-a1"})
+                    await client.close()
+
+    async def test_a_viewer_is_told_building_images_needs_the_developer_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock(side_effect=AuthenticationError(  # type: ignore[method-assign]
+                "forbidden", code="forbidden", status=403
+            ))
+            with self.assertRaisesRegex(
+                AuthenticationError, "developer access to workspace 'ws-a1'"
+            ):
+                await client.resolve_image(
+                    Image.from_registry("ubuntu:24.04"), workspace="ws-a1"
+                )
+            with self.assertRaisesRegex(AuthenticationError, "^forbidden$"):
+                await client.resolve_image(
+                    Image.from_registry("ubuntu:24.04"),
+                    workspace="ws-a1",
+                    gated_features={"nydus": True},
+                )
             await client.close()
 
     async def test_listing_and_lookup_by_name_are_scoped(self) -> None:

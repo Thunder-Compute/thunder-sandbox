@@ -140,7 +140,8 @@ class Sandbox:
         are supported, subject to the API resource catalog.
 
         ``workspace`` is a workspace name or ID. Without one, ``TNR_WORKSPACE``
-        applies, and then main.
+        applies, and then main. The image is built or imported in that
+        workspace too, and listed there.
         """
         _validate_create_options(
             timeout=timeout,
@@ -169,7 +170,7 @@ class Sandbox:
             resolved_image = (
                 await resolved_client.resolve_image(
                     image, gated_features=gated_features, spec=resource_spec,
-                    queue=queue,
+                    queue=queue, workspace=workspace_id,
                 )
                 if image is not None
                 else None
