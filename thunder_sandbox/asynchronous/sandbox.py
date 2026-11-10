@@ -1461,16 +1461,29 @@ fi
             total += resources.gpu_count * pricing.gpu[resources.gpu_type]
         return total
 
-    async def get_cost(self) -> float:
-        """Return USD billed so far: ``info.billed_seconds()`` at current rates.
+    async def get_billed_seconds(self) -> int:
+        """Return whole seconds billed so far, fetching the sandbox when needed.
 
         A sandbox that has not reached a terminal status is refreshed first so a
-        stop since the last fetch is not billed as running time. Rates are today's,
-        so a price change during the sandbox's life is not reflected.
+        stop since the last fetch is not billed as running time. So is a finished
+        sandbox without ``ready_at``: list responses omit lifecycle events, so
+        ``info.billed_seconds()`` on a listed sandbox would otherwise be 0.
         """
-        if not self.status.terminal:
+        if not self.status.terminal or (
+            self.status is SandboxStatus.FINISHED and self.info.ready_at is None
+        ):
             await self.refresh()
-        return self.info.billed_seconds() / 3600 * await self.get_hourly_price()
+        return self.info.billed_seconds()
+
+    async def get_cost(self) -> float:
+        """Return USD billed so far: ``get_billed_seconds()`` at current rates.
+
+        The sandbox is fetched first when ``get_billed_seconds()`` would fetch
+        it. Rates are today's, so a price change during the sandbox's life is
+        not reflected.
+        """
+        seconds = await self.get_billed_seconds()
+        return seconds / 3600 * await self.get_hourly_price()
 
     async def refresh(self) -> "Sandbox":
         response = await self._client._request(
