@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from ._common.exceptions import InvalidRequestError
+from ._common.types import MAIN_WORKSPACE_ID
 
 MAX_BUILD_CONTEXT_BYTES = 5 * 1024 * 1024 * 1024
 _BUILD_OPTIONS = b"thunder-sandbox-build-options-v1\0Dockerfile"
@@ -106,11 +107,15 @@ def _validate_display_name(display_name: str | None) -> None:
 
 @dataclass(frozen=True)
 class ResolvedImage:
-    """An immutable Thunder-managed image ready for sandbox creation."""
+    """An immutable Thunder-managed image ready for sandbox creation.
+
+    ``workspace_id`` is the workspace the image was resolved in, which lists it.
+    """
 
     id: str
     managed_reference: str
     managed_digest: str
+    workspace_id: str = MAIN_WORKSPACE_ID
 
 
 @dataclass(frozen=True)
