@@ -1791,6 +1791,59 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
 
+    async def test_cost_of_a_listed_finished_sandbox_fetches_its_lifecycle(self) -> None:
+        def at(minute: int) -> str:
+            return f"2026-08-23T12:{minute:02d}:00Z"
+
+        logs = [
+            {"event": event, "timestamp": at(minute)}
+            for event, minute in (("created", 0), ("scheduled", 1), ("started", 2), ("ready", 3), ("finished", 33))
+        ]
+        finished = {**SANDBOX_RESPONSE, "status": "finished", "stopped_at": at(33)}
+        pricing = {"pricing": {"sandbox_vcpu": 0.5, "sandbox_memory_gb": 0.25, "sandbox_storage_gb": 0.01}}
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            try:
+                # List responses carry no lifecycle events.
+                listed = AsyncSandbox._from_response(client, {**finished, "logs": []})
+                self.assertIsNone(listed.info.ready_at)
+                self.assertEqual(listed.info.billed_seconds(), 0)
+
+                async def respond(method: str, path: str, *args: object, **kwargs: object) -> object:
+                    if path == "/pricing":
+                        return pricing
+                    self.assertEqual((method, path), ("GET", f"/sandboxes/{listed.id}"))
+                    return {**finished, "logs": logs}
+
+                client._request = mock.AsyncMock(side_effect=respond)
+                # 4 vCPU, 32 GiB, 50 GiB storage = $10.50/hour, for half an hour.
+                self.assertAlmostEqual(await listed.get_cost(), 5.25)
+                self.assertEqual(listed.info.ready_at, datetime(2026, 8, 23, 12, 3, tzinfo=timezone.utc))
+                self.assertEqual(listed.info.billed_seconds(), 30 * 60)
+
+                # Once the lifecycle is known, a finished sandbox is not fetched again.
+                client._request.reset_mock()
+                self.assertAlmostEqual(await listed.get_cost(), 5.25)
+                client._request.assert_awaited_once_with("GET", "/pricing")
+                client._request.reset_mock()
+                self.assertEqual(await listed.get_billed_seconds(), 30 * 60)
+                client._request.assert_not_awaited()
+
+                # Billed seconds alone fetch a listed sandbox too.
+                client._request.reset_mock()
+                other = AsyncSandbox._from_response(client, {**finished, "logs": []})
+                self.assertEqual(await other.get_billed_seconds(), 30 * 60)
+                client._request.assert_awaited_once_with("GET", f"/sandboxes/{other.id}")
+
+                # A failed sandbox never became ready, so it costs nothing without a fetch.
+                client._request.reset_mock()
+                failed = AsyncSandbox._from_response(client, {**finished, "status": "failed", "logs": []})
+                self.assertEqual(await failed.get_billed_seconds(), 0)
+                self.assertEqual(await failed.get_cost(), 0)
+                client._request.assert_awaited_once_with("GET", "/pricing")
+            finally:
+                await client.close()
+
     async def test_create_waits_for_image_before_starting_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
@@ -3806,8 +3859,10 @@ class SynchronousSandboxTest(unittest.TestCase):
             asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
             asynchronous.update_network_policy = mock.AsyncMock()  # type: ignore[method-assign]
             asynchronous.terminate = mock.AsyncMock()  # type: ignore[method-assign]
+            asynchronous.get_billed_seconds = mock.AsyncMock(return_value=42)  # type: ignore[method-assign]
             try:
                 self.assertIs(sandbox.refresh(), sandbox)
+                self.assertEqual(sandbox.get_billed_seconds(), 42)
                 self.assertIsNone(sandbox.poll())
                 self.assertEqual(sandbox.wait(timeout=3), 0)
                 self.assertIs(sandbox.wait_until_ready(timeout=4), sandbox)

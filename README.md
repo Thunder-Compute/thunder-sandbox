@@ -33,13 +33,13 @@ Alternatively, set `TNR_API_TOKEN` and, when using a non-default API endpoint,
 
 ## CPU-only sandboxes and queueing
 
-Omit GPU options for a CPU-only sandbox, or explicitly pass `gpu_type=thunder.GPUType.NONE, gpu_count=0`. Both `cpu=1` and `cpu=2` are supported. Memory is specified in whole GiB, including `memory=1`; the API's configured resource catalog determines which combinations are available.
+Omit GPU options for a CPU-only sandbox, or explicitly pass `gpu_type=thunder.GPUType.NONE, gpu_count=0`. CPU, memory and storage are whole numbers, with memory and storage in GiB. The API's resource catalog sets the allowed range for each and rejects a value outside it with `InvalidRequestError`, so small sizes such as `memory=1` may not be available.
 
 ```python
 sandbox = thunder.Sandbox.create(
-    cpu=1,
-    memory=1,
-    storage=10,
+    cpu=4,
+    memory=16,
+    storage=20,
     gpu_type=thunder.GPUType.NONE,
     gpu_count=0,
     queue=True,
@@ -162,17 +162,17 @@ The native asynchronous API supports `await client.get_pricing()` and `await san
 
 ## Sandbox cost and lifecycle timings
 
-`sandbox.info` carries the sandbox's lifecycle timestamps, all timezone-aware and `None` until the transition happens: `created_at`, `scheduled_at` (placed on a node), `started_at`, `ready_at`, `stopped_at` (finished or failed) and `expires_at` (when the TTL ends it).
+`sandbox.info` carries the sandbox's lifecycle timestamps, all timezone-aware and `None` until the transition happens: `created_at`, `scheduled_at` (placed on a node), `started_at`, `ready_at`, `stopped_at` (finished or failed) and `expires_at` (when the TTL ends it). `list_sandboxes` responses leave out the events behind `scheduled_at`, `started_at` and `ready_at`, so they are `None` on listed sandboxes until `sandbox.refresh()`. `sandbox.get_billed_seconds()` and `sandbox.get_cost()` fetch them when needed.
 
 `sandbox.get_cost()` returns the USD billed so far, including for stopped sandboxes found with `client.list_sandboxes(status="all")` or `client.get_sandbox(...)`:
 
 ```python
 with thunder.Client.from_cli() as client:
     for sandbox in client.list_sandboxes(status="finished"):
-        print(sandbox.id, sandbox.info.billed_seconds(), sandbox.get_cost())
+        print(sandbox.id, sandbox.get_billed_seconds(), sandbox.get_cost())
 ```
 
-`info.billed_seconds()` follows Thunder's metering: billing runs from `ready_at` to the earliest of `stopped_at`, `expires_at` and now, in whole seconds. Time spent queued or starting is not billed, and a sandbox that failed or never became ready bills nothing. `get_cost()` refreshes a sandbox that is not yet stopped, then multiplies its billed hours by `get_hourly_price()`. It uses today's rates, so it can differ from your invoice if prices changed while the sandbox ran, and it does not apply account-level credits or discounts. Async: `await sandbox.get_cost()`, or `await sandbox.get_cost_async()` on blocking objects.
+`sandbox.get_billed_seconds()` follows Thunder's metering: billing runs from `ready_at` to the earliest of `stopped_at`, `expires_at` and now, in whole seconds. Time spent queued or starting is not billed, and a sandbox that failed or never became ready bills nothing. It refreshes a sandbox that is not yet stopped, or a finished one without `ready_at` such as a listed one; `info.billed_seconds()` applies the same rule to the record you already have, without fetching. `get_cost()` multiplies the billed hours by `get_hourly_price()`. It uses today's rates, so it can differ from your invoice if prices changed while the sandbox ran, and it does not apply account-level credits or discounts. Async: `await sandbox.get_cost()` and `await sandbox.get_billed_seconds()`, or the `_async` variants on blocking objects.
 
 ## Handling errors
 

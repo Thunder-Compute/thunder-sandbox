@@ -528,6 +528,14 @@ class Sandbox:
         """Return the configured resources' USD/hour through the async adapter."""
         return await self._client._bridge.run_async(self._sandbox.get_hourly_price())
 
+    def get_billed_seconds(self) -> int:
+        """Return whole seconds billed so far, fetching a listed sandbox first."""
+        return self._client._bridge.run(self._sandbox.get_billed_seconds())
+
+    async def get_billed_seconds_async(self) -> int:
+        """Return whole seconds billed so far through the async adapter."""
+        return await self._client._bridge.run_async(self._sandbox.get_billed_seconds())
+
     def get_cost(self) -> float:
         """Return USD billed so far at current published rates."""
         return self._client._bridge.run(self._sandbox.get_cost())
