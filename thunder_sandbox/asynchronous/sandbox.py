@@ -1439,11 +1439,11 @@ fi
     async def _close_connection(self) -> None:
         await self._ssh_manager.close()
 
-    async def get_hourly_price(self) -> float:
-        """Return the configured resources' aggregate USD/hour at current rates.
+    async def get_price_per_second(self) -> float:
+        """Return the configured resources' aggregate USD/second at current rates.
 
         Uses stored resource quantities regardless of lifecycle status; this is
-        an hourly rate, not accrued charges. No SDK pricing cache is used.
+        a rate, not accrued charges. No SDK pricing cache is used.
         """
         pricing = await self._client.get_pricing()
         resources = self.info.resources
@@ -1459,31 +1459,8 @@ fi
                     code="pricing_unavailable",
                 )
             total += resources.gpu_count * pricing.gpu[resources.gpu_type]
-        return total
-
-    async def get_billed_seconds(self) -> int:
-        """Return whole seconds billed so far, fetching the sandbox when needed.
-
-        A sandbox that has not reached a terminal status is refreshed first so a
-        stop since the last fetch is not billed as running time. So is a finished
-        sandbox without ``ready_at``: list responses omit lifecycle events, so
-        ``info.billed_seconds()`` on a listed sandbox would otherwise be 0.
-        """
-        if not self.status.terminal or (
-            self.status is SandboxStatus.FINISHED and self.info.ready_at is None
-        ):
-            await self.refresh()
-        return self.info.billed_seconds()
-
-    async def get_cost(self) -> float:
-        """Return USD billed so far: ``get_billed_seconds()`` at current rates.
-
-        The sandbox is fetched first when ``get_billed_seconds()`` would fetch
-        it. Rates are today's, so a price change during the sandbox's life is
-        not reflected.
-        """
-        seconds = await self.get_billed_seconds()
-        return seconds / 3600 * await self.get_hourly_price()
+        # Published rates are per hour.
+        return total / 3600
 
     async def refresh(self) -> "Sandbox":
         response = await self._client._request(
@@ -1741,7 +1718,6 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         host_key = ssh_value.get("host_key")
         if host_key:
             _remember_host_key(sandbox_id, str(host_key))
-    lifecycle = _lifecycle_times(response.get("logs"))
     return SandboxInfo(
         id=sandbox_id,
         name=name,
@@ -1771,24 +1747,8 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         failure=str(response["failure"]) if response.get("failure") else None,
         image_id=str(response["image_id"]) if response.get("image_id") else None,
         stopped_at=_datetime(response.get("stopped_at"), optional=True),
-        scheduled_at=lifecycle.get("scheduled"),
-        started_at=lifecycle.get("started"),
-        ready_at=lifecycle.get("ready"),
+        ready_at=_datetime(response.get("ready_at"), optional=True),
     )
-
-
-def _lifecycle_times(logs: object) -> dict[str, datetime]:
-    """Map each lifecycle event in the API's ``logs`` to its first timestamp."""
-    times: dict[str, datetime] = {}
-    if not isinstance(logs, list):
-        return times
-    for log in logs:
-        if not isinstance(log, dict) or not log.get("timestamp"):
-            continue
-        event = str(log.get("event", ""))
-        if event not in times:
-            times[event] = _datetime(log["timestamp"])
-    return times
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

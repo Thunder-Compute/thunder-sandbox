@@ -520,29 +520,13 @@ class Sandbox:
             )
         )
 
-    def get_hourly_price(self) -> float:
-        """Return the configured resources' USD/hour at current published rates."""
-        return self._client._bridge.run(self._sandbox.get_hourly_price())
+    def get_price_per_second(self) -> float:
+        """Return the configured resources' USD/second at current published rates."""
+        return self._client._bridge.run(self._sandbox.get_price_per_second())
 
-    async def get_hourly_price_async(self) -> float:
-        """Return the configured resources' USD/hour through the async adapter."""
-        return await self._client._bridge.run_async(self._sandbox.get_hourly_price())
-
-    def get_billed_seconds(self) -> int:
-        """Return whole seconds billed so far, fetching a listed sandbox first."""
-        return self._client._bridge.run(self._sandbox.get_billed_seconds())
-
-    async def get_billed_seconds_async(self) -> int:
-        """Return whole seconds billed so far through the async adapter."""
-        return await self._client._bridge.run_async(self._sandbox.get_billed_seconds())
-
-    def get_cost(self) -> float:
-        """Return USD billed so far at current published rates."""
-        return self._client._bridge.run(self._sandbox.get_cost())
-
-    async def get_cost_async(self) -> float:
-        """Return USD billed so far through the async adapter."""
-        return await self._client._bridge.run_async(self._sandbox.get_cost())
+    async def get_price_per_second_async(self) -> float:
+        """Return the configured resources' USD/second through the async adapter."""
+        return await self._client._bridge.run_async(self._sandbox.get_price_per_second())
 
     def refresh(self) -> "Sandbox":
         self._client._bridge.run(self._sandbox.refresh())

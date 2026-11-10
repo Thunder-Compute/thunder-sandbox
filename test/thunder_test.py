@@ -1747,100 +1747,82 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
-    async def test_lifecycle_timings_and_cost_follow_metering(self) -> None:
+    async def test_lifecycle_timestamps_come_from_top_level_fields(self) -> None:
         def at(minute: int) -> str:
             return f"2026-08-23T12:{minute:02d}:00Z"
 
-        logs = [
-            {"event": event, "timestamp": at(minute)}
-            for event, minute in (("created", 0), ("scheduled", 1), ("started", 2), ("ready", 3), ("info", 4), ("finished", 33))
-        ]
-        finished = {**SANDBOX_RESPONSE, "status": "finished", "stopped_at": at(33), "logs": logs}
+        def utc(minute: int) -> datetime:
+            return datetime(2026, 8, 23, 12, minute, tzinfo=timezone.utc)
+
+        finished = {
+            **SANDBOX_RESPONSE, "status": "finished", "created_at": at(0), "ready_at": at(3),
+            "stopped_at": at(33), "expires_at": at(40),
+        }
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
+            client._request = mock.AsyncMock()
             try:
-                sandbox = AsyncSandbox._from_response(client, finished)
-                info = sandbox.info
-                self.assertEqual(info.scheduled_at, datetime(2026, 8, 23, 12, 1, tzinfo=timezone.utc))
-                self.assertEqual(info.started_at, datetime(2026, 8, 23, 12, 2, tzinfo=timezone.utc))
-                self.assertEqual(info.ready_at, datetime(2026, 8, 23, 12, 3, tzinfo=timezone.utc))
-                self.assertEqual(info.stopped_at, datetime(2026, 8, 23, 12, 33, tzinfo=timezone.utc))
-                # Ready to stop: queueing and startup are not billed.
-                self.assertEqual(info.billed_seconds(), 30 * 60)
+                # List and get responses carry the same fields, and logs are not read:
+                # an empty list and a contradicting "ready" event change nothing.
+                for logs in ([], [{"event": "ready", "timestamp": at(9)}]):
+                    info = AsyncSandbox._from_response(client, {**finished, "logs": logs}).info
+                    self.assertEqual(
+                        (info.created_at, info.ready_at, info.stopped_at, info.expires_at),
+                        (utc(0), utc(3), utc(33), utc(40)),
+                    )
+                    self.assertEqual(info.ready_at.tzinfo, timezone.utc)
+                client._request.assert_not_awaited()
 
-                expiring = AsyncSandbox._from_response(
-                    client, {**SANDBOX_RESPONSE, "logs": logs, "expires_at": at(13)}
-                ).info
-                self.assertEqual(expiring.billed_seconds(), 10 * 60)
-                running = AsyncSandbox._from_response(client, {**SANDBOX_RESPONSE, "logs": logs}).info
-                self.assertEqual(
-                    running.billed_seconds(datetime(2026, 8, 23, 12, 3, 59, 900000, tzinfo=timezone.utc)), 59
-                )
-                failed = AsyncSandbox._from_response(client, {**finished, "status": "failed"}).info
-                self.assertEqual(failed.billed_seconds(), 0)
-                never_ready = AsyncSandbox._from_response(client, {**finished, "logs": logs[:3]}).info
-                self.assertIsNone(never_ready.ready_at)
-                self.assertEqual(never_ready.billed_seconds(), 0)
-
-                client._request = mock.AsyncMock(return_value={
-                    "pricing": {"sandbox_vcpu": 0.5, "sandbox_memory_gb": 0.25, "sandbox_storage_gb": 0.01}
-                })
-                # 4 vCPU, 32 GiB, 50 GiB storage = $10.50/hour, for half an hour.
-                self.assertAlmostEqual(await sandbox.get_cost(), 5.25)
-                client._request.assert_awaited_once_with("GET", "/pricing")
+                # A sandbox that has not become ready, or failed first, has no ready_at.
+                pending = {**SANDBOX_RESPONSE, "status": "created", "created_at": at(0)}
+                info = AsyncSandbox._from_response(client, pending).info
+                self.assertIsNone(info.ready_at)
+                self.assertIsNone(info.stopped_at)
+                self.assertFalse(hasattr(info, "scheduled_at") or hasattr(info, "started_at"))
             finally:
                 await client.close()
 
-    async def test_cost_of_a_listed_finished_sandbox_fetches_its_lifecycle(self) -> None:
-        def at(minute: int) -> str:
-            return f"2026-08-23T12:{minute:02d}:00Z"
-
-        logs = [
-            {"event": event, "timestamp": at(minute)}
-            for event, minute in (("created", 0), ("scheduled", 1), ("started", 2), ("ready", 3), ("finished", 33))
-        ]
-        finished = {**SANDBOX_RESPONSE, "status": "finished", "stopped_at": at(33)}
-        pricing = {"pricing": {"sandbox_vcpu": 0.5, "sandbox_memory_gb": 0.25, "sandbox_storage_gb": 0.01}}
+    async def test_pricing_reads_sandbox_rates(self) -> None:
+        rates = {
+            "sandbox_vcpu": 0.051, "sandbox_memory_gb": 0.016, "sandbox_storage_gb": 0.00012,
+            "sandbox_h100": 2.95, "h100": 3.2, "a6000_x1": 0.35,
+        }
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             try:
-                # List responses carry no lifecycle events.
-                listed = AsyncSandbox._from_response(client, {**finished, "logs": []})
-                self.assertIsNone(listed.info.ready_at)
-                self.assertEqual(listed.info.billed_seconds(), 0)
-
-                async def respond(method: str, path: str, *args: object, **kwargs: object) -> object:
-                    if path == "/pricing":
-                        return pricing
-                    self.assertEqual((method, path), ("GET", f"/sandboxes/{listed.id}"))
-                    return {**finished, "logs": logs}
-
-                client._request = mock.AsyncMock(side_effect=respond)
-                # 4 vCPU, 32 GiB, 50 GiB storage = $10.50/hour, for half an hour.
-                self.assertAlmostEqual(await listed.get_cost(), 5.25)
-                self.assertEqual(listed.info.ready_at, datetime(2026, 8, 23, 12, 3, tzinfo=timezone.utc))
-                self.assertEqual(listed.info.billed_seconds(), 30 * 60)
-
-                # Once the lifecycle is known, a finished sandbox is not fetched again.
-                client._request.reset_mock()
-                self.assertAlmostEqual(await listed.get_cost(), 5.25)
+                client._request = mock.AsyncMock(return_value={"pricing": rates})
+                pricing = await client.get_pricing()
                 client._request.assert_awaited_once_with("GET", "/pricing")
-                client._request.reset_mock()
-                self.assertEqual(await listed.get_billed_seconds(), 30 * 60)
-                client._request.assert_not_awaited()
+                # Only sandbox rates count, and GPUs without one are left out.
+                self.assertEqual(
+                    pricing,
+                    thunder.Pricing(vcpu=0.051, storage_gb=0.00012, memory_gb=0.016, gpu={GPUType.H100: 2.95}),
+                )
+                for broken in ({**rates, "sandbox_vcpu": -1}, {**rates, "sandbox_vcpu": True}, {"sandbox_vcpu": 0.051}):
+                    client._request = mock.AsyncMock(return_value={"pricing": broken})
+                    with self.assertRaises(thunder.ThunderError):
+                        await client.get_pricing()
+            finally:
+                await client.close()
 
-                # Billed seconds alone fetch a listed sandbox too.
-                client._request.reset_mock()
-                other = AsyncSandbox._from_response(client, {**finished, "logs": []})
-                self.assertEqual(await other.get_billed_seconds(), 30 * 60)
-                client._request.assert_awaited_once_with("GET", f"/sandboxes/{other.id}")
-
-                # A failed sandbox never became ready, so it costs nothing without a fetch.
-                client._request.reset_mock()
-                failed = AsyncSandbox._from_response(client, {**finished, "status": "failed", "logs": []})
-                self.assertEqual(await failed.get_billed_seconds(), 0)
-                self.assertEqual(await failed.get_cost(), 0)
-                client._request.assert_awaited_once_with("GET", "/pricing")
+    async def test_price_per_second_sums_the_sandbox_resources(self) -> None:
+        rates = {"sandbox_vcpu": 0.5, "sandbox_memory_gb": 0.25, "sandbox_storage_gb": 0.01, "sandbox_h100": 3.0}
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            try:
+                client._request = mock.AsyncMock(return_value={"pricing": rates})
+                # 4 vCPU, 32 GiB memory, 50 GiB storage: $10.50 per hour.
+                cpu_only = AsyncSandbox._from_response(client, SANDBOX_RESPONSE)
+                self.assertAlmostEqual(await cpu_only.get_price_per_second(), 10.5 / 3600)
+                spec = {**SANDBOX_RESPONSE["spec"], "gpu_type": "H100", "gpu_count": 2}
+                with_gpus = AsyncSandbox._from_response(client, {**SANDBOX_RESPONSE, "spec": spec})
+                self.assertAlmostEqual(await with_gpus.get_price_per_second(), 16.5 / 3600)
+                unpriced = AsyncSandbox._from_response(
+                    client, {**SANDBOX_RESPONSE, "spec": {**spec, "gpu_type": "A6000"}}
+                )
+                with self.assertRaises(thunder.ThunderError) as raised:
+                    await unpriced.get_price_per_second()
+                self.assertEqual(raised.exception.code, "pricing_unavailable")
             finally:
                 await client.close()
 
@@ -3859,10 +3841,8 @@ class SynchronousSandboxTest(unittest.TestCase):
             asynchronous.wait_until_ready = mock.AsyncMock(return_value=asynchronous)  # type: ignore[method-assign]
             asynchronous.update_network_policy = mock.AsyncMock()  # type: ignore[method-assign]
             asynchronous.terminate = mock.AsyncMock()  # type: ignore[method-assign]
-            asynchronous.get_billed_seconds = mock.AsyncMock(return_value=42)  # type: ignore[method-assign]
             try:
                 self.assertIs(sandbox.refresh(), sandbox)
-                self.assertEqual(sandbox.get_billed_seconds(), 42)
                 self.assertIsNone(sandbox.poll())
                 self.assertEqual(sandbox.wait(timeout=3), 0)
                 self.assertIs(sandbox.wait_until_ready(timeout=4), sandbox)
