@@ -140,7 +140,7 @@ Viewers can read a workspace's sandboxes. Starting, stopping and connecting to t
 
 ## Live pricing
 
-Fetch current resource rates as a `thunder.Pricing` object, or get a sandbox's aggregate hourly rate:
+Fetch current resource rates as a `thunder.Pricing` object, or get a sandbox's aggregate rate per second:
 
 ```python
 with thunder.Client.from_cli() as client:
@@ -149,30 +149,28 @@ with thunder.Client.from_cli() as client:
     print(pricing.gpu[thunder.GPUType.H100])
 
     sandbox = client.get_sandbox("sbx-your-id")
-    print(sandbox.get_hourly_price())
+    print(sandbox.get_price_per_second())
 ```
 
-All rates are USD per resource-hour. `memory_gb` and `storage_gb` are per **GiB**, matching sandbox resource quantities. The GPU dictionary contains only published rates, keyed by `GPUType`; A100XL is distinct from A100.
+`Pricing` rates are USD per resource-hour. `memory_gb` and `storage_gb` are per **GiB**, matching sandbox resource quantities. The GPU dictionary contains only published rates, keyed by `GPUType`; A100XL is distinct from A100.
 
-Each call fetches pricing from the API without SDK caching; the API's own caching still applies. The sandbox total includes every configured vCPU, GiB of memory, GiB of storage, and GPU, with no included-resource allowance or rounding. It uses the sandbox object's stored resources regardless of lifecycle status and reports an hourly rate, not accrued charges.
+Each call fetches pricing from the API without SDK caching; the API's own caching still applies. The sandbox total includes every configured vCPU, GiB of memory, GiB of storage, and GPU, with no included-resource allowance or rounding. It uses the sandbox object's stored resources regardless of lifecycle status and reports USD per second (the hourly rates divided by 3600), not accrued charges.
 
 Invalid or missing base rates raise `ThunderError` with code `invalid_pricing`. A sandbox using an unpriced GPU raises `ThunderError` with code `pricing_unavailable` rather than returning a partial total.
 
-The native asynchronous API supports `await client.get_pricing()` and `await sandbox.get_hourly_price()`. Blocking objects also expose `await client.get_pricing_async()` and `await sandbox.get_hourly_price_async()`.
+The native asynchronous API supports `await client.get_pricing()` and `await sandbox.get_price_per_second()`. Blocking objects also expose `await client.get_pricing_async()` and `await sandbox.get_price_per_second_async()`.
 
-## Sandbox cost and lifecycle timings
+## Sandbox lifecycle timings
 
-`sandbox.info` carries the sandbox's lifecycle timestamps, all timezone-aware and `None` until the transition happens: `created_at`, `scheduled_at` (placed on a node), `started_at`, `ready_at`, `stopped_at` (finished or failed) and `expires_at` (when the TTL ends it). `list_sandboxes` responses leave out the events behind `scheduled_at`, `started_at` and `ready_at`, so they are `None` on listed sandboxes until `sandbox.refresh()`. `sandbox.get_billed_seconds()` and `sandbox.get_cost()` fetch them when needed.
-
-`sandbox.get_cost()` returns the USD billed so far, including for stopped sandboxes found with `client.list_sandboxes(status="all")` or `client.get_sandbox(...)`:
+`sandbox.info` carries the sandbox's lifecycle timestamps, all timezone-aware: `created_at`, `ready_at`, `stopped_at` (finished or failed) and `expires_at` (when the TTL ends it). Sandboxes from `list_sandboxes`, `get_sandbox` and `create` carry the same fields, so reading them never makes a request:
 
 ```python
 with thunder.Client.from_cli() as client:
     for sandbox in client.list_sandboxes(status="finished"):
-        print(sandbox.id, sandbox.get_billed_seconds(), sandbox.get_cost())
+        print(sandbox.id, sandbox.info.ready_at, sandbox.info.stopped_at)
 ```
 
-`sandbox.get_billed_seconds()` follows Thunder's metering: billing runs from `ready_at` to the earliest of `stopped_at`, `expires_at` and now, in whole seconds. Time spent queued or starting is not billed, and a sandbox that failed or never became ready bills nothing. It refreshes a sandbox that is not yet stopped, or a finished one without `ready_at` such as a listed one; `info.billed_seconds()` applies the same rule to the record you already have, without fetching. `get_cost()` multiplies the billed hours by `get_hourly_price()`. It uses today's rates, so it can differ from your invoice if prices changed while the sandbox ran, and it does not apply account-level credits or discounts. Async: `await sandbox.get_cost()` and `await sandbox.get_billed_seconds()`, or the `_async` variants on blocking objects.
+A timestamp is `None` until its transition happens: `ready_at` before the sandbox is ready, or for good if it failed first, and `stopped_at` while it runs. The values are as of the last fetch, so call `sandbox.refresh()` to see transitions since then.
 
 ## Handling errors
 

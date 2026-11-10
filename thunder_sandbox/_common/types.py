@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -157,21 +157,4 @@ class SandboxInfo:
     queued: bool = False
     workspace_id: str = MAIN_WORKSPACE_ID
     stopped_at: datetime | None = None
-    scheduled_at: datetime | None = None
-    started_at: datetime | None = None
     ready_at: datetime | None = None
-
-    def billed_seconds(self, now: datetime | None = None) -> int:
-        """Whole seconds billed so far, by the same rule Thunder meters with.
-
-        Billing runs from ``ready_at`` to the earliest of ``stopped_at``,
-        ``expires_at`` and ``now`` (timezone-aware; defaults to the current
-        time). A sandbox that failed or never became ready is not billed.
-        """
-        if self.status not in (SandboxStatus.READY, SandboxStatus.FINISHED) or self.ready_at is None:
-            return 0
-        end = now or datetime.now(timezone.utc)
-        for bound in (self.stopped_at, self.expires_at):
-            if bound is not None and bound < end:
-                end = bound
-        return max(0, int((end - self.ready_at).total_seconds()))
