@@ -158,6 +158,20 @@ Invalid or missing base rates raise `ThunderError` with code `invalid_pricing`. 
 
 The native asynchronous API supports `await client.get_pricing()` and `await sandbox.get_hourly_price()`. Blocking objects also expose `await client.get_pricing_async()` and `await sandbox.get_hourly_price_async()`.
 
+## Sandbox cost and lifecycle timings
+
+`sandbox.info` carries the sandbox's lifecycle timestamps, all timezone-aware and `None` until the transition happens: `created_at`, `scheduled_at` (placed on a node), `started_at`, `ready_at`, `stopped_at` (finished or failed) and `expires_at` (when the TTL ends it).
+
+`sandbox.get_cost()` returns the USD billed so far, including for stopped sandboxes found with `client.list_sandboxes(status="all")` or `client.get_sandbox(...)`:
+
+```python
+with thunder.Client.from_cli() as client:
+    for sandbox in client.list_sandboxes(status="finished"):
+        print(sandbox.id, sandbox.info.billed_seconds(), sandbox.get_cost())
+```
+
+`info.billed_seconds()` follows Thunder's metering: billing runs from `ready_at` to the earliest of `stopped_at`, `expires_at` and now, in whole seconds. Time spent queued or starting is not billed, and a sandbox that failed or never became ready bills nothing. `get_cost()` refreshes a sandbox that is not yet stopped, then multiplies its billed hours by `get_hourly_price()`. It uses today's rates, so it can differ from your invoice if prices changed while the sandbox ran, and it does not apply account-level credits or discounts. Async: `await sandbox.get_cost()`, or `await sandbox.get_cost_async()` on blocking objects.
+
 ## Handling errors
 
 Conditions worth retrying are typed, so they can be caught without matching on
