@@ -1140,6 +1140,49 @@ class ImageTest(unittest.TestCase):
                 repr(image), f"Image.from_dockerfile({str(context.resolve())!r})"
             )
 
+    def test_dockerfile_image_accepts_base_image_registry_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = Path(directory)
+            (context / "Dockerfile").write_text("FROM ghcr.io/acme/base:1\n")
+            for host in ("ghcr.io", "docker.io", "registry.example.com:5000", "localhost:5000"):
+                with self.subTest(host=host):
+                    image = Image.from_dockerfile(
+                        context,
+                        registry_host=host,
+                        registry_username="user",
+                        registry_password="secret",
+                    )
+                    self.assertNotIn("secret", repr(image))
+                    self.assertIn("<redacted>", repr(image))
+                    self.assertIn(host, repr(image))
+
+    def test_dockerfile_image_rejects_invalid_registry_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = Path(directory)
+            (context / "Dockerfile").write_text("FROM ghcr.io/acme/base:1\n")
+            for host, username, password in (
+                ("ghcr.io", None, None),
+                (None, "user", "secret"),
+                ("ghcr.io", "user", None),
+                ("ghcr.io", None, "secret"),
+                ("ghcr.io", "", "secret"),
+                ("ghcr.io", "user", ""),
+                ("", "user", "secret"),
+                ("https://ghcr.io", "user", "secret"),
+                ("ghcr.io/acme", "user", "secret"),
+                ("ghcr .io", "user", "secret"),
+                ("ghcr.io", "u" * 1025, "secret"),
+                ("ghcr.io", "user", "p" * 8193),
+            ):
+                with self.subTest(host=host, username=username, password=password):
+                    with self.assertRaises(InvalidRequestError):
+                        Image.from_dockerfile(
+                            context,
+                            registry_host=host,
+                            registry_username=username,
+                            registry_password=password,
+                        )
+
     def test_image_display_name_must_be_trimmed_single_line_and_bounded(self) -> None:
         for display_name in (" image", "image\nname", "é" * 65):
             with self.subTest(display_name=display_name):
@@ -1483,6 +1526,43 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                         self.assertIs(call.kwargs["body"]["queue"], True)
                     finally:
                         await client.close()
+
+    async def test_dockerfile_registry_credentials_are_sent_outside_the_recipe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_text("FROM ghcr.io/acme/base:1\n")
+            bodies = []
+            for image in (
+                Image.from_dockerfile(root),
+                Image.from_dockerfile(
+                    root,
+                    registry_host="ghcr.io",
+                    registry_username="user",
+                    registry_password="secret",
+                ),
+            ):
+                client = AsyncClient(config(directory))
+                client._request = mock.AsyncMock(return_value={
+                    "id": "image-id", "state": "READY",
+                    "managed_reference": "registry.example/image@sha256:digest",
+                    "managed_digest": "sha256:digest",
+                })
+                try:
+                    await client.resolve_image(image)
+                    bodies.append(client._request.await_args.kwargs["body"])
+                finally:
+                    await client.close()
+
+            anonymous, authenticated = bodies
+            for key in ("registry_host", "registry_username", "registry_password"):
+                self.assertNotIn(key, anonymous)
+            self.assertEqual(authenticated["registry_host"], "ghcr.io")
+            self.assertEqual(authenticated["registry_username"], "user")
+            self.assertEqual(authenticated["registry_password"], "secret")
+            for key in ("recipe_hash", "context_hash", "dockerfile_hash", "build_options_hash"):
+                self.assertEqual(anonymous[key], authenticated[key])
 
     async def test_registry_image_is_imported_and_returned_when_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

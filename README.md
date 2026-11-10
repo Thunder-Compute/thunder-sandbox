@@ -412,6 +412,19 @@ finally:
     sandbox.terminate()
 ```
 
+When the Dockerfile's `FROM` image is in a private registry, pass a credential for that registry:
+
+```python
+image = thunder.Image.from_dockerfile(
+    "./server-image",
+    registry_host="ghcr.io",
+    registry_username="my-user",
+    registry_password=os.environ["GHCR_TOKEN"],
+)
+```
+
+The credential is offered only to `registry_host` (use `docker.io` for Docker Hub). Base images from any other registry must be public. Credentials are not part of the image's cache key: an already-built image with the same build context is reused without pulling again.
+
 `Image.from_registry(...)` uses the same image-command behavior. Inherited defaults count too: a base image's shell or interpreter command can exit immediately when started without interactive input.
 
 If both `ENTRYPOINT` and `CMD` are absent or empty, the sandbox stays available for `sandbox.exec(...)` without running an initial command. To prevent an inherited command from running, clear both defaults:

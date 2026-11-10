@@ -373,6 +373,10 @@ class Client:
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
+                if image._registry_host is not None:
+                    request_body["registry_host"] = image._registry_host
+                    request_body["registry_username"] = image._registry_username
+                    request_body["registry_password"] = image._registry_password
                 if gated_features is not None:
                     request_body["gatedFeatures"] = dict(gated_features)
                 if queue:
