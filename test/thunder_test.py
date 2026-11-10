@@ -1841,6 +1841,48 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await failed.get_billed_seconds(), 0)
                 self.assertEqual(await failed.get_cost(), 0)
                 client._request.assert_awaited_once_with("GET", "/pricing")
+
+                # Terminated during startup: the full read has no ready event, and
+                # that confirmed absence is not fetched again.
+                never_ready = AsyncSandbox._from_response(client, {**finished, "logs": []})
+
+                async def respond_never_ready(
+                    method: str, path: str, *args: object, **kwargs: object
+                ) -> object:
+                    if path == "/pricing":
+                        return pricing
+                    self.assertEqual((method, path), ("GET", f"/sandboxes/{never_ready.id}"))
+                    return {**finished, "logs": logs[:3]}
+
+                client._request = mock.AsyncMock(side_effect=respond_never_ready)
+                self.assertEqual(await never_ready.get_billed_seconds(), 0)
+                self.assertIsNone(never_ready.info.ready_at)
+                self.assertEqual(await never_ready.get_billed_seconds(), 0)
+                self.assertEqual(await never_ready.get_cost(), 0)
+                self.assertEqual(
+                    [call.args for call in client._request.await_args_list],
+                    [
+                        ("GET", f"/sandboxes/{never_ready.id}"),
+                        ("GET", "/pricing"),
+                    ],
+                )
+
+                # Loaded by ID from that same full document: nothing left to fetch.
+                client._request = mock.AsyncMock(side_effect=[
+                    {**finished, "logs": logs[:3]},
+                    pricing,
+                ])
+                loaded = await AsyncSandbox.from_id(never_ready.id, client=client)
+                self.assertIsNone(loaded.info.ready_at)
+                self.assertEqual(await loaded.get_billed_seconds(), 0)
+                self.assertEqual(await loaded.get_cost(), 0)
+                self.assertEqual(
+                    [call.args for call in client._request.await_args_list],
+                    [
+                        ("GET", f"/sandboxes/{never_ready.id}"),
+                        ("GET", "/pricing"),
+                    ],
+                )
             finally:
                 await client.close()
 

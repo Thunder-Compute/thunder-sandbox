@@ -99,6 +99,10 @@ class Sandbox:
         self._client = client
         self._owns_client = owns_client
         self._info = info
+        # List responses omit lifecycle events, so a missing ``ready_at`` there
+        # is not evidence the sandbox never became ready. A full sandbox GET
+        # records that the timestamps now on ``_info`` are complete.
+        self._lifecycle_known = False
         self._main_process: Process[str] | None = None
         self._ssh_manager = SSHConnectionManager(self._open_connection)
 
@@ -265,6 +269,7 @@ class Sandbox:
             )
             sandbox = Sandbox._from_response(resolved_client, response)
             sandbox._owns_client = owns_client
+            sandbox._lifecycle_known = True
             return sandbox
         except BaseException:
             if owns_client:
@@ -1344,6 +1349,7 @@ fi
                     "Thunder returned a different sandbox during policy enforcement"
                 )
             self._info = _info_from_response(self._client.config.paths, response)
+            self._lifecycle_known = True
             if self.status.terminal:
                 raise SandboxFailedError(
                     f"sandbox {self.id} stopped before policy enforcement was confirmed "
@@ -1466,11 +1472,15 @@ fi
 
         A sandbox that has not reached a terminal status is refreshed first so a
         stop since the last fetch is not billed as running time. So is a finished
-        sandbox without ``ready_at``: list responses omit lifecycle events, so
-        ``info.billed_seconds()`` on a listed sandbox would otherwise be 0.
+        sandbox whose lifecycle timestamps are not loaded yet: list responses omit
+        those events, so ``info.billed_seconds()`` on a listed sandbox would
+        otherwise be 0. A full read that confirms the sandbox never became ready
+        is not repeated.
         """
         if not self.status.terminal or (
-            self.status is SandboxStatus.FINISHED and self.info.ready_at is None
+            self.status is SandboxStatus.FINISHED
+            and self.info.ready_at is None
+            and not self._lifecycle_known
         ):
             await self.refresh()
         return self.info.billed_seconds()
@@ -1490,6 +1500,7 @@ fi
             "GET", f"/sandboxes/{_path_segment(self.id)}"
         )
         self._info = _info_from_response(self._client.config.paths, response)
+        self._lifecycle_known = True
         return self
 
     async def poll(self) -> int | None:
@@ -1643,6 +1654,9 @@ fi
             client._wait_endpoint_available = False
             return
         self._info = _info_from_response(client.config.paths, response)
+        # This is not ``GET /sandboxes/{id}``. Its body may omit lifecycle
+        # events, so a missing ``ready_at`` still needs a full read.
+        self._lifecycle_known = False
 
     async def terminate(self, *, timeout: float | None = 300) -> None:
         try:
