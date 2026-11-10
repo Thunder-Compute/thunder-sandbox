@@ -1461,6 +1461,17 @@ fi
             total += resources.gpu_count * pricing.gpu[resources.gpu_type]
         return total
 
+    async def get_cost(self) -> float:
+        """Return USD billed so far: ``info.billed_seconds()`` at current rates.
+
+        A sandbox that has not reached a terminal status is refreshed first so a
+        stop since the last fetch is not billed as running time. Rates are today's,
+        so a price change during the sandbox's life is not reflected.
+        """
+        if not self.status.terminal:
+            await self.refresh()
+        return self.info.billed_seconds() / 3600 * await self.get_hourly_price()
+
     async def refresh(self) -> "Sandbox":
         response = await self._client._request(
             "GET", f"/sandboxes/{_path_segment(self.id)}"
@@ -1717,6 +1728,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         host_key = ssh_value.get("host_key")
         if host_key:
             _remember_host_key(sandbox_id, str(host_key))
+    lifecycle = _lifecycle_times(response.get("logs"))
     return SandboxInfo(
         id=sandbox_id,
         name=name,
@@ -1745,7 +1757,25 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         ),
         failure=str(response["failure"]) if response.get("failure") else None,
         image_id=str(response["image_id"]) if response.get("image_id") else None,
+        stopped_at=_datetime(response.get("stopped_at"), optional=True),
+        scheduled_at=lifecycle.get("scheduled"),
+        started_at=lifecycle.get("started"),
+        ready_at=lifecycle.get("ready"),
     )
+
+
+def _lifecycle_times(logs: object) -> dict[str, datetime]:
+    """Map each lifecycle event in the API's ``logs`` to its first timestamp."""
+    times: dict[str, datetime] = {}
+    if not isinstance(logs, list):
+        return times
+    for log in logs:
+        if not isinstance(log, dict) or not log.get("timestamp"):
+            continue
+        event = str(log.get("event", ""))
+        if event not in times:
+            times[event] = _datetime(log["timestamp"])
+    return times
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

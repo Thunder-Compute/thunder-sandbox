@@ -1747,6 +1747,50 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         prepare_key(client.config.paths)
         return AsyncSandbox._from_response(client, SANDBOX_RESPONSE), client
 
+    async def test_lifecycle_timings_and_cost_follow_metering(self) -> None:
+        def at(minute: int) -> str:
+            return f"2026-08-23T12:{minute:02d}:00Z"
+
+        logs = [
+            {"event": event, "timestamp": at(minute)}
+            for event, minute in (("created", 0), ("scheduled", 1), ("started", 2), ("ready", 3), ("info", 4), ("finished", 33))
+        ]
+        finished = {**SANDBOX_RESPONSE, "status": "finished", "stopped_at": at(33), "logs": logs}
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            try:
+                sandbox = AsyncSandbox._from_response(client, finished)
+                info = sandbox.info
+                self.assertEqual(info.scheduled_at, datetime(2026, 8, 23, 12, 1, tzinfo=timezone.utc))
+                self.assertEqual(info.started_at, datetime(2026, 8, 23, 12, 2, tzinfo=timezone.utc))
+                self.assertEqual(info.ready_at, datetime(2026, 8, 23, 12, 3, tzinfo=timezone.utc))
+                self.assertEqual(info.stopped_at, datetime(2026, 8, 23, 12, 33, tzinfo=timezone.utc))
+                # Ready to stop: queueing and startup are not billed.
+                self.assertEqual(info.billed_seconds(), 30 * 60)
+
+                expiring = AsyncSandbox._from_response(
+                    client, {**SANDBOX_RESPONSE, "logs": logs, "expires_at": at(13)}
+                ).info
+                self.assertEqual(expiring.billed_seconds(), 10 * 60)
+                running = AsyncSandbox._from_response(client, {**SANDBOX_RESPONSE, "logs": logs}).info
+                self.assertEqual(
+                    running.billed_seconds(datetime(2026, 8, 23, 12, 3, 59, 900000, tzinfo=timezone.utc)), 59
+                )
+                failed = AsyncSandbox._from_response(client, {**finished, "status": "failed"}).info
+                self.assertEqual(failed.billed_seconds(), 0)
+                never_ready = AsyncSandbox._from_response(client, {**finished, "logs": logs[:3]}).info
+                self.assertIsNone(never_ready.ready_at)
+                self.assertEqual(never_ready.billed_seconds(), 0)
+
+                client._request = mock.AsyncMock(return_value={
+                    "pricing": {"sandbox_vcpu": 0.5, "sandbox_memory_gb": 0.25, "sandbox_storage_gb": 0.01}
+                })
+                # 4 vCPU, 32 GiB, 50 GiB storage = $10.50/hour, for half an hour.
+                self.assertAlmostEqual(await sandbox.get_cost(), 5.25)
+                client._request.assert_awaited_once_with("GET", "/pricing")
+            finally:
+                await client.close()
+
     async def test_create_waits_for_image_before_starting_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
