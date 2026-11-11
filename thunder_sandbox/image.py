@@ -29,6 +29,7 @@ class Image:
     _registry_url: str | None = None
     _registry_username: str | None = None
     _registry_password: str | None = None
+    _registry_host: str | None = None
     _context_directory: Path | None = None
     _display_name: str | None = None
 
@@ -61,9 +62,21 @@ class Image:
 
     @staticmethod
     def from_dockerfile(
-        directory_path: str | Path, display_name: str | None = None
+        directory_path: str | Path,
+        display_name: str | None = None,
+        *,
+        registry_host: str | None = None,
+        registry_username: str | None = None,
+        registry_password: str | None = None,
     ) -> "Image":
-        """Create an image definition from a directory containing a Dockerfile."""
+        """Create an image definition from a directory containing a Dockerfile.
+
+        ``registry_host``, ``registry_username`` and ``registry_password``
+        optionally authenticate the build's base-image pulls (the Dockerfile's
+        ``FROM``) from a private registry. All three come together, and the
+        credential is offered only to ``registry_host`` (for example
+        ``ghcr.io`` or ``docker.io``), never to any other registry.
+        """
         if not isinstance(directory_path, (str, Path)):
             raise InvalidRequestError("Dockerfile directory must be a path")
         context_directory = Path(directory_path).expanduser().resolve()
@@ -78,8 +91,14 @@ class Image:
                 f"{context_directory}"
             )
         _validate_display_name(display_name)
+        _validate_build_registry_auth(
+            registry_host, registry_username, registry_password
+        )
         return Image(
             _source="dockerfile",
+            _registry_host=registry_host,
+            _registry_username=registry_username,
+            _registry_password=registry_password,
             _context_directory=context_directory,
             _display_name=display_name,
         )
@@ -88,7 +107,54 @@ class Image:
         if self._source == "registry":
             credentials = ", credentials=<redacted>" if self._registry_username else ""
             return f"Image.from_registry({self._registry_url!r}{credentials})"
-        return f"Image.from_dockerfile({str(self._context_directory)!r})"
+        credentials = (
+            f", registry_host={self._registry_host!r}, credentials=<redacted>"
+            if self._registry_username
+            else ""
+        )
+        return f"Image.from_dockerfile({str(self._context_directory)!r}{credentials})"
+
+
+_MAX_REGISTRY_USERNAME_BYTES = 1024
+_MAX_REGISTRY_PASSWORD_BYTES = 8192
+_REGISTRY_HOST_PATTERN = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*"
+    r"|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$"
+)
+
+
+def _validate_build_registry_auth(
+    host: str | None, username: str | None, password: str | None
+) -> None:
+    if host is None and username is None and password is None:
+        return
+    if (username is None) != (password is None):
+        raise InvalidRequestError(
+            "registry username and password must be provided together"
+        )
+    if username is None:
+        raise InvalidRequestError("registry_host requires registry credentials")
+    if host is None:
+        raise InvalidRequestError(
+            "registry credentials require the registry_host they are for"
+        )
+    if not all(isinstance(value, str) for value in (host, username, password)):
+        raise InvalidRequestError(
+            "registry host, username and password must be strings"
+        )
+    if not username or not password:
+        raise InvalidRequestError("registry username and password cannot be empty")
+    if (
+        len(username.encode("utf-8")) > _MAX_REGISTRY_USERNAME_BYTES
+        or len(password.encode("utf-8")) > _MAX_REGISTRY_PASSWORD_BYTES
+    ):
+        raise InvalidRequestError("registry credentials exceed the size limit")
+    if not _REGISTRY_HOST_PATTERN.fullmatch(host):
+        raise InvalidRequestError(
+            "registry_host must be a bare registry host such as ghcr.io or "
+            "registry.example.com:5000, without a scheme or path"
+        )
 
 
 def _validate_display_name(display_name: str | None) -> None:
