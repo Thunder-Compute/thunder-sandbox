@@ -44,6 +44,7 @@ from .._common.types import (
     SandboxInfo,
     SandboxStatus,
     SSHConnection,
+    SSHProxyJump,
 )
 from ..image import Image
 from . import credentials
@@ -60,6 +61,7 @@ from ._jobs import (
     validate_job_id,
 )
 from ._ssh import (
+    JumpSSHClient,
     RetryableSSHOperationError,
     SSHConnectionManager,
     SSH_CONNECT_TIMEOUT_SECONDS,
@@ -181,6 +183,7 @@ class Sandbox:
                 outbound_domain_allowlist,
             )
             request = {
+                "client_capabilities": {"proxy_jump": True},
                 **({"queue": True} if queue else {}),
                 **(
                     {"workspace_id": workspace_id}
@@ -1389,7 +1392,13 @@ fi
         credential = await store.ensure(self._client)
         try:
             connection = await self._open(ssh, credential, known_hosts)
-        except asyncssh.PermissionDenied:
+        except (asyncssh.PermissionDenied, asyncssh.ChannelOpenError) as exc:
+            if isinstance(exc, asyncssh.ChannelOpenError) and (
+                ssh.proxy_jump is None or exc.code != asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED
+            ):
+                raise
+            # Cached certificates from before ProxyJump may authenticate but
+            # lack permission to open a forwarding channel. Renew these once.
             # An unexpired certificate may belong to another environment or a
             # rotated authority. Renew the rejected credential exactly once.
             credential = await store.renew(self._client, rejected=credential)
@@ -1409,27 +1418,35 @@ fi
         credential: "credentials.SSHCredential",
         known_hosts: object,
     ) -> asyncssh.SSHClientConnection:
-        return await asyncssh.connect(
-            ssh.host,
-            ssh.port,
-            username=ssh.user,
-            # The sandbox trusts the authority that signed this, not the key
-            # itself, so the same credential opens every sandbox in the
-            # workspace.
+        options = dict(
             client_keys=[(credential.key, credential.certificate)],
-            known_hosts=known_hosts,
             agent_path=None,
             preferred_auth=["publickey"],
             config=None,
             connect_timeout=SSH_CONNECT_TIMEOUT_SECONDS,
-            # A command that writes to a file rather than the terminal sends
-            # nothing over the channel, so a long build looks idle and is cut
-            # by a NAT or idle timeout. wait() then reports a closed channel
-            # with no exit status. Keep the connection warm and notice a dead
-            # peer within a minute instead of blocking on it forever.
             keepalive_interval=SSH_KEEPALIVE_INTERVAL_SECONDS,
             keepalive_count_max=SSH_KEEPALIVE_COUNT_MAX,
         )
+        jump = None
+        if ssh.proxy_jump is not None:
+            proxy = ssh.proxy_jump
+            pinned = asyncssh.import_public_key(proxy.host_key)
+            jump = await asyncssh.connect(
+                proxy.host, proxy.port, username=proxy.user,
+                known_hosts=([pinned], [], []), **options,
+            )
+        try:
+            return await asyncssh.connect(
+                ssh.host, ssh.port, username=ssh.user, known_hosts=known_hosts,
+                **options,
+                **({"tunnel": jump, "client_factory": lambda: JumpSSHClient(jump)}
+                   if jump is not None else {}),
+            )
+        except BaseException:
+            if jump is not None:
+                jump.close()
+                await jump.wait_closed()
+            raise
 
     async def _discard_connection(
         self, connection: asyncssh.SSHClientConnection
@@ -1708,12 +1725,32 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
     ssh_value = response.get("ssh")
     ssh = None
     if isinstance(ssh_value, dict) and ssh_value.get("host"):
+        proxy_jump = None
+        proxy = ssh_value.get("proxy_jump")
+        if proxy is not None:
+            try:
+                if not isinstance(proxy, dict):
+                    raise ValueError("expected an object")
+                host, user, host_key = (proxy[key] for key in ("host", "user", "host_key"))
+                port = int(proxy["port"])
+                if any(not isinstance(value, str) or not value or any(c.isspace() for c in value)
+                       or value.startswith("-") for value in (host, user)):
+                    raise ValueError("invalid jump host or user")
+                if not 1 <= port <= 65535 or not isinstance(host_key, str):
+                    raise ValueError("invalid jump port or host key")
+                key = asyncssh.import_public_key(host_key)
+                proxy_jump = SSHProxyJump(
+                    host, port, user, key.export_public_key().decode("ascii").strip()
+                )
+            except (KeyError, TypeError, ValueError, asyncssh.Error) as exc:
+                raise SandboxFailedError("Thunder returned invalid SSH ProxyJump metadata") from exc
         ssh = SSHConnection(
             host=str(ssh_value["host"]),
             port=int(ssh_value.get("port", 22)),
             user=str(ssh_value.get("user", "ubuntu")),
             private_key_path=paths.ssh_key,
             certificate_path=paths.workspace_ssh_certificate(workspace_id),
+            proxy_jump=proxy_jump,
         )
         host_key = ssh_value.get("host_key")
         if host_key:

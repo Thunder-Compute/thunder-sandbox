@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import shlex
+
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -103,6 +106,14 @@ class Workspace:
 
 
 @dataclass(frozen=True)
+class SSHProxyJump:
+    host: str
+    port: int
+    user: str
+    host_key: str
+
+
+@dataclass(frozen=True)
 class SSHConnection:
     host: str
     port: int
@@ -112,6 +123,7 @@ class SSHConnection:
     # certificate as values, so a client whose cache is unwritable still works.
     private_key_path: Path | None = None
     certificate_path: Path | None = None
+    proxy_jump: SSHProxyJump | None = None
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -135,6 +147,32 @@ class SSHConnection:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR",
         ))
+        if self.proxy_jump is not None:
+            jump = self.proxy_jump
+            # OpenSSH does not pass the destination's -i/CertificateFile to -J.
+            # Supply both explicitly to the proxy and pin its API-provided key.
+            digest = hashlib.sha256(jump.host_key.encode()).hexdigest()
+            known_hosts = self.private_key_path.parent / f"jump-{digest}.known_hosts"
+            try:
+                known_hosts.write_text(
+                    f"thunder-jump {jump.host_key}\n", encoding="utf-8"
+                )
+            except OSError as exc:
+                raise InvalidRequestError(
+                    "cannot cache the jump host key for ssh_command; use the SDK connection"
+                ) from exc
+            proxy = [
+                "ssh", "-F", "none", "-i", str(self.private_key_path),
+                "-o", f"CertificateFile={self.certificate_path}",
+                "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+                "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=thunder-jump",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-p", str(jump.port), "-l", jump.user, jump.host,
+            ]
+            # ProxyCommand expands percent tokens even in quoted arguments.
+            proxy = [arg.replace("%", "%%") for arg in proxy]
+            proxy[1:1] = ["-W", "[%h]:%p"]
+            command.extend(("-o", "ProxyCommand=" + shlex.join(proxy)))
         command.append(f"{self.user}@{self.host}")
         return tuple(command)
 

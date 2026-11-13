@@ -25,6 +25,7 @@ from ._common.types import (
     SandboxInfo,
     SandboxStatus,
     SSHConnection,
+    SSHProxyJump,
     Workspace,
 )
 from .image import Image, ResolvedImage
@@ -33,7 +34,7 @@ __all__ = [
     "AuthenticationError", "CapacityError", "ClientConfig", "ConflictError",
     "ConnectionError", "GPUType", "Image", "InvalidRequestError", "ResolvedImage",
     "NetworkPolicy", "NotFoundError", "Pricing", "RateLimitError", "Resources", "RetryableError",
-    "SSHConnection", "SandboxError", "SandboxFailedError", "SandboxInfo",
+    "SSHConnection", "SSHProxyJump", "SandboxError", "SandboxFailedError", "SandboxInfo",
     "SandboxStatus", "SandboxTimeoutError", "ServiceUnavailableError",
     "ThunderError", "ThunderPaths", "UnsupportedFeatureError", "Workspace",
 ]

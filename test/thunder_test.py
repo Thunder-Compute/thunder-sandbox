@@ -2004,6 +2004,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 )
 
             start_body = client._request.await_args_list[0].args[2]
+            self.assertEqual(start_body["client_capabilities"], {"proxy_jump": True})
             self.assertNotIn("command", start_body)
             wait_until_ready.assert_awaited_once_with(timeout=300)
             exec_process.assert_awaited_once_with("echo", "hello")
@@ -4707,6 +4708,146 @@ class CertificateAuthenticationTest(unittest.IsolatedAsyncioTestCase):
         finally:
             for server in servers:
                 server.close()
+
+
+
+
+class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.client = AsyncClient(config(self.directory.name))
+        self.addAsyncCleanup(self.client.close)
+        self.ca = asyncssh.generate_private_key("ssh-ed25519")
+        self.key = asyncssh.generate_private_key("ssh-ed25519")
+        self.certificate = self.ca.generate_user_certificate(
+            self.key, "jump-test", principals=["workspace"],
+            permit_port_forwarding=True,
+        )
+        self.credential = mock.Mock(key=self.key, certificate=self.certificate)
+        self.jump_connections = []
+        connections = self.jump_connections
+
+        class JumpServer(asyncssh.SSHServer):
+            def connection_made(self, connection):
+                connections.append(connection)
+
+            def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
+                return True
+
+        authorized = asyncssh.import_authorized_keys(
+            'cert-authority,principals="workspace" '
+            + self.ca.export_public_key().decode()
+        )
+
+        async def echo(process):
+            process.stdout.write("through-jump\n")
+            process.exit(0)
+
+        self.guest_key = asyncssh.generate_private_key("ssh-ed25519")
+        self.guest = await asyncssh.listen(
+            "127.0.0.1", 0, server_host_keys=[self.guest_key],
+            authorized_client_keys=authorized, process_factory=echo,
+            sftp_factory=lambda conn: asyncssh.SFTPServer(
+                conn, chroot=self.directory.name
+            ),
+        )
+        self.jump_key = asyncssh.generate_private_key("ssh-ed25519")
+        self.jump = await asyncssh.listen(
+            "127.0.0.1", 0, server_factory=JumpServer,
+            server_host_keys=[self.jump_key], authorized_client_keys=authorized,
+        )
+        self.addAsyncCleanup(self.close_servers)
+        self.proxy = {
+            "host": "127.0.0.1", "port": self.jump.get_port(), "user": "jump",
+            "host_key": self.jump_key.export_public_key().decode().strip(),
+        }
+        self.sandbox = AsyncSandbox._from_response(self.client, {
+            **SANDBOX_RESPONSE, "id": "sbx-proxyjump-" + self.directory.name,
+            "ssh": {"host": "127.0.0.1", "port": self.guest.get_port(),
+                    "user": "ubuntu", "proxy_jump": self.proxy},
+        })
+        store = self.client._credentials_for(self.sandbox.workspace_id)
+        store.ensure = mock.AsyncMock(return_value=self.credential)
+        store.renew = mock.AsyncMock(return_value=self.credential)
+        self.store = store
+
+    async def close_servers(self):
+        await self.sandbox._close_connection()
+        for connection in self.jump_connections:
+            connection.close()
+            await connection.wait_closed()
+        self.jump.close()
+        self.guest.close()
+        await self.jump.wait_closed()
+        await self.guest.wait_closed()
+
+    async def test_commands_files_reconnect_and_close_use_same_credential(self):
+        connection = await self.sandbox._connect()
+        self.assertEqual((await connection.run("echo")).stdout, "through-jump\n")
+        async with connection.start_sftp_client() as sftp:
+            async with sftp.open("hello", "wb") as remote:
+                await remote.write(b"file-through-jump")
+            async with sftp.open("hello", "rb") as remote:
+                self.assertEqual(await remote.read(), b"file-through-jump")
+        self.assertEqual(len(self.jump_connections), 1)
+        await self.sandbox._discard_connection(connection)
+        await asyncio.wait_for(self.jump_connections[0].wait_closed(), 5)
+        replacement = await self.sandbox._connect()
+        self.assertIsNot(connection, replacement)
+        self.assertEqual((await replacement.run("echo")).stdout, "through-jump\n")
+        await self.sandbox._close_connection()
+        await asyncio.wait_for(self.jump_connections[-1].wait_closed(), 5)
+
+    async def test_wrong_jump_host_key_fails_without_fallback(self):
+        from dataclasses import replace
+        wrong = asyncssh.generate_private_key("ssh-ed25519")
+        ssh = replace(self.sandbox.ssh, proxy_jump=replace(
+            self.sandbox.ssh.proxy_jump,
+            host_key=wrong.export_public_key().decode().strip(),
+        ))
+        with self.assertRaises(asyncssh.HostKeyNotVerifiable):
+            await self.sandbox._open(ssh, self.credential, None)
+        self.store.renew.assert_not_awaited()
+
+    async def test_failed_inner_auth_closes_jump(self):
+        wrong = asyncssh.generate_private_key("ssh-ed25519")
+        with self.assertRaises(asyncssh.HostKeyNotVerifiable):
+            await self.sandbox._open(
+                self.sandbox.ssh, self.credential, ([wrong], [], [])
+            )
+        await asyncio.wait_for(self.jump_connections[-1].wait_closed(), 5)
+
+    async def test_command_supplies_credentials_and_pins_jump(self):
+        self.client.config.paths.ssh_key.parent.mkdir(parents=True, exist_ok=True)
+        command = self.sandbox.ssh.command
+        proxy = next(arg for arg in command if arg.startswith("ProxyCommand="))
+        args = shlex.split(proxy.split("=", 1)[1])
+        self.assertIn(str(self.sandbox.ssh.private_key_path), args)
+        self.assertIn(f"CertificateFile={self.sandbox.ssh.certificate_path}", args)
+        self.assertIn("StrictHostKeyChecking=yes", args)
+        self.assertIn("[%h]:%p", args)
+        path = next(arg.split("=", 1)[1] for arg in args if arg.startswith("UserKnownHostsFile="))
+        self.assertEqual(Path(path).read_text(), f"thunder-jump {self.proxy['host_key']}\n")
+
+    async def test_malformed_metadata_never_silently_connects_directly(self):
+        for proxy in ({}, "bad", {**self.proxy, "host_key": ""}, {**self.proxy, "port": 0}):
+            with self.subTest(proxy=proxy), self.assertRaises(SandboxFailedError):
+                AsyncSandbox._from_response(self.client, {
+                    **SANDBOX_RESPONSE,
+                    "ssh": {**SANDBOX_RESPONSE["ssh"], "proxy_jump": proxy},
+                })
+
+    async def test_cached_certificate_without_forwarding_is_renewed_once(self):
+        old = self.ca.generate_user_certificate(
+            self.key, "old", principals=["workspace"], permit_port_forwarding=False,
+        )
+        self.store.ensure.return_value = mock.Mock(key=self.key, certificate=old)
+        connection = await self.sandbox._connect()
+        self.assertEqual((await connection.run("echo")).stdout, "through-jump\n")
+        self.store.renew.assert_awaited_once()
+        self.assertEqual(len(self.jump_connections), 2)
+        await asyncio.wait_for(self.jump_connections[0].wait_closed(), 5)
 
 
 if __name__ == "__main__":

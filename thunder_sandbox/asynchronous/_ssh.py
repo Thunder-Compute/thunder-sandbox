@@ -41,6 +41,16 @@ def is_transient_ssh_error(error: BaseException) -> bool:
     return isinstance(error, (OSError, asyncssh.Error, RetryableSSHOperationError))
 
 
+class JumpSSHClient(asyncssh.SSHClient):
+    """Close the dedicated jump transport when its guest connection ends."""
+
+    def __init__(self, jump: asyncssh.SSHClientConnection) -> None:
+        self._jump = jump
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._jump.close()
+
+
 class SSHConnectionManager:
     """Own one reusable connection and retry explicitly idempotent operations."""
 
