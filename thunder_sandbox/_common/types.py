@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shlex
+import subprocess
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -134,7 +136,7 @@ class SSHConnection:
             )
         command = [
             "ssh", "-i", str(self.private_key_path),
-            "-o", f"CertificateFile={self.certificate_path}",
+            "-o", f'CertificateFile="{self.certificate_path.as_posix()}"' ,
             "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
@@ -163,16 +165,19 @@ class SSHConnection:
                 ) from exc
             proxy = [
                 "ssh", "-F", "none", "-i", str(self.private_key_path),
-                "-o", f"CertificateFile={self.certificate_path}",
+                "-o", f'CertificateFile="{self.certificate_path.as_posix()}"' ,
                 "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                 "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=thunder-jump",
-                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", f'UserKnownHostsFile="{known_hosts.as_posix()}"' ,
                 "-p", str(jump.port), "-l", jump.user, jump.host,
             ]
             # ProxyCommand expands percent tokens even in quoted arguments.
             proxy = [arg.replace("%", "%%") for arg in proxy]
             proxy[1:1] = ["-W", "[%h]:%p"]
-            command.extend(("-o", "ProxyCommand=" + shlex.join(proxy)))
+            proxy_command = (
+                subprocess.list2cmdline(proxy) if os.name == "nt" else shlex.join(proxy)
+            )
+            command.extend(("-o", "ProxyCommand=" + proxy_command))
         command.append(f"{self.user}@{self.host}")
         return tuple(command)
 

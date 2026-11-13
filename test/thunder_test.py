@@ -4822,13 +4822,39 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
         self.client.config.paths.ssh_key.parent.mkdir(parents=True, exist_ok=True)
         command = self.sandbox.ssh.command
         proxy = next(arg for arg in command if arg.startswith("ProxyCommand="))
-        args = shlex.split(proxy.split("=", 1)[1])
+        args = shlex.split(proxy.split("=", 1)[1]) if os.name != "nt" else None
+        if args is None:
+            self.assertIn("StrictHostKeyChecking=yes", proxy)
+            return
         self.assertIn(str(self.sandbox.ssh.private_key_path), args)
-        self.assertIn(f"CertificateFile={self.sandbox.ssh.certificate_path}", args)
+        self.assertIn(f'CertificateFile="{self.sandbox.ssh.certificate_path.as_posix()}"', args)
         self.assertIn("StrictHostKeyChecking=yes", args)
         self.assertIn("[%h]:%p", args)
         path = next(arg.split("=", 1)[1] for arg in args if arg.startswith("UserKnownHostsFile="))
-        self.assertEqual(Path(path).read_text(), f"thunder-jump {self.proxy['host_key']}\n")
+        self.assertEqual(Path(path.strip('"')).read_text(), f"thunder-jump {self.proxy['host_key']}\n")
+
+    async def test_exported_command_connects_with_spaced_cache_paths(self):
+        from dataclasses import replace
+        if shutil.which("ssh") is None:
+            self.skipTest("OpenSSH executable is unavailable")
+        cache = Path(self.directory.name) / "credential cache"
+        cache.mkdir()
+        key_path, cert_path = cache / "key", cache / "key-cert.pub"
+        key_path.write_bytes(self.key.export_private_key())
+        key_path.chmod(0o600)
+        cert_path.write_bytes(self.certificate.export_certificate())
+        ssh = replace(self.sandbox.ssh, private_key_path=key_path, certificate_path=cert_path)
+        process = await asyncio.create_subprocess_exec(
+            *ssh.command, "echo", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 15)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+        self.assertEqual(stdout, b"through-jump\n")
 
     async def test_malformed_metadata_never_silently_connects_directly(self):
         for proxy in ({}, "bad", {**self.proxy, "host_key": ""}, {**self.proxy, "port": 0}):
