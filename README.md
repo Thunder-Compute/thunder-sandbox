@@ -353,6 +353,8 @@ with thunder.Client.from_cli() as client:
     print(" ".join(sandbox.ssh_command))
 ```
 
+The SDK automatically uses the node’s SSH jump server when the API advertises `ssh.proxy_jump`, using the same workspace key and certificate for both hops. Commands, processes, and file transfers work without application changes; sandboxes without jump metadata keep connecting directly. The jump server’s host key is verified against the API-provided key. `ssh_command` also includes the jump connection with explicit credentials and a cached host-key pin.
+
 You can reconnect to existing sandboxes from another machine using API credentials authorized for that organization; the SDK obtains SSH credentials as needed. Running the printed `ssh_command` outside the SDK requires its cached private key and certificate.
 
 ## Async API
