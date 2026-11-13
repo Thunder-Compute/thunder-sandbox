@@ -4843,10 +4843,10 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
         key_path.write_bytes(self.key.export_private_key())
         key_path.chmod(0o600)
         if os.name == "nt":
-            # chmod does not remove the Windows runner temp directory's ACLs.
+            # OpenSSH rejects Python's OWNER RIGHTS ACE even after inheritance is removed.
             subprocess.run(
                 ["icacls", str(key_path), "/inheritance:r", "/grant:r",
-                 f"{os.environ['USERNAME']}:F"],
+                 f"{os.environ['USERNAME']}:F", "/remove", "*S-1-3-4"],
                 check=True, capture_output=True,
             )
         cert_path.write_bytes(self.certificate.export_certificate())
