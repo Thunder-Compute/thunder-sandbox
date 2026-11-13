@@ -4842,6 +4842,13 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
         key_path, cert_path = cache / "key", cache / "key-cert.pub"
         key_path.write_bytes(self.key.export_private_key())
         key_path.chmod(0o600)
+        if os.name == "nt":
+            # chmod does not remove the Windows runner temp directory's ACLs.
+            subprocess.run(
+                ["icacls", str(key_path), "/inheritance:r", "/grant:r",
+                 f"{os.environ['USERNAME']}:F"],
+                check=True, capture_output=True,
+            )
         cert_path.write_bytes(self.certificate.export_certificate())
         ssh = replace(self.sandbox.ssh, private_key_path=key_path, certificate_path=cert_path)
         process = await asyncio.create_subprocess_exec(

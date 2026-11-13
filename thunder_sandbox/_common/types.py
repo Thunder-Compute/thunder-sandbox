@@ -136,7 +136,7 @@ class SSHConnection:
             )
         command = [
             "ssh", "-i", str(self.private_key_path),
-            "-o", f'CertificateFile="{self.certificate_path.as_posix()}"' ,
+            "-o", f'CertificateFile="{self.certificate_path.as_posix()}"',
             "-p", str(self.port),
             "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         ]
@@ -165,10 +165,10 @@ class SSHConnection:
                 ) from exc
             proxy = [
                 "ssh", "-F", "none", "-i", str(self.private_key_path),
-                "-o", f'CertificateFile="{self.certificate_path.as_posix()}"' ,
+                "-o", f'CertificateFile="{self.certificate_path.as_posix()}"',
                 "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                 "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=thunder-jump",
-                "-o", f'UserKnownHostsFile="{known_hosts.as_posix()}"' ,
+                "-o", f'UserKnownHostsFile="{known_hosts.as_posix()}"',
                 "-p", str(jump.port), "-l", jump.user, jump.host,
             ]
             # ProxyCommand expands percent tokens even in quoted arguments.
