@@ -960,14 +960,52 @@ class Sandbox:
     ) -> str:
         if not remote_path or "\x00" in remote_path:
             raise InvalidRequestError("upload destination must be a non-empty remote path")
+        if await self._inspect_remote_upload_destination(remote_path):
+            return posixpath.join(remote_path, source_name)
+        return remote_path
+
+    async def _inspect_remote_upload_destination(
+        self, remote_path: str, *, stage_beside_directory: bool = False
+    ) -> bool:
+        """Return whether ``remote_path`` is a directory.
+
+        Raises InvalidRequestError when the sandbox user cannot create the
+        transfer stage, which sits in ``remote_path`` when it is a directory and
+        beside it otherwise (always beside it for a directory-contents upload).
+        Without this check that case surfaces as a failure to reset the stage.
+        """
         destination = shlex.quote(remote_path)
-        command = f"if [ -d {destination} ]; then printf directory; else printf exact; fi"
+        parent = (
+            f"$(dirname -- {destination})"
+            if stage_beside_directory
+            else f"$(if [ -d {destination} ]; then printf %s {destination}; "
+            f"else dirname -- {destination}; fi)"
+        )
+        command = (
+            f"if [ -d {destination} ]; then echo directory; else echo exact; fi; "
+            f'parent={parent}; '
+            'if [ ! -d "$parent" ]; then echo missing; '
+            'elif [ -w "$parent" ]; then echo writable; else echo unwritable; fi; '
+            'printf "%s\\n" "$parent"; id -un'
+        )
         result = await self._run_idempotent_command(
             command, name=f"inspect upload destination in sandbox {self.id}"
         )
-        if str(result.stdout or "") == "directory":
-            return posixpath.join(remote_path, source_name)
-        return remote_path
+        kind, access, parent_path, user = (
+            str(result.stdout or "").splitlines() + ["", "", "", ""]
+        )[:4]
+        if access == "missing":
+            raise InvalidRequestError(
+                f"cannot upload to {remote_path}: directory {parent_path} does not "
+                "exist in the sandbox"
+            )
+        if access == "unwritable":
+            raise InvalidRequestError(
+                f"cannot upload to {remote_path}: sandbox user {user} cannot write "
+                f"to {parent_path}; upload under its home directory or /tmp, or "
+                "move the file with sudo afterwards"
+            )
+        return kind == "directory"
 
     async def _upload_guest_contents(
         self, source_directory: Path, remote_path: str
@@ -976,6 +1014,9 @@ class Sandbox:
             raise InvalidRequestError("upload destination must be a non-empty remote path")
         transfer_id = uuid.uuid4().hex
         destination = remote_path.rstrip("/") or "/"
+        await self._inspect_remote_upload_destination(
+            destination, stage_beside_directory=True
+        )
         stage = f"{destination}.thunder-transfer-{transfer_id}.stage"
 
         try:

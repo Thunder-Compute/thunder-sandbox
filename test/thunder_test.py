@@ -3041,6 +3041,33 @@ else:
             await sandbox._close_connection()
             await client.close()
 
+    async def test_upload_to_unwritable_directory_names_the_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            source = Path(directory) / "blob"
+            source.write_bytes(b"blob")
+            inspect = mock.AsyncMock(
+                return_value=mock.Mock(stdout="exact\nunwritable\n/root\nubuntu\n")
+            )
+            with mock.patch.object(
+                sandbox, "_run_idempotent_command", new=inspect
+            ), mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
+                new=mock.AsyncMock(),
+            ) as scp:
+                with self.assertRaisesRegex(
+                    InvalidRequestError,
+                    "cannot upload to /root/blob: sandbox user ubuntu cannot write to /root",
+                ):
+                    await sandbox.upload(source, "/root/blob")
+
+            scp.assert_not_awaited()
+            syntax = subprocess.run(
+                ["sh", "-n"], input=inspect.await_args.args[0], text=True, capture_output=True
+            )
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+            await client.close()
+
     async def test_download_keeps_destination_intact_until_retry_succeeds(
         self,
     ) -> None:
