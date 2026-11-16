@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
 
+import aiohttp
 import asyncssh
 
 import thunder_sandbox as thunder
@@ -4176,6 +4177,68 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("timeout", seen[0])
             self.assertEqual(seen[1]["timeout"].total, 45)  # type: ignore[union-attr]
             self.assertNotIn("timeout", seen[2])
+
+    async def test_connection_failures_resend_only_safe_requests(self) -> None:
+        reset = aiohttp.ClientOSError(104, "Connection reset by peer")
+        refused = aiohttp.ClientConnectorError(mock.Mock(), OSError(111, "refused"))
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def read(self) -> bytes:
+                return b'{"ok": true}'
+
+            async def __aenter__(self) -> "Response":
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+        cases = [
+            # (method, idempotent, failures before success, expected sends, succeeds)
+            ("GET", None, [reset], 2, True),
+            ("POST", True, [reset], 2, True),
+            ("POST", None, [refused], 2, True),
+            ("POST", None, [reset], 1, False),
+            ("GET", None, [reset, reset, reset], 3, False),
+        ]
+        for method, idempotent, failures, sends, succeeds in cases:
+            with self.subTest(method=method, idempotent=idempotent, failures=failures):
+                with tempfile.TemporaryDirectory() as directory:
+                    client = AsyncClient(config(directory))
+                    pending = list(failures)
+                    sent: list[str] = []
+
+                    def request(method: str, url: str, **kwargs: object) -> Response:
+                        sent.append(method)
+                        if pending:
+                            raise pending.pop(0)
+                        return Response()
+
+                    session = mock.Mock()
+                    session.request = request
+                    client._get_session = lambda: session  # type: ignore[method-assign]
+                    try:
+                        with mock.patch(
+                            "thunder_sandbox.asynchronous.client.CONNECTION_RETRY_DELAYS",
+                            (0, 0),
+                        ):
+                            if succeeds:
+                                result = await client._request(
+                                    method, "/a", idempotent=idempotent
+                                )
+                                self.assertEqual(result, {"ok": True})
+                            else:
+                                with self.assertRaisesRegex(
+                                    ConnectionError, "ClientOSError"
+                                ):
+                                    await client._request(
+                                        method, "/a", idempotent=idempotent
+                                    )
+                    finally:
+                        await client.close()
+                    self.assertEqual(len(sent), sends)
 
     def test_closed_wait_window_maps_to_its_own_error(self) -> None:
         error = _api_error(

@@ -152,7 +152,7 @@ class CredentialStore:
             request["workspace_id"] = self._workspace_id
         try:
             response = await client._request(
-                "POST", "/sandboxes/ssh-certificate", request
+                "POST", "/sandboxes/ssh-certificate", request, idempotent=True
             )
         except AuthenticationError as exc:
             # A role that cannot connect is not a bad token, which is what this

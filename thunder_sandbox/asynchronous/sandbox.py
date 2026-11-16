@@ -1277,6 +1277,7 @@ fi
                     "PATCH",
                     f"/sandboxes/{_path_segment(self.id)}/network-policy",
                     request,
+                    idempotent=True,
                 )
                 break
             except ConflictError as exc:
@@ -1948,7 +1949,7 @@ async def _stop_sandbox(
     while True:
         try:
             await client._request(
-                "POST", f"/sandboxes/{_path_segment(sandbox_id)}/stop"
+                "POST", f"/sandboxes/{_path_segment(sandbox_id)}/stop", idempotent=True
             )
             return
         except (ConnectionError, RetryableError) as exc:

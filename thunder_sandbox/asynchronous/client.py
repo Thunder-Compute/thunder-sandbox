@@ -42,6 +42,15 @@ USER_AGENT = f"thunder-python-sdk/{__version__}"
 WORKSPACE_ID_PREFIX = "ws-"
 WORKSPACE_CACHE_SECONDS = 60.0
 
+# Pauses before each retry of a request whose connection failed. A proxy in
+# front of the API (Cloudflare) occasionally resets a pooled connection; the
+# next attempt opens a fresh one, so a short pause is enough.
+CONNECTION_RETRY_DELAYS = (0.2, 1.0)
+# Methods safe to send again when a connection fails after the request may
+# have reached the server. A POST or PATCH is resent only when its caller
+# says it is idempotent.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+
 _ERROR_CODES: dict[str, type[ThunderError]] = {
     "sandbox_capacity_unavailable": CapacityError,
     "sandbox_scheduler_unavailable": ServiceUnavailableError,
@@ -86,6 +95,29 @@ def _api_error(
         except (TypeError, ValueError):
             retry_after = None
     return error_type(message, code=code, status=status, retry_after=retry_after)
+
+
+def _resendable(exc: BaseException, idempotent: bool) -> bool:
+    """Whether a request that failed with ``exc`` may be sent again.
+
+    A failure to connect means the request never left, so any request can be
+    resent. A reset or disconnect afterwards may hit a request the server
+    already acted on, so only an idempotent one is resent. A timeout is never
+    resent: the server may still be working on it.
+    """
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return True
+    if isinstance(
+        exc,
+        (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError, aiohttp.ClientPayloadError),
+    ):
+        return idempotent
+    return False
+
+
+def _describe(exc: BaseException) -> str:
+    # asyncio.TimeoutError and some resets have an empty message.
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 class Client:
@@ -135,8 +167,11 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
+        idempotent: bool | None = None,
     ) -> dict[str, Any]:
-        result = await self._request_json(method, path, body, query, timeout=timeout)
+        result = await self._request_json(
+            method, path, body, query, timeout=timeout, idempotent=idempotent
+        )
         if not isinstance(result, dict):
             raise ConnectionError("Thunder returned an unexpected response")
         return result
@@ -149,12 +184,49 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
+        idempotent: bool | None = None,
     ) -> Any:
         """Send one API request and return its decoded JSON.
 
-        ``timeout`` bounds this request alone, in seconds, for calls the server
+        ``timeout`` bounds each attempt, in seconds, for calls the server
         deliberately holds open longer than the session default allows.
+
+        A request whose connection fails is sent again, up to
+        ``len(CONNECTION_RETRY_DELAYS)`` times: always when the connection
+        could not be opened, and after a reset only when the request is
+        ``idempotent``, which defaults to whether ``method`` is.
         """
+        if idempotent is None:
+            idempotent = method.upper() in IDEMPOTENT_METHODS
+        for delay in (*CONNECTION_RETRY_DELAYS, None):
+            try:
+                payload = await self._send(method, path, body, query, timeout)
+                break
+            except ThunderError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                if delay is None or not _resendable(exc, idempotent):
+                    raise ConnectionError(
+                        f"could not communicate with Thunder: {_describe(exc)}"
+                    ) from exc
+                await asyncio.sleep(delay)
+
+        if not payload:
+            return {}
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ConnectionError("Thunder returned an invalid JSON response") from exc
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        body: object | None,
+        query: dict[str, object] | None,
+        timeout: float | None,
+    ) -> bytes:
+        """Send one attempt and return the response body, raising API errors."""
         session = self._get_session()
         url = f"{self.config.api_url}/v1{path}"
         params = (
@@ -168,36 +240,23 @@ class Client:
         options = (
             {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout is not None else {}
         )
-        try:
-            async with session.request(
-                method, url, json=body, params=params, **options
-            ) as response:
-                payload = await response.read()
-                if response.status >= 400:
-                    code = None
-                    try:
-                        parsed = json.loads(payload)
-                        message = (
-                            parsed.get("message")
-                            or f"Thunder API returned HTTP {response.status}"
-                        )
-                        code = parsed.get("error")
-                    except (json.JSONDecodeError, AttributeError):
-                        message = f"Thunder API returned HTTP {response.status}"
-                    raise _api_error(
-                        response.status, code, message, response.headers
+        async with session.request(
+            method, url, json=body, params=params, **options
+        ) as response:
+            payload = await response.read()
+            if response.status >= 400:
+                code = None
+                try:
+                    parsed = json.loads(payload)
+                    message = (
+                        parsed.get("message")
+                        or f"Thunder API returned HTTP {response.status}"
                     )
-        except ThunderError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            raise ConnectionError(f"could not communicate with Thunder: {exc}") from exc
-
-        if not payload:
-            return {}
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ConnectionError("Thunder returned an invalid JSON response") from exc
+                    code = parsed.get("error")
+                except (json.JSONDecodeError, AttributeError):
+                    message = f"Thunder API returned HTTP {response.status}"
+                raise _api_error(response.status, code, message, response.headers)
+        return payload
 
     async def list_workspaces(self) -> list[Workspace]:
         """List the workspaces this credential can access, main first."""
