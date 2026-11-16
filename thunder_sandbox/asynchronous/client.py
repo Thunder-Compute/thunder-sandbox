@@ -121,16 +121,26 @@ def _resendable(exc: BaseException, idempotent: bool) -> bool:
     A failure to connect means the request never left, so any request can be
     resent. A reset or disconnect afterwards may hit a request the server
     already acted on, so only an idempotent one is resent. A timeout is never
-    resent: the server may still be working on it.
+    resent: the server may still be working on it. Neither is a TLS failure,
+    which a new connection repeats.
     """
+    # aiohttp's ServerTimeoutError is also a ClientConnectionError.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, aiohttp.ClientSSLError)):
+        return False
     if isinstance(exc, aiohttp.ClientConnectorError):
         return True
-    if isinstance(
+    # ClientConnectionError covers every reset and disconnect, including
+    # ClientConnectionResetError (aiohttp >= 3.10.6), which is not a
+    # ClientOSError.
+    return idempotent and isinstance(
         exc,
-        (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError, aiohttp.ClientPayloadError),
-    ):
-        return idempotent
-    return False
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            ConnectionResetError,
+            BrokenPipeError,
+        ),
+    )
 
 
 def _describe(exc: BaseException) -> str:

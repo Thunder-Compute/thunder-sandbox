@@ -4180,6 +4180,12 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_connection_failures_resend_only_safe_requests(self) -> None:
         reset = aiohttp.ClientOSError(104, "Connection reset by peer")
+        # aiohttp >= 3.10.6 raises this, not a ClientOSError, when a write to
+        # a pooled connection finds it reset.
+        write_reset = getattr(
+            aiohttp, "ClientConnectionResetError", aiohttp.ServerDisconnectedError
+        )("Connection lost")
+        timed_out = aiohttp.ServerTimeoutError("Timeout on reading data from socket")
         refused = aiohttp.ClientConnectorError(mock.Mock(), OSError(111, "refused"))
 
         class Response:
@@ -4198,9 +4204,10 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
         cases = [
             # (method, path, failures before success, expected sends, succeeds)
             ("GET", "/sandboxes/sbx-1", [reset], 2, True),
-            ("POST", "/sandboxes/ssh-certificate", [reset], 2, True),
+            ("POST", "/sandboxes/ssh-certificate", [write_reset], 2, True),
             ("POST", "/sandboxes/start", [refused], 2, True),
             ("POST", "/sandboxes/start", [reset], 1, False),
+            ("GET", "/sandboxes/sbx-1", [timed_out], 1, False),
             ("GET", "/sandboxes/sbx-1", [reset, reset, reset], 3, False),
         ]
         for method, path, failures, sends, succeeds in cases:
@@ -4229,7 +4236,7 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(result, {"ok": True})
                             else:
                                 with self.assertRaisesRegex(
-                                    ConnectionError, "ClientOSError"
+                                    ConnectionError, type(failures[-1]).__name__
                                 ):
                                     await client._request(method, path)
                     finally:
