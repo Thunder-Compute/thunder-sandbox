@@ -47,8 +47,7 @@ WORKSPACE_CACHE_SECONDS = 60.0
 # next attempt opens a fresh one, so a short pause is enough.
 CONNECTION_RETRY_DELAYS = (0.2, 1.0)
 # Methods safe to send again when a connection fails after the request may
-# have reached the server. A POST or PATCH is resent only when its caller
-# says it is idempotent.
+# have reached the server.
 IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 
 _ERROR_CODES: dict[str, type[ThunderError]] = {
@@ -95,6 +94,25 @@ def _api_error(
         except (TypeError, ValueError):
             retry_after = None
     return error_type(message, code=code, status=status, retry_after=retry_after)
+
+
+def _idempotent(method: str, path: str) -> bool:
+    """Whether sending this request twice has the same effect as once.
+
+    Besides the idempotent methods: minting an SSH certificate only issues
+    another one, stopping a stopped sandbox does nothing, and a network-policy
+    update replaces the complete policy. Starting a sandbox is not.
+    """
+    method = method.upper()
+    if method in IDEMPOTENT_METHODS:
+        return True
+    if method == "POST":
+        return path == "/sandboxes/ssh-certificate" or (
+            path.startswith("/sandboxes/") and path.endswith("/stop")
+        )
+    if method == "PATCH":
+        return path.startswith("/sandboxes/") and path.endswith("/network-policy")
+    return False
 
 
 def _resendable(exc: BaseException, idempotent: bool) -> bool:
@@ -167,11 +185,8 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
-        idempotent: bool | None = None,
     ) -> dict[str, Any]:
-        result = await self._request_json(
-            method, path, body, query, timeout=timeout, idempotent=idempotent
-        )
+        result = await self._request_json(method, path, body, query, timeout=timeout)
         if not isinstance(result, dict):
             raise ConnectionError("Thunder returned an unexpected response")
         return result
@@ -184,7 +199,6 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
-        idempotent: bool | None = None,
     ) -> Any:
         """Send one API request and return its decoded JSON.
 
@@ -194,10 +208,9 @@ class Client:
         A request whose connection fails is sent again, up to
         ``len(CONNECTION_RETRY_DELAYS)`` times: always when the connection
         could not be opened, and after a reset only when the request is
-        ``idempotent``, which defaults to whether ``method`` is.
+        idempotent (see :func:`_idempotent`).
         """
-        if idempotent is None:
-            idempotent = method.upper() in IDEMPOTENT_METHODS
+        idempotent = _idempotent(method, path)
         for delay in (*CONNECTION_RETRY_DELAYS, None):
             try:
                 payload = await self._send(method, path, body, query, timeout)

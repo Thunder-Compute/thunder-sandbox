@@ -4196,15 +4196,15 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
                 return None
 
         cases = [
-            # (method, idempotent, failures before success, expected sends, succeeds)
-            ("GET", None, [reset], 2, True),
-            ("POST", True, [reset], 2, True),
-            ("POST", None, [refused], 2, True),
-            ("POST", None, [reset], 1, False),
-            ("GET", None, [reset, reset, reset], 3, False),
+            # (method, path, failures before success, expected sends, succeeds)
+            ("GET", "/sandboxes/sbx-1", [reset], 2, True),
+            ("POST", "/sandboxes/ssh-certificate", [reset], 2, True),
+            ("POST", "/sandboxes/start", [refused], 2, True),
+            ("POST", "/sandboxes/start", [reset], 1, False),
+            ("GET", "/sandboxes/sbx-1", [reset, reset, reset], 3, False),
         ]
-        for method, idempotent, failures, sends, succeeds in cases:
-            with self.subTest(method=method, idempotent=idempotent, failures=failures):
+        for method, path, failures, sends, succeeds in cases:
+            with self.subTest(method=method, path=path, failures=failures):
                 with tempfile.TemporaryDirectory() as directory:
                     client = AsyncClient(config(directory))
                     pending = list(failures)
@@ -4225,17 +4225,13 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
                             (0, 0),
                         ):
                             if succeeds:
-                                result = await client._request(
-                                    method, "/a", idempotent=idempotent
-                                )
+                                result = await client._request(method, path)
                                 self.assertEqual(result, {"ok": True})
                             else:
                                 with self.assertRaisesRegex(
                                     ConnectionError, "ClientOSError"
                                 ):
-                                    await client._request(
-                                        method, "/a", idempotent=idempotent
-                                    )
+                                    await client._request(method, path)
                     finally:
                         await client.close()
                     self.assertEqual(len(sent), sends)
