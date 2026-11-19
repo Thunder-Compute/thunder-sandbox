@@ -67,6 +67,8 @@ from ._ssh import (
     SSH_CONNECT_TIMEOUT_SECONDS,
 )
 from ._transfer import (
+    ByteChannel as _ByteChannel,
+    extract_download_archive as _extract_download_archive,
     parse_transfer_path as _parse_transfer_path,
     publish_local_contents as _publish_local_contents,
     publish_local_transfer as _publish_local_transfer,
@@ -843,24 +845,29 @@ class Sandbox:
         timeout: float | None = None,
     ) -> None:
         """Download a file or directory, raising after ``timeout`` seconds if given."""
-        transfer = (
-            self._download_from_container
-            if self.image_id is not None
-            else self._download_from_guest
-        )
         await _within_timeout(
-            transfer(remote_path, local_path, recursive=recursive),
+            self._download_archive(remote_path, local_path, recursive=recursive),
             timeout,
             f"download from sandbox {self.id}",
         )
 
-    async def _download_from_guest(
+    async def _download_archive(
         self,
         remote_path: str,
         local_path: str | os.PathLike[str],
         *,
         recursive: bool,
     ) -> None:
+        """Stream ``remote_path`` as one tar archive and extract it locally.
+
+        SCP acknowledges every file and directory record before the next one
+        is sent, so a tree of many small files costs several round trips per
+        file. A tar stream costs one session whatever the file count. In an
+        image-backed sandbox the archive is written by the container's BusyBox
+        straight into the SSH channel, so nothing is staged on the guest disk
+        either, which a nearly full sandbox may not have room for.
+        """
+
         if not remote_path or "\x00" in remote_path:
             raise InvalidRequestError("download source must be a non-empty remote path")
         parsed_source = _parse_transfer_path(remote_path, separator="/")
@@ -880,27 +887,49 @@ class Sandbox:
                 dir=os.fspath(target.parent),
             )
         )
-        stage = transfer_root / ("contents" if contents_only else source_name)
+        extracted = transfer_root / "archive"
+        command = _download_archive_command(
+            parsed_source.path,
+            recursive=recursive,
+            contents_only=contents_only,
+            container=self.image_id is not None,
+        )
+        name = f"download {remote_path} from sandbox {self.id}"
         try:
-            async def transfer(connection: asyncssh.SSHClientConnection) -> None:
-                await asyncio.to_thread(_remove_local_transfer_path, stage)
-                # Request the directory itself: asyncssh refuses the "." name a
-                # remote scp sends for "dir/.". The stage is removed above, so
-                # the directory's contents land directly in it.
-                await asyncssh.scp(
-                    (connection, parsed_source.path),
-                    os.fspath(stage),
-                    recurse=recursive,
+            async def transfer(connection: asyncssh.SSHClientConnection) -> str | None:
+                def reset() -> None:
+                    _remove_local_transfer_path(extracted)
+                    extracted.mkdir()
+
+                try:
+                    await asyncio.to_thread(reset)
+                except OSError as exc:
+                    # A local disk error: final, not an SSH loss to retry.
+                    raise SandboxFailedError(
+                        f"could not prepare local staging for {name}: {exc}"
+                    ) from exc
+                return await _stream_download_archive(
+                    connection,
+                    command,
+                    extracted,
+                    single_root=not contents_only,
+                    name=name,
                 )
 
-            await self._retry_scp(
-                transfer,
-                name=f"download {remote_path} from sandbox {self.id}",
+            root = await self._ssh_manager.run(
+                transfer, name=name, deadline=self._ssh_deadline()
             )
-            publisher = (
-                _publish_local_contents if contents_only else _publish_local_transfer
-            )
+            if contents_only:
+                stage = extracted
+                publisher = _publish_local_contents
+            else:
+                stage = extracted / cast(str, root)
+                publisher = _publish_local_transfer
             await asyncio.to_thread(publisher, stage, target)
+        except ConnectionError:
+            raise
+        except (OSError, asyncssh.Error) as exc:
+            raise SandboxFailedError(f"could not complete {name}: {exc}") from exc
         finally:
             await asyncio.to_thread(shutil.rmtree, transfer_root, True)
 
@@ -1152,69 +1181,6 @@ fi
             # The stage is root-owned once it has changed hands above, which
             # the SSH user could not remove.
             await self._cleanup_remote_transfer_paths(stage, privileged=True)
-
-    async def _download_from_container(
-        self,
-        remote_path: str,
-        local_path: str | os.PathLike[str],
-        *,
-        recursive: bool,
-    ) -> None:
-        stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
-        await self._run_guest_command("mkdir", "-p", "--", stage)
-        try:
-            parsed_source = _parse_transfer_path(remote_path, separator="/")
-            contents_only = parsed_source.contents_only
-            await self._run_guest_command(
-                "sudo",
-                "--non-interactive",
-                "docker",
-                "cp",
-                f"{_CONTAINER_NAME}:{remote_path}",
-                stage + "/",
-            )
-            # docker cp keeps each file's container owner and mode, but the
-            # next leg reads the stage over SSH as an unprivileged user. A
-            # payload that is root-owned and owner-only (0600 files, 0700
-            # directories) would fail that leg with "Permission denied" and
-            # could not be cleaned up afterwards. Hand the staged copy to the
-            # SSH user. -h changes a symlink itself, never its target: this
-            # runs under sudo, and the payload must not be able to point the
-            # chown at a guest file outside the stage. chmod -R skips
-            # symlinks on its own.
-            await self._run_guest_command(
-                "sudo",
-                "--non-interactive",
-                "chown",
-                "-R",
-                "-h",
-                "--",
-                f"{self.ssh.user}:",
-                stage,
-            )
-            await self._run_guest_command(
-                "sudo",
-                "--non-interactive",
-                "chmod",
-                "-R",
-                "u+rwX",
-                "--",
-                stage,
-            )
-            guest_source = (
-                stage + "/."
-                if contents_only
-                else stage + "/" + parsed_source.name
-            )
-            await self._download_from_guest(
-                guest_source, local_path, recursive=recursive
-            )
-        except (OSError, asyncssh.Error) as exc:
-            raise SandboxFailedError(
-                f"could not download from sandbox container: {exc}"
-            ) from exc
-        finally:
-            await self._cleanup_remote_transfer_paths(stage)
 
     async def _run_guest_command(self, *args: str) -> None:
         await self._run_idempotent_command(
@@ -1960,6 +1926,190 @@ async def _stop_sandbox(
                 raise
             await _sleep_until_next_poll(deadline, delay, exc.retry_after)
             delay = min(5.0, delay * 2.0)
+
+
+# Archives one download source to stdout. $1 is the source, $2 and $3 are 1
+# for a recursive and a contents-only download, and $4 prefixes tar: the
+# container's BusyBox, or empty for the guest's own. tar -h follows every
+# symlink where it is archived, as SCP did, so the archive holds only files and
+# directories: a link never reaches the caller's machine, where its target
+# would name the caller's own files. A dangling link or a loop fails the
+# download, as it did over SCP.
+_DOWNLOAD_ARCHIVE_SCRIPT = """source=$1 recursive=$2 contents=$3 tool=$4
+while [ "$source" != / ] && [ "${source%/}" != "$source" ]; do
+    source=${source%/}
+done
+if [ ! -e "$source" ]; then
+    echo "$1: No such file or directory" >&2
+    exit 2
+fi
+if [ -d "$source" ] && [ "$recursive" != 1 ]; then
+    echo "$1: is a directory; download it with recursive=True" >&2
+    exit 2
+fi
+if [ "$contents" = 1 ]; then
+    if [ ! -d "$source" ]; then
+        echo "$1: Not a directory" >&2
+        exit 2
+    fi
+    cd -- "$source" || exit 2
+    exec $tool tar -c -h -f - .
+fi
+case $source in
+*/*) parent=${source%/*} name=${source##*/} ;;
+*) parent=. name=$source ;;
+esac
+cd -- "${parent:-/}" || exit 2
+exec $tool tar -c -h -f - -- "$name"
+"""
+_DOWNLOAD_CHUNK_BYTES = 1 << 16
+_DOWNLOAD_STDERR_LIMIT = 4096
+
+
+def _download_archive_command(
+    source: str, *, recursive: bool, contents_only: bool, container: bool
+) -> str:
+    flags = ("1" if recursive else "0", "1" if contents_only else "0")
+    if container:
+        # docker cp reads a relative container path from /, not the image's
+        # WORKDIR, and uploads still go through docker cp: keep them agreeing.
+        if not source.startswith("/"):
+            source = "/" + source
+        # As root in the container, as docker cp was: a verifier's root-only
+        # output must still download. BusyBox is bind-mounted into every
+        # image, so the image needs no tar of its own.
+        args: tuple[str, ...] = (
+            "sudo",
+            "--non-interactive",
+            "docker",
+            "exec",
+            "--user",
+            "0",
+            _CONTAINER_NAME,
+            _CONTAINER_BUSYBOX,
+            "sh",
+            "-c",
+            _DOWNLOAD_ARCHIVE_SCRIPT,
+            "sh",
+            source,
+            *flags,
+            _CONTAINER_BUSYBOX,
+        )
+    else:
+        args = ("sh", "-c", _DOWNLOAD_ARCHIVE_SCRIPT, "sh", source, *flags, "")
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+async def _stream_download_archive(
+    connection: asyncssh.SSHClientConnection,
+    command: str,
+    destination: Path,
+    *,
+    single_root: bool,
+    name: str,
+) -> str | None:
+    """Run ``command`` and extract the tar archive it writes into ``destination``.
+
+    A lost connection raises an ``OSError`` so the caller's SSH manager can
+    reconnect and restart the download; any other failure is final.
+    """
+
+    channel = _ByteChannel()
+    reader = channel.reader()
+
+    def extract() -> str | None:
+        try:
+            return _extract_download_archive(
+                reader, destination, single_root=single_root
+            )
+        finally:
+            # Stops the SSH side waiting on a queue nobody reads any more.
+            channel.abort()
+
+    extractor = asyncio.ensure_future(asyncio.to_thread(extract))
+    process: asyncssh.SSHClientProcess[bytes] | None = None
+    stderr: asyncio.Future[bytes] | None = None
+    try:
+        try:
+            process = await connection.create_process(
+                command, encoding=None, stdin=asyncssh.DEVNULL
+            )
+        except (OSError, asyncssh.Error) as exc:
+            if connection.is_closed():
+                raise RetryableSSHOperationError(f"{name} could not start: {exc}") from exc
+            raise SandboxFailedError(f"could not start {name}: {exc}") from exc
+        stderr = asyncio.ensure_future(process.stderr.read())
+
+        stream_error: BaseException | None = None
+        exit_status: int | None = None
+        try:
+            delivering = True
+            while True:
+                chunk = await process.stdout.read(_DOWNLOAD_CHUNK_BYTES)
+                if delivering and not await asyncio.to_thread(
+                    channel.put, chunk or None
+                ):
+                    # The extractor is finished. After a complete archive
+                    # tar may still send padding, which is read and dropped
+                    # so the exit status arrives; after a failure, stop.
+                    delivering = False
+                    await asyncio.wait({extractor})
+                    if extractor.exception() is not None:
+                        process.close()
+                        break
+                if not chunk:
+                    exit_status = (await process.wait()).exit_status
+                    break
+        except (OSError, asyncssh.Error) as exc:
+            stream_error = exc
+        channel.abort()
+        await asyncio.wait({extractor})
+        extract_error = extractor.exception()
+
+        if connection.is_closed():
+            raise RetryableSSHOperationError(
+                f"{name} lost its connection"
+            ) from (stream_error or extract_error)
+        if stream_error is not None:
+            raise SandboxFailedError(
+                f"could not complete {name}: {stream_error}"
+            ) from stream_error
+        detail = await _stderr_detail(stderr)
+        if exit_status not in (None, 0):
+            raise SandboxFailedError(
+                f"could not complete {name}: the archive exited with status "
+                f"{exit_status}" + (f": {detail}" if detail else "")
+            )
+        if extract_error is not None:
+            raise SandboxFailedError(
+                f"could not complete {name}: {extract_error}"
+            ) from extract_error
+        if exit_status is None:
+            raise SandboxFailedError(
+                f"could not complete {name}: the archive ended without an exit status"
+                + (f": {detail}" if detail else "")
+            )
+        return extractor.result()
+    finally:
+        channel.abort()
+        if process is not None:
+            process.close()
+        if stderr is not None and not stderr.done():
+            stderr.cancel()
+        # The extractor thread stops once the channel is aborted. Wait for it
+        # so a retry or the cleanup never races its writes into the stage.
+        await asyncio.wait({extractor})
+        if not extractor.cancelled():
+            extractor.exception()
+
+
+async def _stderr_detail(stderr: asyncio.Future[bytes]) -> str:
+    if not stderr.done():
+        await asyncio.wait({stderr}, timeout=1.0)
+    if not stderr.done() or stderr.cancelled() or stderr.exception() is not None:
+        return ""
+    text = bytes(stderr.result()).decode("utf-8", "replace").strip()
+    return text[-_DOWNLOAD_STDERR_LIMIT:]
 
 
 def _remote_command(
