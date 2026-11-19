@@ -371,14 +371,7 @@ class Sandbox:
         ``docker exec`` starts one in a container sandbox.
         """
 
-        ssh = self._info.ssh
-        command = _remote_command(
-            args,
-            workdir=workdir,
-            env=env,
-            user=user,
-            privileged=ssh is None or ssh.user == "root",
-        )
+        command = _remote_command(args, workdir=workdir, env=env, user=user)
         if self._info.vm and workdir is None:
             command = _VM_IMAGE_WORKDIR + command
         return command
@@ -473,12 +466,16 @@ class Sandbox:
         stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
-        if user is not None and (
-            not isinstance(user, str) or not user or "\x00" in user
-        ):
-            raise InvalidRequestError(
-                "user must be a non-empty string without NUL bytes"
-            )
+        if user is not None:
+            if not isinstance(user, str) or not user or "\x00" in user:
+                raise InvalidRequestError(
+                    "user must be a non-empty string without NUL bytes"
+                )
+            # A sandbox without an image logs in as an account that can start
+            # a command as another user but not signal it, so terminate() and
+            # the job's liveness checks would fail on it.
+            if not self._has_container and not self._info.vm:
+                raise InvalidRequestError("user requires a container or VM sandbox")
         if not args:
             raise InvalidRequestError("exec requires a command")
         for text_value in (*args, *(f"{k}={v}" for k, v in (env or {}).items())):
@@ -2184,16 +2181,11 @@ def _remote_command(
     workdir: str | None,
     env: Mapping[str, str | None] | None,
     user: str | None = None,
-    privileged: bool = True,
 ) -> str:
     parts: list[str] = []
     if workdir is not None:
         parts.extend(("cd", shlex.quote(workdir), "&&"))
     if user is not None:
-        if not privileged:
-            # sudo keeps the session's environment with -E, except PATH,
-            # which its secure_path replaces; pass that explicitly.
-            parts.extend(("sudo", "--non-interactive", "--preserve-env", "env", '"PATH=$PATH"'))
         parts.extend(("sh", "-c", shlex.quote(_SWITCH_USER_SCRIPT), "sh", shlex.quote(user)))
     if env:
         # env takes its options before any assignment: after one, "-u" would
@@ -2210,10 +2202,10 @@ def _remote_command(
 
 
 # Enters a VM sandbox's image working directory, or / when the sandbox names
-# none or the directory no longer exists.
+# none (an empty name included) or the directory no longer exists.
 _VM_IMAGE_WORKDIR = (
-    'cd -- "$(cat /run/thunder_seed/vmroot/workdir 2>/dev/null || echo /)" '
-    "2>/dev/null || cd /; "
+    '__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir 2>/dev/null); '
+    'cd -- "${__thunder_workdir:-/}" 2>/dev/null || cd /; '
 )
 
 

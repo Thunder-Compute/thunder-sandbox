@@ -422,10 +422,9 @@ class Client:
                         deadline=deadline,
                     )
                 del upload_key
-            resolved = await self._wait_for_image(
+            return await self._wait_for_image(
                 response, deadline=deadline, workspace_id=workspace_id
             )
-            return resolved
         finally:
             if context is not None:
                 await asyncio.to_thread(context.close)
