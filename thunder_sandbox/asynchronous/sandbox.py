@@ -1651,11 +1651,16 @@ fi
             return
         window = _wait_window(deadline)
         try:
+            # ``timeout`` is one window plus grace. The deadline stops a reset
+            # from resending that whole timeout once it can no longer hold
+            # another attempt; the wait loop then opens the next window from
+            # the time left.
             response = await client._request(
                 "GET",
                 f"/sandboxes/{_path_segment(self.id)}/wait",
                 query={"timeout_seconds": window},
                 timeout=window + WAIT_REPLY_GRACE_SECONDS,
+                deadline=deadline,
             )
         except NotFoundError:
             # An API without the endpoint answers 404 exactly as it does for

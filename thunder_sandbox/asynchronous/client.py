@@ -115,6 +115,18 @@ def _idempotent(method: str, path: str) -> bool:
     return False
 
 
+def _retry_fits(timeout: float | None, deadline: float | None, delay: float) -> bool:
+    """Whether resending after ``delay`` still finishes by ``deadline``.
+
+    No deadline, and no explicit timeout, keeps the per-attempt bound. A
+    deadline the next attempt would outlive is refused: the caller sized
+    ``timeout`` to the time it has left and opens a shorter one itself.
+    """
+    if deadline is None or timeout is None:
+        return True
+    return time.monotonic() + delay + timeout <= deadline
+
+
 def _resendable(exc: BaseException, idempotent: bool) -> bool:
     """Whether a request that failed with ``exc`` may be sent again.
 
@@ -195,8 +207,11 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
-        result = await self._request_json(method, path, body, query, timeout=timeout)
+        result = await self._request_json(
+            method, path, body, query, timeout=timeout, deadline=deadline
+        )
         if not isinstance(result, dict):
             raise ConnectionError("Thunder returned an unexpected response")
         return result
@@ -209,11 +224,16 @@ class Client:
         query: dict[str, object] | None = None,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Send one API request and return its decoded JSON.
 
         ``timeout`` bounds each attempt, in seconds, for calls the server
         deliberately holds open longer than the session default allows.
+        ``deadline`` is a monotonic timestamp. A resend starts only when that
+        attempt would finish by then (see :func:`_retry_fits`), so a caller
+        that sized ``timeout`` to the time it has left is not overrun by
+        another full attempt. With no deadline the per-attempt timeout stands.
 
         A request whose connection fails is sent again, up to
         ``len(CONNECTION_RETRY_DELAYS)`` times: always when the connection
@@ -228,7 +248,11 @@ class Client:
             except ThunderError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                if delay is None or not _resendable(exc, idempotent):
+                if (
+                    delay is None
+                    or not _resendable(exc, idempotent)
+                    or not _retry_fits(timeout, deadline, delay)
+                ):
                     raise ConnectionError(
                         f"could not communicate with Thunder: {_describe(exc)}"
                     ) from exc

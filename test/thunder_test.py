@@ -3391,6 +3391,36 @@ else:
             self.assertLess(client._request.await_count, 20)
             await client.close()
 
+    async def test_a_reset_near_the_wait_deadline_is_not_resent(self) -> None:
+        # The HTTP timeout is the window plus grace, so one wait fits the
+        # deadline. Resending it after a reset would open another full window
+        # (up to 45s) and the wait would run long past its timeout.
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory)
+            attempts: list[float] = []
+
+            def request(method: str, url: str, **kwargs: object) -> None:
+                attempts.append(time.monotonic())
+                raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+            session = mock.Mock()
+            session.request = request
+            client._get_session = lambda: session  # type: ignore[method-assign]
+            started = time.monotonic()
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.client.CONNECTION_RETRY_DELAYS",
+                    (2, 2),
+                ), self.assertRaises(ConnectionError):
+                    await sandbox.wait_until_ready(timeout=0.2)
+            finally:
+                await client.close()
+            self.assertGreaterEqual(len(attempts), 1)
+            # A resend sleeps for the retry delay before the next attempt.
+            # Every attempt here starts inside the caller's deadline instead.
+            for attempt_at in attempts:
+                self.assertLess(attempt_at, started + 1.5)
+
     async def test_wait_until_ready_falls_back_to_polling_without_the_endpoint(
         self,
     ) -> None:
@@ -4774,6 +4804,93 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
                     finally:
                         await client.close()
                     self.assertEqual(len(sent), sends)
+
+    async def test_connection_retry_does_not_outrun_a_deadline(self) -> None:
+        # A reset after part of a deadline-sized attempt must not start
+        # another attempt of the original timeout: that one would finish
+        # after the deadline.
+        class Attempt:
+            async def __aenter__(self) -> None:
+                await asyncio.sleep(0.05)
+                raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sent: list[float] = []
+
+            def request(method: str, url: str, **kwargs: object) -> Attempt:
+                timeout = kwargs["timeout"]
+                sent.append(timeout.total)  # type: ignore[attr-defined]
+                return Attempt()
+
+            session = mock.Mock()
+            session.request = request
+            client._get_session = lambda: session  # type: ignore[method-assign]
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.client.CONNECTION_RETRY_DELAYS",
+                    (0, 0),
+                ), self.assertRaisesRegex(ConnectionError, "ClientOSError"):
+                    await client._request(
+                        "GET",
+                        "/sandboxes/sbx-1/wait",
+                        timeout=0.2,
+                        deadline=time.monotonic() + 0.2,
+                    )
+            finally:
+                await client.close()
+            self.assertEqual(sent, [0.2])
+
+    async def test_connection_retry_resends_when_the_deadline_can_hold_it(self) -> None:
+        # The per-attempt timeout stands when the deadline still has room for
+        # it. A retry is not a shorter leftover of the first attempt.
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def read(self) -> bytes:
+                return b'{"ok": true}'
+
+            async def __aenter__(self) -> "Response":
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+        reset = aiohttp.ClientOSError(104, "Connection reset by peer")
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            pending = [reset]
+            sent: list[float] = []
+
+            def request(method: str, url: str, **kwargs: object) -> Response:
+                timeout = kwargs["timeout"]
+                sent.append(timeout.total)  # type: ignore[attr-defined]
+                if pending:
+                    raise pending.pop(0)
+                return Response()
+
+            session = mock.Mock()
+            session.request = request
+            client._get_session = lambda: session  # type: ignore[method-assign]
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.client.CONNECTION_RETRY_DELAYS",
+                    (0, 0),
+                ):
+                    result = await client._request(
+                        "GET",
+                        "/sandboxes/sbx-1",
+                        timeout=0.4,
+                        deadline=time.monotonic() + 5,
+                    )
+            finally:
+                await client.close()
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(sent, [0.4, 0.4])
 
     def test_closed_wait_window_maps_to_its_own_error(self) -> None:
         error = _api_error(
