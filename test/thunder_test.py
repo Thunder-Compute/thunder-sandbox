@@ -4152,6 +4152,36 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(destination.iterdir()), [])
             await client.close()
 
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_directory_symlink_cycles_fail_the_download(self) -> None:
+        # tar -h follows directory links and does not record visited inodes, so
+        # a cycle or a link to / has to be rejected before the archive starts.
+        for kind in ("parent", "root", "mutual"):
+            with self.subTest(kind), tempfile.TemporaryDirectory() as directory:
+                sandbox, client = self.sandbox(directory, image=True)
+                remote = Path(directory) / "remote" / "out"
+                remote.mkdir(parents=True)
+                (remote / "ok.txt").write_text("ok", encoding="utf-8")
+                if kind == "parent":
+                    (remote / "loop").symlink_to("..")
+                elif kind == "root":
+                    (remote / "all").symlink_to("/")
+                else:
+                    (remote / "a").mkdir()
+                    (remote / "b").mkdir()
+                    (remote / "a" / "to-b").symlink_to("../b")
+                    (remote / "b" / "to-a").symlink_to("../a")
+                sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+                destination = Path(directory) / "local"
+                destination.mkdir()
+                with self.assertRaisesRegex(SandboxFailedError, "symbolic link loop"):
+                    await asyncio.wait_for(
+                        sandbox.download(str(remote), destination, recursive=True),
+                        timeout=10,
+                    )
+                self.assertEqual(list(destination.iterdir()), [])
+                await client.close()
+
     async def test_download_restarts_after_a_lost_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory, image=True)

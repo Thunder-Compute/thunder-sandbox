@@ -1933,9 +1933,72 @@ async def _stop_sandbox(
 # container's BusyBox, or empty for the guest's own. tar -h follows every
 # symlink where it is archived, as SCP did, so the archive holds only files and
 # directories: a link never reaches the caller's machine, where its target
-# would name the caller's own files. A dangling link or a loop fails the
-# download, as it did over SCP.
+# would name the caller's own files. A dangling link fails the download, as it
+# did over SCP. A directory link that revisits a directory already on the walk
+# (loop -> .., or a link to /) is rejected first: tar -h does not record
+# visited directories, so the archive would grow until a path limit or the
+# filesystem had been copied.
 _DOWNLOAD_ARCHIVE_SCRIPT = """source=$1 recursive=$2 contents=$3 tool=$4
+# Device and inode of the path tar -h would archive. GNU and BusyBox stat take
+# -c; BSD stat takes -f. -L follows, which BusyBox does not do otherwise.
+file_id() {
+    if [ "$_stat_format" = c ]; then
+        $tool stat -L -c '%d:%i' -- "$1"
+    else
+        $tool stat -L -f '%d:%i' "$1"
+    fi
+}
+# Ancestors of the source are already on the stack, so a link to / fails before
+# that tree is walked. "|dev:ino|" keeps one id from matching a prefix of another.
+reject_archive_loops() {
+    if $tool stat -c '%d:%i' -- / >/dev/null 2>&1; then
+        _stat_format=c
+    elif $tool stat -f '%d:%i' / >/dev/null 2>&1; then
+        _stat_format=f
+    else
+        echo "$1: cannot identify files" >&2
+        exit 2
+    fi
+    path=$(cd -P -- "$1" && pwd -P) || exit 2
+    stack=
+    if [ "$path" != / ]; then
+        path=${path%/*}
+        [ -n "$path" ] || path=/
+        while :; do
+            id=$(file_id "$path") || exit 2
+            stack="$stack|$id|"
+            [ "$path" = / ] && break
+            path=${path%/*}
+            [ -n "$path" ] || path=/
+        done
+    fi
+    walk_archive "$1" "$stack"
+}
+walk_archive() {
+    local dir="$1" stack="$2" id prev entry
+    id=$(file_id "$dir") || exit 2
+    case $stack in
+    *"|$id|"*)
+        echo "$dir: symbolic link loop" >&2
+        exit 2
+        ;;
+    esac
+    stack="$stack|$id|"
+    prev=$(pwd -P) || exit 2
+    cd -P -- "$dir" || exit 2
+    for entry in .* *; do
+        case $entry in
+        .|..) continue ;;
+        esac
+        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+            continue
+        fi
+        if [ -d "$entry" ]; then
+            walk_archive "$entry" "$stack" || exit 2
+        fi
+    done
+    cd -P -- "$prev" || exit 2
+}
 while [ "$source" != / ] && [ "${source%/}" != "$source" ]; do
     source=${source%/}
 done
@@ -1946,6 +2009,9 @@ fi
 if [ -d "$source" ] && [ "$recursive" != 1 ]; then
     echo "$1: is a directory; download it with recursive=True" >&2
     exit 2
+fi
+if [ -d "$source" ]; then
+    (reject_archive_loops "$source") || exit 2
 fi
 if [ "$contents" = 1 ]; then
     if [ ! -d "$source" ]; then
