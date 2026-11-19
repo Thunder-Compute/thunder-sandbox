@@ -240,9 +240,9 @@ the entire remote process group, and reconnects safely if the SSH
 acknowledgement is lost. Jobs which do not exit after a five-second `SIGTERM`
 grace period are stopped with `SIGKILL`; `wait()` then returns `143` or `137`.
 
-In an image-backed sandbox, a command given by bare name runs the image's own program, as it would under `docker exec`. So `sh` is the image's shell, which is dash on Ubuntu and Debian and doesn't support `[[ ]]`, `set -o pipefail` or `source`; use `bash` for scripts that need them. If the image has no such program, the sandbox's BusyBox provides it when it can.
+In a container sandbox, a command given by bare name runs the image's own program, as it would under `docker exec`. So `sh` is the image's shell, which is dash on Ubuntu and Debian and doesn't support `[[ ]]`, `set -o pipefail` or `source`; use `bash` for scripts that need them. If the image has no such program, the sandbox's BusyBox provides it when it can.
 
-`wait()` returns when the command itself exits, so a command can leave a background service running and return immediately. In an image-backed sandbox, redirect the service's output if you start it with `&`; otherwise it holds the container's output stream open and `wait()` lasts as long as the service:
+`wait()` returns when the command itself exits, so a command can leave a background service running and return immediately. In a container sandbox, redirect the service's output if you start it with `&`; otherwise it holds the container's output stream open and `wait()` lasts as long as the service:
 
 ```python
 sandbox.exec("sh", "-c", "my-server >/var/log/my-server.log 2>&1 </dev/null &").wait()
@@ -451,7 +451,31 @@ setup.wait()
 agent = sandbox.exec("id", user="1000:1000")
 ```
 
-`user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`). Commands default to root unless `user` is specified, independently of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK. Specifying `user` without an image raises `InvalidRequestError`.
+`user` accepts a username or UID, optionally followed by a group name or GID (`"root"`, `"1000"`, or `"1000:1000"`). Commands default to root unless `user` is specified, independently of the image's `USER`. This option works for durable and PTY commands through `exec` and `exec_async`, including the native async SDK, and in [VM sandboxes](#vm-sandboxes) as well as container sandboxes.
+
+## VM sandboxes
+
+A VM sandbox boots its image as the whole VM: the image's own systemd is PID 1, and there is no container. Commands and file transfers reach it directly over SSH as `root`. Everything else works as in a container sandbox: durable and PTY commands, `user`, output streaming and recovery, uploads and downloads, network policies, lifetimes and queueing. Ask for one with `vm`:
+
+```python
+sandbox = thunder.Sandbox.create(
+    image=thunder.Image.from_dockerfile("./agent-image"),
+    vm=True,
+    timeout=900,
+)
+```
+
+The image is built for it: `vm` makes `create` build or import a VM image of the source, which is a separate image from that source's container image. `client.resolve_image(image, vm=True)` prepares one ahead of time and returns a `ResolvedImage` whose `vm` is true. Without `image`, the sandbox boots Thunder's default VM image, Ubuntu 24.04. Where VM sandboxes are not available, `vm` is ignored: the image is built as a container image and the sandbox starts as it would without `vm`. `sandbox.vm` tells the two kinds of sandbox apart.
+
+Only images of a supported distribution can boot as a VM: Debian, Ubuntu, Fedora, CentOS Stream, Rocky Linux, AlmaLinux, Arch Linux and openSUSE. Building a scratch, distroless or Alpine image this way fails with `SandboxFailedError` code `IMAGE_CANNOT_BOOT_AS_VM` and the reason. A build that fails for a transient reason fails with `VM_ROOT_PROVISION_FAILED` and can be retried.
+
+The image's `ENTRYPOINT` and `CMD` run once as root, from its `WORKDIR`, after the image's own services start; their state is in `/var/lib/thunder-sandbox/image-command/` as in a container sandbox. `vm={"imageCommand": {...}}` overrides them the way `docker run` does, with `entrypoint`, `cmd` and `workdir`, and `restart` (`"no"`, `"on-failure"` or `"always"`) runs the command again after it exits.
+
+Some things differ from a container sandbox:
+
+- A command runs with the image's `ENV` and starts in the image's `WORKDIR`, or in `/` when the image sets none; pass `workdir` to choose. A relative transfer path is relative to `/`, as in a container sandbox.
+- A command given by bare name is looked up in the image's `PATH`, with no BusyBox fallback.
+- The guest can `reboot` or `poweroff`, and a kernel panic does the same: the sandbox restarts in place with its disk, network and lifetime. A command that was running when it restarted ends with exit code 137, and its output from the last moments before the restart may be missing.
 
 ## Configuration
 

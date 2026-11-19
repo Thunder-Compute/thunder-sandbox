@@ -152,6 +152,11 @@ class RemoteJobPaths:
     def termination_request(self) -> PurePosixPath:
         return self.directory / "termination.request"
 
+    @property
+    def boot_id(self) -> PurePosixPath:
+        """The kernel boot the job was submitted in."""
+        return self.directory / "boot_id"
+
 
 def _validate_text(value: str, label: str, *, empty: bool = True) -> None:
     if not empty and not value:
@@ -521,12 +526,17 @@ mkdir -- "$stage"
 printf '%s' {encoded_spec} >"$stage/spec.json"
 printf '%s' {encoded_launcher} >"$stage/launch.sh"
 printf '%s' {prepared} >"$stage/status.json"
+cat -- {_BOOT_ID} >"$stage/boot_id" 2>/dev/null || :
 chmod 700 -- "$stage" "$stage/launch.sh"
 : >"$stage/stdout"
 : >"$stage/stderr"
 : >"$stage/launcher.stderr"
+# A sandbox can lose power or panic at any moment, and a VM sandbox restarts
+# in place on the same disk. Without these flushes a job submitted shortly
+# before would come back with an empty specification.
+sync -- "$stage/spec.json" "$stage/launch.sh" "$stage/status.json" "$stage/boot_id" 2>/dev/null || :
 if mv -T -- "$stage" "$job" 2>/dev/null; then
-    :
+    sync -- "$root" 2>/dev/null || :
 else
     cmp -s -- "$stage/spec.json" "$job/spec.json"
     cmp -s -- "$stage/launch.sh" "$job/launch.sh"
@@ -564,6 +574,58 @@ while grep -Eq {prepared_pattern} {status}; do
     launch_round=$((launch_round + 1))
 done
 cat -- {status}
+"""
+
+
+_BOOT_ID = "/proc/sys/kernel/random/boot_id"
+# The job's code when the sandbox restarted under it, as if it was killed.
+SANDBOX_RESTART_RETURNCODE = 137
+
+
+def _reconcile_restart(paths: RemoteJobPaths) -> str:
+    """Shell which ends a job whose sandbox restarted while it was unfinished.
+
+    Its supervisor died with the old boot and nothing will start it again, so
+    its status would otherwise stay unfinished forever, and its recorded PID
+    may now belong to an unrelated process. Jobs from before the boot record
+    have no ``boot_id`` and are left as they are.
+
+    A submission retried after the restart may launch a job staged before it,
+    so a ``boot_id`` from another boot alone does not prove the job dead. Its
+    launcher holds the run lock for the job's whole life, and no lock outlives
+    a boot: the job is ended only while that lock is free, and the launcher,
+    which takes it before reading the status, then finds it finished.
+    """
+
+    unfinished = shlex.quote(
+        _state_pattern(*(state for state in JobState if not state.terminal))
+    )
+    failed = shlex.quote(
+        JobStatus(JobState.FAILED, returncode=SANDBOX_RESTART_RETURNCODE).to_json()
+    )
+    boot_id = shlex.quote(str(paths.boot_id))
+    run_lock = shlex.quote(str(paths.run_lock))
+    return f"""if [ -s {boot_id} ] && grep -Eq {unfinished} "$status" \
+    && [ "$(cat -- {boot_id})" != "$(cat -- {_BOOT_ID} 2>/dev/null)" ]; then
+    exec 7>{run_lock}
+    if flock -n 7 && grep -Eq {unfinished} "$status"; then
+        temporary="$job/.status.restart.$$"
+        printf '%s' {failed} >"$temporary"
+        mv -f -- "$temporary" "$status"
+    fi
+    exec 7>&-
+fi
+"""
+
+
+def status_command(paths: RemoteJobPaths) -> str:
+    """Build a command which prints the job's status, ending it if its sandbox restarted."""
+
+    return f"""set -eu
+job={shlex.quote(str(paths.directory))}
+status={shlex.quote(str(paths.status))}
+[ -f "$status" ] || {{ echo 'no such job' >&2; exit 1; }}
+{_reconcile_restart(paths)}cat -- "$status"
 """
 
 
@@ -704,7 +766,7 @@ mv -f -- "$temporary" "$status"
 job={job}
 status={shlex.quote(str(paths.status))}
 touch -- {shlex.quote(str(paths.termination_request))}
-if grep -Eq {terminal_pattern} "$status"; then
+{_reconcile_restart(paths)}if grep -Eq {terminal_pattern} "$status"; then
     cat -- "$status"
     exit 0
 fi
@@ -724,6 +786,7 @@ cat -- "$status"
 __all__ = [
     "JOB_PROTOCOL_VERSION",
     "JOB_ROOT",
+    "SANDBOX_RESTART_RETURNCODE",
     "JobSpec",
     "JobState",
     "JobStatus",
@@ -735,6 +798,7 @@ __all__ = [
     "launcher_script",
     "new_job_id",
     "signal_command",
+    "status_command",
     "submission_command",
     "validate_job_id",
 ]

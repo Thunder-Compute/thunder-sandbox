@@ -176,12 +176,15 @@ class ResolvedImage:
     """An immutable Thunder-managed image ready for sandbox creation.
 
     ``workspace_id`` is the workspace the image was resolved in, which lists it.
+    ``vm`` is true for an image built to boot as the whole VM, which only
+    starts VM sandboxes; see ``Client.resolve_image``.
     """
 
     id: str
     managed_reference: str
     managed_digest: str
     workspace_id: str = MAIN_WORKSPACE_ID
+    vm: bool = False
 
 
 @dataclass(frozen=True)

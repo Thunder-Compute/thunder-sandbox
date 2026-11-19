@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 import time
@@ -56,6 +57,7 @@ from thunder_sandbox.asynchronous._jobs import (
     submission_command,
 )
 from thunder_sandbox.asynchronous._transfer import (
+    extract_download_archive,
     parse_transfer_path as _parse_transfer_path,
 )
 from thunder_sandbox.asynchronous._ssh import (
@@ -66,6 +68,7 @@ from thunder_sandbox.asynchronous._ssh import (
 from thunder_sandbox.asynchronous.sandbox import (
     WAIT_WINDOW_MAX_SECONDS,
     _container_exec_script,
+    _download_archive_command,
 )
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
 from thunder_sandbox.asynchronous.sandbox import (
@@ -73,6 +76,7 @@ from thunder_sandbox.asynchronous.sandbox import (
     _container_remote_command,
     _container_job_prepare_script,
     _pinned_host_key,
+    _remote_command,
 )
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
 from thunder_sandbox.synchronous._bridge import AsyncBridge
@@ -1422,20 +1426,21 @@ class SynchronousClientTest(unittest.TestCase):
                 )
                 client._client.resolve_image.assert_awaited_once_with(
                     image, timeout=42, gated_features=features, spec=None, queue=True,
-                    workspace="research",
+                    workspace="research", vm=False,
                 )
                 client._client.resolve_image.reset_mock()
                 self.assertEqual(
                     asyncio.run(
                         client.resolve_image_async(
-                            image, timeout=42, gated_features=features, queue=True
+                            image, timeout=42, gated_features=features, queue=True,
+                            vm=True,
                         )
                     ),
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
                     image, timeout=42, gated_features=features, spec=None, queue=True,
-                    workspace=None,
+                    workspace=None, vm=True,
                 )
             finally:
                 client.close()
@@ -1603,6 +1608,50 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await client.close()
+
+    async def test_vm_image_is_requested_natively_or_through_the_gated_feature(self) -> None:
+        # The vm argument has its own field. gated_features={"vm": ...} is the
+        # build's mode, and the build's other gated features are kept.
+        for kwargs, fields in (
+            ({"vm": True}, {"vm": True}),
+            ({"gated_features": {"vm": {}}}, {"mode": "vm"}),
+            ({"gated_features": {"vm": {}, "image_feature": True}}, {"mode": "vm", "gatedFeatures": {"image_feature": True}}),
+        ):
+            with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client._request = mock.AsyncMock(return_value={
+                    "id": "image-id", "state": "READY",
+                    "managed_reference": "managed.example/image@sha256:digest",
+                    "managed_digest": "sha256:digest",
+                })
+                try:
+                    await client.resolve_image(Image.from_registry("fedora:41"), **kwargs)
+                    body = client._request.await_args.kwargs["body"]
+                    self.assertEqual(
+                        {key: body[key] for key in ("vm", "mode", "gatedFeatures") if key in body},
+                        fields,
+                    )
+                finally:
+                    await client.close()
+        # Where VM sandboxes are unavailable Thunder builds the container image.
+        for mode in ("vm", None):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client._request = mock.AsyncMock(
+                    return_value={
+                        "id": "image-id",
+                        "state": "READY",
+                        "managed_reference": "managed.example/image@sha256:digest",
+                        "managed_digest": "sha256:digest",
+                        **({"mode": mode} if mode else {}),
+                    }
+                )
+                try:
+                    image = Image.from_registry("fedora:41")
+                    resolved = await client.resolve_image(image, vm=True)
+                    self.assertEqual(resolved.vm, mode == "vm")
+                finally:
+                    await client.close()
 
     async def test_dockerfile_image_is_archived_uploaded_and_polled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1808,7 +1857,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         )
                         client.resolve_image.assert_awaited_once_with(
                             image, gated_features=None, spec=spec, queue=True,
-                            workspace="main",
+                            workspace="main", vm=False,
                         )
                         body = client._request.await_args_list[0].args[2]
                         self.assertIs(body["queue"], True)
@@ -1822,6 +1871,71 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(sandbox.queued)
                     finally:
                         await client.close()
+
+    async def test_create_with_vm_builds_a_vm_image_and_starts_it_as_a_vm(self) -> None:
+        vm_config = {"imageCommand": {"cmd": []}}
+        # Where VM sandboxes are unavailable Thunder ignores vm and starts a
+        # container sandbox, which the SDK then drives through the container.
+        for vm, granted, sent in (
+            (False, False, None),
+            (True, True, {}),
+            (vm_config, True, vm_config),
+            (True, False, {}),
+        ):
+            with self.subTest(vm=vm, granted=granted), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                    "image-id", "registry.example/image@sha256:digest", "sha256:digest",
+                    vm=granted,
+                ))
+                client._request = mock.AsyncMock(side_effect=[
+                    {"id": "sbx-test"},
+                    {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": granted},
+                ])
+                try:
+                    sandbox = await client.create_sandbox(
+                        image=Image.from_registry("fedora:41"),
+                        vm=vm,
+                        gated_features={"image_feature": True},
+                    )
+                    kwargs = client.resolve_image.await_args.kwargs
+                    self.assertEqual(kwargs["gated_features"], {"image_feature": True})
+                    self.assertIs(kwargs["vm"], sent is not None)
+                    body = client._request.await_args_list[0].args[2]
+                    self.assertEqual(body.get("vm"), sent)
+                    self.assertEqual(body["gatedFeatures"], {"image_feature": True})
+                    self.assertEqual(sandbox.vm, granted)
+                    self.assertEqual(sandbox._has_container, not granted)
+                finally:
+                    await client.close()
+
+    async def test_create_with_the_gated_vm_feature_is_unchanged(self) -> None:
+        gated = {"vm": {"imageCommand": {"cmd": []}}, "image_feature": True}
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                "image-id", "registry.example/image@sha256:digest", "sha256:digest", vm=True,
+            ))
+            client._request = mock.AsyncMock(side_effect=[
+                {"id": "sbx-test"},
+                {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": True},
+            ])
+            try:
+                sandbox = await client.create_sandbox(
+                    image=Image.from_registry("fedora:41"), gated_features=gated
+                )
+                kwargs = client.resolve_image.await_args.kwargs
+                self.assertEqual((kwargs["gated_features"], kwargs["vm"]), (gated, False))
+                body = client._request.await_args_list[0].args[2]
+                self.assertEqual(body["gatedFeatures"], gated)
+                self.assertNotIn("vm", body)
+                self.assertTrue(sandbox.vm)
+            finally:
+                await client.close()
+
+    async def test_create_rejects_a_vm_that_is_neither_a_boolean_nor_a_mapping(self) -> None:
+        with self.assertRaisesRegex(InvalidRequestError, "vm must be"):
+            await AsyncSandbox.create(vm="yes", client=mock.Mock())  # type: ignore[arg-type]
 
     def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
         client = AsyncClient(config(directory))
@@ -1926,8 +2040,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 spec=None,
                 queue=False,
                 workspace=None,
+                vm=False,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
+                self.assertFalse(vm)
                 self.assertEqual(timeout, 7200)
                 self.assertEqual(workspace, "ws-a1")
                 self.assertEqual(gated_features, {"image_feature": True})
@@ -2449,26 +2565,6 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("unset NOT-A-NAME", script)
         self.assertIn("/busybox env -u NOT-A-NAME ", script)
 
-    async def test_contents_download_requests_the_directory_itself(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox, client = self.sandbox(directory)
-            sandbox._ssh_manager._connection = FakeSSHConnection()  # type: ignore[assignment]
-            target = Path(directory) / "target"
-            target.mkdir()
-            requested: list[str] = []
-
-            async def scp(source: tuple[object, str], stage: str, **_kwargs: object) -> None:
-                requested.append(source[1])
-                Path(stage).mkdir()
-                (Path(stage) / "result.txt").write_text("done", encoding="utf-8")
-
-            with mock.patch("thunder_sandbox.asynchronous.sandbox.asyncssh.scp", scp):
-                await sandbox._download_from_guest("/logs/.", target, recursive=True)
-
-            self.assertEqual(requested, ["/logs"])
-            self.assertEqual((target / "result.txt").read_text(encoding="utf-8"), "done")
-            await client.close()
-
     async def test_upload_timeout_raises_sandbox_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -2709,6 +2805,64 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("python train.py", submitted)
             await client.close()
 
+    async def test_vm_sandbox_runs_commands_on_the_vm_without_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client,
+                {
+                    **SANDBOX_RESPONSE,
+                    "image_id": "a" * 64,
+                    "vm": True,
+                    "ssh": {**SANDBOX_RESPONSE["ssh"], "user": "root"},
+                },
+            )
+            result = mock.Mock(
+                returncode=0,
+                stdout=JobStatus(JobState.STARTING, pid=987).to_json(),
+                stderr="",
+            )
+            connection = mock.Mock(run=mock.AsyncMock(return_value=result))
+            connection.is_closed.return_value = False
+            sandbox._ssh_manager._connection = connection
+            try:
+                process = await sandbox.exec(
+                    "python", "train.py", workdir="/workspace", user="1000:1000"
+                )
+                self.assertTrue(process.is_durable)
+                submitted = connection.run.await_args.kwargs["input"]
+                self.assertNotIn("docker", submitted)
+                self.assertNotIn("sudo", submitted)
+                self.assertIn('"container":null', submitted)
+                self.assertIn("/var/tmp/thunder-sandbox/jobs/", submitted)
+                self.assertIn("exec setpriv", submitted)
+                self.assertNotIn("/run/thunder_seed/vmroot/workdir", submitted)
+                with mock.patch.object(
+                    sandbox, "_create_process", new_callable=mock.AsyncMock
+                ) as create:
+                    await sandbox.exec("id", user="agent", pty=True)
+                    command = create.await_args.args[0]
+                    # Without a workdir it starts in the image's, as docker exec does.
+                    self.assertTrue(command.startswith(
+                        "__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
+                    ))
+                    argv = shlex.split(command.split("; ", 2)[2])
+                    self.assertEqual(argv[:2], ["sh", "-c"])
+                    self.assertEqual(argv[3:], ["sh", "agent", "id"])
+                self.assertEqual(sandbox._image_path("out/x"), "/out/x")
+                self.assertEqual(sandbox._image_path("/abs"), "/abs")
+            finally:
+                await client.close()
+
+    def test_direct_command_passes_env_options_before_assignments(self) -> None:
+        command = _remote_command(
+            ["sh", "-c", "true"], workdir=None, env={"SET": "a b", "GONE": None}
+        )
+        self.assertEqual(
+            shlex.split(command),
+            ["env", "-u", "GONE", "SET=a b", "sh", "-c", "true"],
+        )
+
     async def test_detached_launch_reconciles_a_lost_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -2779,19 +2933,15 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             try:
-                for pty in (False, True):
-                    with self.subTest(pty=pty), self.assertRaisesRegex(
-                        InvalidRequestError, "image-backed"
-                    ):
-                        await sandbox.exec("id", user="root", pty=pty)
-                sandbox = AsyncSandbox._from_response(
-                    client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
-                )
                 for user in ("", "root\x00bad", 0):
                     with self.subTest(user=user), self.assertRaisesRegex(
                         InvalidRequestError, "non-empty string"
                     ):
                         await sandbox.exec("id", user=user)
+                with self.subTest(sandbox="no image"), self.assertRaisesRegex(
+                    InvalidRequestError, "container or VM sandbox"
+                ):
+                    await sandbox.exec("id", user="nobody")
             finally:
                 await client.close()
 
@@ -3042,81 +3192,6 @@ else:
             await sandbox._close_connection()
             await client.close()
 
-    async def test_download_keeps_destination_intact_until_retry_succeeds(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox, client = self.sandbox(directory)
-            destination = Path(directory) / "result.bin"
-            destination.write_bytes(b"old-result")
-            first = FakeSSHConnection()
-            second = FakeSSHConnection()
-            sandbox._ssh_manager = SSHConnectionManager(
-                mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
-                sleep=mock.AsyncMock(),
-                jitter=lambda _start, _end: 0.0,
-            )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
-            observed_destinations: list[bytes] = []
-
-            async def transfer(_source: object, staged: str, **_kwargs: object) -> None:
-                observed_destinations.append(destination.read_bytes())
-                Path(staged).write_bytes(
-                    b"partial" if len(observed_destinations) == 1 else b"complete"
-                )
-                if len(observed_destinations) == 1:
-                    first.close()
-                    raise SSHDisconnected("download lost")
-
-            with mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
-                new=mock.AsyncMock(side_effect=transfer),
-            ):
-                await sandbox.download("/workspace/result.bin", destination)
-
-            self.assertEqual(observed_destinations, [b"old-result", b"old-result"])
-            self.assertEqual(destination.read_bytes(), b"complete")
-            self.assertTrue(first.closed)
-            self.assertEqual(
-                list(Path(directory).glob(".result.bin.thunder-transfer-*")), []
-            )
-            await sandbox._close_connection()
-            await client.close()
-
-    async def test_directory_contents_download_preserves_existing_entries(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sandbox, client = self.sandbox(directory)
-            destination = Path(directory) / "results"
-            destination.mkdir()
-            (destination / "existing.txt").write_text("keep", encoding="utf-8")
-            connection = FakeSSHConnection()
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
-
-            async def transfer(_source: object, staged: str, **_kwargs: object) -> None:
-                stage = Path(staged)
-                stage.mkdir()
-                (stage / "new.txt").write_text("new", encoding="utf-8")
-
-            with mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
-                new=mock.AsyncMock(side_effect=transfer),
-            ):
-                await sandbox.download(
-                    "/workspace/results/.", destination, recursive=True
-                )
-
-            self.assertEqual(
-                (destination / "existing.txt").read_text(encoding="utf-8"), "keep"
-            )
-            self.assertEqual(
-                (destination / "new.txt").read_text(encoding="utf-8"), "new"
-            )
-            self.assertEqual(
-                list(Path(directory).glob(".results.thunder-*")), []
-            )
-            await sandbox._close_connection()
-            await client.close()
-
     async def test_upload_publication_retries_after_lost_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -3255,110 +3330,6 @@ else:
                 order,
                 ["reset", "scp", "chown 0:0", "docker cp", "sudo rm"],
             )
-            chown = next(c.args for c in guest.await_args_list if "chown" in c.args)
-            # Under sudo, a symlink in the payload must never redirect the
-            # ownership change to a guest file outside the stage.
-            self.assertIn("-h", chown)
-            self.assertEqual(chown[:2], ("sudo", "--non-interactive"))
-            await client.close()
-
-    async def test_download_from_image_container_uses_isolated_guest_staging(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            client = AsyncClient(config(directory))
-            sandbox = AsyncSandbox._from_response(
-                client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
-            )
-            destination = Path(directory) / "result.txt"
-            connection = FakeSSHConnection()
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
-            with mock.patch.object(
-                sandbox, "_run_guest_command", new=mock.AsyncMock()
-            ) as guest, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
-                new=mock.AsyncMock(),
-            ) as scp, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox._publish_local_transfer"
-            ), mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.uuid.uuid4",
-                return_value=mock.Mock(hex="transfer"),
-            ):
-                await sandbox.download("/workspace/result.txt", destination)
-
-            stage = "/tmp/thunder-sandbox-transfer-transfer"
-            scp_source, scp_destination = scp.await_args.args
-            self.assertEqual(scp_source, (connection, stage + "/result.txt"))
-            self.assertEqual(Path(scp_destination).name, "result.txt")
-            self.assertNotEqual(scp_destination, str(destination))
-            self.assertEqual(scp.await_args.kwargs, {"recurse": False})
-            self.assertEqual(
-                [call.args for call in guest.await_args_list],
-                [
-                    ("mkdir", "-p", "--", stage),
-                    (
-                        "sudo",
-                        "--non-interactive",
-                        "docker",
-                        "cp",
-                        "thunder-sandbox:/workspace/result.txt",
-                        stage + "/",
-                    ),
-                    (
-                        "sudo",
-                        "--non-interactive",
-                        "chown",
-                        "-R",
-                        "-h",
-                        "--",
-                        "ubuntu:",
-                        stage,
-                    ),
-                    (
-                        "sudo",
-                        "--non-interactive",
-                        "chmod",
-                        "-R",
-                        "u+rwX",
-                        "--",
-                        stage,
-                    ),
-                ],
-            )
-            await client.close()
-
-    async def test_download_from_image_container_hands_stage_to_ssh_user_before_scp(
-        self,
-    ) -> None:
-        # docker cp preserves container ownership, so a root-owned 0600 file
-        # (a verifier's locked-down output, say) is unreadable to the SSH user
-        # that scp runs as. The stage must change hands between the two legs.
-        with tempfile.TemporaryDirectory() as directory:
-            client = AsyncClient(config(directory))
-            sandbox = AsyncSandbox._from_response(
-                client, {**SANDBOX_RESPONSE, "image_id": "b" * 64}
-            )
-            destination = Path(directory) / "frozen.sha256"
-            sandbox._ssh_manager._connection = FakeSSHConnection()  # type: ignore[assignment]
-            order: list[str] = []
-
-            async def record_guest(*args: str) -> None:
-                order.append(next(a for a in args if a in {"mkdir", "docker", "chown", "chmod"}))
-
-            async def record_scp(*args: object, **kwargs: object) -> None:
-                order.append("scp")
-
-            with mock.patch.object(
-                sandbox, "_run_guest_command", new=mock.AsyncMock(side_effect=record_guest)
-            ) as guest, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
-                new=mock.AsyncMock(side_effect=record_scp),
-            ), mock.patch(
-                "thunder_sandbox.asynchronous.sandbox._publish_local_transfer"
-            ):
-                await sandbox.download("/logs/verifier/frozen.sha256", destination)
-
-            self.assertEqual(order, ["mkdir", "docker", "chown", "chmod", "scp"])
             chown = next(c.args for c in guest.await_args_list if "chown" in c.args)
             # Under sudo, a symlink in the payload must never redirect the
             # ownership change to a guest file outside the stage.
@@ -3874,6 +3845,566 @@ else:
                 client._request.assert_not_awaited()
             finally:
                 await client.close()
+
+
+_CONTAINER_EXEC_PREFIX = [
+    "sudo", "--non-interactive", "docker", "exec", "--user", "0", "thunder-sandbox",
+]
+
+
+class _LocalStream:
+    def __init__(self, stream: asyncio.StreamReader) -> None:
+        self._stream = stream
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._stream.read(n)
+
+
+class _LocalProcess:
+    """An asyncssh-like process backed by a local subprocess."""
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+        assert process.stdout is not None and process.stderr is not None
+        self.stdout = _LocalStream(process.stdout)
+        self.stderr = _LocalStream(process.stderr)
+
+    async def wait(self) -> mock.Mock:
+        return mock.Mock(exit_status=await self._process.wait())
+
+    def close(self) -> None:
+        if self._process.returncode is None:
+            with suppress(ProcessLookupError):
+                self._process.kill()
+
+
+class LocalShellConnection(FakeSSHConnection):
+    """Run sandbox commands on this machine, as the guest or its container.
+
+    A container command loses its ``docker exec`` prefix and its BusyBox
+    becomes a pass-through, so the archive script runs with local tools.
+    """
+
+    def __init__(self, busybox: Path) -> None:
+        super().__init__()
+        self.busybox = busybox
+        self.commands: list[list[str]] = []
+
+    async def create_process(self, command: str, **kwargs: object) -> _LocalProcess:
+        assert kwargs.get("encoding", "") is None
+        argv = shlex.split(command)
+        self.commands.append(argv)
+        if argv[: len(_CONTAINER_EXEC_PREFIX)] == _CONTAINER_EXEC_PREFIX:
+            argv = argv[len(_CONTAINER_EXEC_PREFIX):]
+            argv = [str(self.busybox) if arg == "/busybox" else arg for arg in argv]
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # macOS tar would add AppleDouble "._name" entries for xattrs.
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
+        )
+        return _LocalProcess(process)
+
+
+class _ScriptedStream:
+    def __init__(self, chunks: list[bytes | BaseException], then_block: bool) -> None:
+        self._chunks = list(chunks)
+        self._then_block = then_block
+        self.reads = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        self.reads += 1
+        if self._chunks:
+            item = self._chunks.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        if self._then_block:
+            await asyncio.Event().wait()
+        return b""
+
+
+class ScriptedProcess:
+    def __init__(
+        self,
+        chunks: list[bytes | BaseException],
+        *,
+        exit_status: int | None = 0,
+        stderr: bytes = b"",
+        then_block: bool = False,
+        on_close: Callable[[], None] | None = None,
+    ) -> None:
+        self.stdout = _ScriptedStream(chunks, then_block)
+        self.stderr = _ScriptedStream([stderr], then_block)
+        self._exit_status = exit_status
+        self._on_close = on_close
+        self.closed = False
+
+    async def wait(self) -> mock.Mock:
+        return mock.Mock(exit_status=self._exit_status)
+
+    def close(self) -> None:
+        self.closed = True
+        if self._on_close is not None:
+            self._on_close()
+
+
+def tar_bytes(*entries: tuple[str, str, object]) -> bytes:
+    """Build a tar archive from (kind, name, payload) entries."""
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for kind, name, payload in entries:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                data = cast_bytes(payload)
+                info.size = len(data)
+                info.mode = 0o644
+                archive.addfile(info, io.BytesIO(data))
+                continue
+            if kind == "mode":
+                data, mode = cast_mode(payload)
+                info.size = len(data)
+                info.mode = mode
+                archive.addfile(info, io.BytesIO(data))
+                continue
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                info.mode = int(payload) if payload is not None else 0o755  # type: ignore[call-overload]
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = str(payload)
+            elif kind == "hardlink":
+                info.type = tarfile.LNKTYPE
+                info.linkname = str(payload)
+            else:
+                raise AssertionError(kind)
+            archive.addfile(info)
+    return buffer.getvalue()
+
+
+def cast_bytes(payload: object) -> bytes:
+    assert isinstance(payload, bytes)
+    return payload
+
+
+def cast_mode(payload: object) -> tuple[bytes, int]:
+    assert isinstance(payload, tuple)
+    return payload[0], payload[1]
+
+
+def extract(data: bytes, destination: Path, *, single_root: bool = True) -> str | None:
+    return extract_download_archive(
+        io.BufferedReader(io.BytesIO(data)),  # type: ignore[arg-type]
+        destination,
+        single_root=single_root,
+    )
+
+
+class DownloadArchiveExtractionTest(unittest.TestCase):
+    def test_extracts_a_tree_and_names_its_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = extract(
+                tar_bytes(
+                    ("dir", "verifier/", None),
+                    ("file", "verifier/a.txt", b"a"),
+                    ("dir", "verifier/sub", None),
+                    ("file", "verifier/sub/b.txt", b"b"),
+                ),
+                Path(directory),
+            )
+            self.assertEqual(root, "verifier")
+            self.assertEqual((Path(directory) / "verifier/sub/b.txt").read_bytes(), b"b")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX modes")
+    def test_owner_only_and_unreadable_entries_become_readable_by_the_caller(self) -> None:
+        # docker cp needed a chown/chmod pass for root-only verifier output;
+        # the archive's modes must not lock the caller out either.
+        with tempfile.TemporaryDirectory() as directory:
+            extract(
+                tar_bytes(
+                    ("dir", "out", 0o500),
+                    ("mode", "out/frozen.sha256", (b"digest", 0o000)),
+                ),
+                Path(directory),
+            )
+            target = Path(directory) / "out/frozen.sha256"
+            self.assertEqual(target.read_bytes(), b"digest")
+            self.assertTrue(os.access(Path(directory) / "out", os.W_OK))
+            self.assertEqual(target.stat().st_uid, os.getuid())
+
+    def test_hard_links_extract_and_symlinks_are_refused(self) -> None:
+        # The sender follows symlinks, so a link arriving here would point at
+        # the caller's own files, which oddish-style uploaders then read.
+        with tempfile.TemporaryDirectory() as directory:
+            extract(
+                tar_bytes(
+                    ("dir", "app", None),
+                    ("file", "app/data", b"x"),
+                    ("hardlink", "app/data-link", "app/data"),
+                ),
+                Path(directory),
+            )
+            self.assertEqual((Path(directory) / "app/data-link").read_bytes(), b"x")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SandboxFailedError, "symlink"):
+                extract(
+                    tar_bytes(
+                        ("dir", "app", None),
+                        ("symlink", "app/creds", "/root/.thunder/credentials"),
+                    ),
+                    Path(directory),
+                )
+            self.assertFalse((Path(directory) / "app/creds").is_symlink())
+
+    def test_contents_archive_skips_its_dot_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = extract(
+                tar_bytes(("dir", "./", None), ("file", "./a", b"a"), ("file", "./b", b"b")),
+                Path(directory),
+                single_root=False,
+            )
+            self.assertIsNone(root)
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["a", "b"])
+
+    def test_refuses_members_that_could_escape_the_destination(self) -> None:
+        cases = {
+            "parent reference": tar_bytes(("file", "out/../../evil", b"x")),
+            "absolute path": tar_bytes(("file", "/tmp/evil", b"x")),
+            "write through a link": tar_bytes(
+                ("dir", "out", None),
+                ("symlink", "out/escape", "/tmp"),
+                ("file", "out/escape/evil", b"x"),
+            ),
+            "replace a link": tar_bytes(
+                ("dir", "out", None),
+                ("symlink", "out/passwd", "/etc/passwd"),
+                ("file", "out/passwd", b"x"),
+            ),
+            "hard link outside": tar_bytes(
+                ("dir", "out", None), ("hardlink", "out/shadow", "/etc/shadow")
+            ),
+            "second root": tar_bytes(("file", "one", b"1"), ("file", "two", b"2")),
+        }
+        for label, data in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                outside = Path(directory) / "outside"
+                outside.mkdir()
+                destination = Path(directory) / "stage"
+                destination.mkdir()
+                with self.assertRaises(SandboxFailedError):
+                    extract(data, destination)
+                self.assertEqual(list(outside.iterdir()), [])
+
+    def test_truncated_archive_is_an_error(self) -> None:
+        data = tar_bytes(("file", "out", b"x" * 4096))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SandboxFailedError):
+                extract(data[:1024], Path(directory))
+
+
+class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
+    def sandbox(
+        self, directory: str, *, image: bool
+    ) -> tuple[AsyncSandbox, AsyncClient]:
+        client = AsyncClient(config(directory))
+        prepare_key(client.config.paths)
+        response = {**SANDBOX_RESPONSE, "image_id": "a" * 64} if image else SANDBOX_RESPONSE
+        return AsyncSandbox._from_response(client, response), client
+
+    def local_connection(self, directory: str) -> LocalShellConnection:
+        busybox = Path(directory) / "busybox"
+        busybox.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+        busybox.chmod(0o755)
+        return LocalShellConnection(busybox)
+
+    def test_container_command_archives_with_busybox_as_root(self) -> None:
+        argv = shlex.split(
+            _download_archive_command(
+                "/logs/verifier", recursive=True, contents_only=False, container=True
+            )
+        )
+        self.assertEqual(argv[:7], _CONTAINER_EXEC_PREFIX)
+        self.assertEqual(argv[7:10], ["/busybox", "sh", "-c"])
+        self.assertEqual(argv[11:], ["sh", "/logs/verifier", "1", "0", "/busybox"])
+        # Nothing is staged on the guest: the only command is the archive.
+        self.assertNotIn("cp", argv)
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_container_download_of_many_files_is_one_stream_without_guest_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            remote = Path(directory) / "remote" / "verifier"
+            for index in range(3000):
+                path = remote / f"d{index % 30}" / f"f{index}.txt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(str(index), encoding="utf-8")
+            (remote / "d3" / "latest.txt").symlink_to("f3.txt")
+            (remote / "linked-dir").symlink_to("d5")
+            connection = self.local_connection(directory)
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            with mock.patch.object(
+                sandbox, "_run_guest_command", new=mock.AsyncMock()
+            ) as guest, mock.patch(
+                "thunder_sandbox.asynchronous.sandbox.asyncssh.scp", new=mock.AsyncMock()
+            ) as scp:
+                await sandbox.download(str(remote), destination, recursive=True)
+
+            guest.assert_not_awaited()
+            scp.assert_not_awaited()
+            self.assertEqual(len(connection.commands), 1)
+            self.assertEqual(connection.commands[0][:7], _CONTAINER_EXEC_PREFIX)
+            downloaded = destination / "verifier"
+            # Links arrive as the files they point at, as over SCP.
+            self.assertEqual(
+                [path for path in downloaded.rglob("*") if path.is_symlink()], []
+            )
+            self.assertEqual(
+                sum(1 for path in downloaded.rglob("*") if path.is_file()), 3101
+            )
+            self.assertEqual((downloaded / "d7/f2707.txt").read_text(), "2707")
+            self.assertEqual((downloaded / "d3/latest.txt").read_text(), "3")
+            self.assertEqual((downloaded / "linked-dir/f5.txt").read_text(), "5")
+            self.assertEqual(
+                [p.name for p in destination.iterdir()], ["verifier"]
+            )
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_guest_file_download_replaces_the_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=False)
+            remote = Path(directory) / "result.bin"
+            remote.write_bytes(b"\x00\xffcomplete" * 10000)
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "copy.bin"
+            destination.write_bytes(b"old")
+            await sandbox.download(str(remote), destination)
+            self.assertEqual(destination.read_bytes(), remote.read_bytes())
+            self.assertEqual(list(Path(directory).glob(".copy.bin.thunder-*")), [])
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_symlink_source_downloads_its_target_under_the_requested_name(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            remote = Path(directory) / "remote"
+            remote.mkdir()
+            (remote / "checkpoint-42.bin").write_bytes(b"weights")
+            (remote / "latest.bin").symlink_to("checkpoint-42.bin")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            await sandbox.download(str(remote / "latest.bin"), destination)
+            downloaded = destination / "latest.bin"
+            self.assertFalse(downloaded.is_symlink())
+            self.assertEqual(downloaded.read_bytes(), b"weights")
+            await client.close()
+
+    def test_relative_container_source_is_read_from_root_as_docker_cp_did(self) -> None:
+        argv = shlex.split(
+            _download_archive_command(
+                "logs/out.txt", recursive=False, contents_only=False, container=True
+            )
+        )
+        self.assertEqual(argv[12], "/logs/out.txt")
+        guest = shlex.split(
+            _download_archive_command(
+                "logs/out.txt", recursive=False, contents_only=False, container=False
+            )
+        )
+        # On the guest a relative path stays relative to the SSH user's home.
+        self.assertEqual(guest[4], "logs/out.txt")
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_directory_symlink_source_with_trailing_slash_is_followed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=False)
+            remote = Path(directory) / "remote"
+            (remote / "run-7").mkdir(parents=True)
+            (remote / "run-7" / "metrics.json").write_text("{}", encoding="utf-8")
+            (remote / "latest").symlink_to("run-7")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            await sandbox.download(f"{remote}/latest/", destination, recursive=True)
+            downloaded = destination / "latest"
+            self.assertFalse(downloaded.is_symlink())
+            self.assertEqual((downloaded / "metrics.json").read_text(), "{}")
+            await client.close()
+
+    async def test_local_staging_errors_fail_without_ssh_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            connection = FakeSSHConnection()
+            connection.create_process = mock.AsyncMock()  # type: ignore[attr-defined]
+            reconnect = mock.AsyncMock(return_value=FakeSSHConnection())
+            sandbox._ssh_manager = SSHConnectionManager(
+                reconnect,  # type: ignore[arg-type]
+                sleep=mock.AsyncMock(),
+                jitter=lambda _start, _end: 0.0,
+            )
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._remove_local_transfer_path",
+                side_effect=PermissionError("read-only destination"),
+            ):
+                with self.assertRaisesRegex(SandboxFailedError, "read-only destination"):
+                    await sandbox.download("/logs/out", Path(directory) / "out")
+            reconnect.assert_not_awaited()
+            connection.create_process.assert_not_awaited()
+            self.assertFalse(connection.closed)
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_contents_download_preserves_existing_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=False)
+            remote = Path(directory) / "remote"
+            remote.mkdir()
+            (remote / "new.txt").write_text("new", encoding="utf-8")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "results"
+            destination.mkdir()
+            (destination / "existing.txt").write_text("keep", encoding="utf-8")
+            await sandbox.download(f"{remote}/.", destination, recursive=True)
+            self.assertEqual((destination / "existing.txt").read_text(), "keep")
+            self.assertEqual((destination / "new.txt").read_text(), "new")
+            self.assertEqual(list(Path(directory).glob(".results.thunder-*")), [])
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_remote_errors_are_reported_and_leave_the_destination_alone(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            remote = Path(directory) / "remote"
+            remote.mkdir()
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.write_text("old", encoding="utf-8")
+            with self.assertRaisesRegex(SandboxFailedError, "No such file"):
+                await sandbox.download(str(remote / "missing"), destination)
+            with self.assertRaisesRegex(SandboxFailedError, "recursive=True"):
+                await sandbox.download(str(remote), destination)
+            self.assertEqual(destination.read_text(), "old")
+            self.assertEqual(
+                [p.name for p in Path(directory).iterdir() if p.name.startswith(".")], []
+            )
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_dangling_symlink_fails_the_download_as_over_scp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            remote = Path(directory) / "remote" / "out"
+            remote.mkdir(parents=True)
+            (remote / "ok.txt").write_text("ok", encoding="utf-8")
+            (remote / "gone").symlink_to("missing.txt")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            with self.assertRaisesRegex(SandboxFailedError, "gone"):
+                await sandbox.download(str(remote), destination, recursive=True)
+            self.assertEqual(list(destination.iterdir()), [])
+            await client.close()
+
+    async def test_download_restarts_after_a_lost_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            destination = Path(directory) / "result.bin"
+            destination.write_bytes(b"old-result")
+            archive = tar_bytes(("file", "result.bin", b"complete"))
+            first = FakeSSHConnection()
+            second = FakeSSHConnection()
+            observed: list[bytes] = []
+
+            def lose() -> ScriptedProcess:
+                observed.append(destination.read_bytes())
+                first.close()
+                return ScriptedProcess(
+                    [archive[:512], asyncssh.ConnectionLost("download lost")]
+                )
+
+            def finish() -> ScriptedProcess:
+                observed.append(destination.read_bytes())
+                return ScriptedProcess([archive])
+
+            first.create_process = mock.AsyncMock(side_effect=lambda *a, **k: lose())  # type: ignore[attr-defined]
+            second.create_process = mock.AsyncMock(side_effect=lambda *a, **k: finish())  # type: ignore[attr-defined]
+            sandbox._ssh_manager = SSHConnectionManager(
+                mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
+                sleep=mock.AsyncMock(),
+                jitter=lambda _start, _end: 0.0,
+            )
+            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            await sandbox.download("/workspace/result.bin", destination)
+            self.assertEqual(observed, [b"old-result", b"old-result"])
+            self.assertEqual(destination.read_bytes(), b"complete")
+            self.assertEqual(list(Path(directory).glob(".result.bin.thunder-*")), [])
+            await client.close()
+
+    async def test_a_bad_archive_stops_the_stream_instead_of_hanging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            connection = FakeSSHConnection()
+            # Far more garbage than the hand-off queue holds, then a stream
+            # that never ends: only stopping on the extractor's error finishes.
+            process = ScriptedProcess([b"\x01" * 65536] * 500, then_block=True)
+            connection.create_process = mock.AsyncMock(return_value=process)  # type: ignore[attr-defined]
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            destination = Path(directory) / "out"
+            with self.assertRaisesRegex(SandboxFailedError, "archive is invalid"):
+                await asyncio.wait_for(
+                    sandbox.download("/logs/out", destination), timeout=10
+                )
+            self.assertTrue(process.closed)
+            self.assertFalse(destination.exists())
+            await client.close()
+
+    async def test_nonzero_exit_reports_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            connection = FakeSSHConnection()
+            connection.create_process = mock.AsyncMock(  # type: ignore[attr-defined]
+                return_value=ScriptedProcess(
+                    [], exit_status=1, stderr=b"tar: out/x: Permission denied"
+                )
+            )
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            with self.assertRaisesRegex(
+                SandboxFailedError, "status 1: tar: out/x: Permission denied"
+            ):
+                await sandbox.download("/logs/out", Path(directory) / "out")
+            await client.close()
+
+    async def test_timeout_abandons_a_stalled_stream_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            connection = FakeSSHConnection()
+            process = ScriptedProcess([], then_block=True)
+            connection.create_process = mock.AsyncMock(return_value=process)  # type: ignore[attr-defined]
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            started = time.monotonic()
+            with self.assertRaises(SandboxTimeoutError):
+                await sandbox.download("/logs/out", Path(directory) / "out", timeout=0.2)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertTrue(process.closed)
+            self.assertEqual(
+                [p.name for p in Path(directory).iterdir() if p.name.startswith(".out")], []
+            )
+            await client.close()
 
 
 class SynchronousSandboxTest(unittest.TestCase):
