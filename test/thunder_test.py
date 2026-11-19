@@ -4737,6 +4737,7 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
             ("GET", "/sandboxes/sbx-1", [reset], 2, True),
             ("POST", "/sandboxes/ssh-certificate", [write_reset], 2, True),
             ("POST", "/sandboxes/start", [refused], 2, True),
+            ("PATCH", "/sandboxes/sbx-1/network-policy", [reset], 2, True),
             ("POST", "/sandboxes/start", [reset], 1, False),
             ("GET", "/sandboxes/sbx-1", [timed_out], 1, False),
             ("GET", "/sandboxes/sbx-1", [reset, reset, reset], 3, False),
