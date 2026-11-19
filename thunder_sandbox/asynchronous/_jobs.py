@@ -589,6 +589,12 @@ def _reconcile_restart(paths: RemoteJobPaths) -> str:
     its status would otherwise stay unfinished forever, and its recorded PID
     may now belong to an unrelated process. Jobs from before the boot record
     have no ``boot_id`` and are left as they are.
+
+    A submission retried after the restart may launch a job staged before it,
+    so a ``boot_id`` from another boot alone does not prove the job dead. Its
+    launcher holds the run lock for the job's whole life, and no lock outlives
+    a boot: the job is ended only while that lock is free, and the launcher,
+    which takes it before reading the status, then finds it finished.
     """
 
     unfinished = shlex.quote(
@@ -598,11 +604,16 @@ def _reconcile_restart(paths: RemoteJobPaths) -> str:
         JobStatus(JobState.FAILED, returncode=SANDBOX_RESTART_RETURNCODE).to_json()
     )
     boot_id = shlex.quote(str(paths.boot_id))
+    run_lock = shlex.quote(str(paths.run_lock))
     return f"""if [ -s {boot_id} ] && grep -Eq {unfinished} "$status" \
     && [ "$(cat -- {boot_id})" != "$(cat -- {_BOOT_ID} 2>/dev/null)" ]; then
-    temporary="$job/.status.restart.$$"
-    printf '%s' {failed} >"$temporary"
-    mv -f -- "$temporary" "$status"
+    exec 7>{run_lock}
+    if flock -n 7 && grep -Eq {unfinished} "$status"; then
+        temporary="$job/.status.restart.$$"
+        printf '%s' {failed} >"$temporary"
+        mv -f -- "$temporary" "$status"
+    fi
+    exec 7>&-
 fi
 """
 

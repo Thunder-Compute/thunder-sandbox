@@ -2843,9 +2843,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     command = create.await_args.args[0]
                     # Without a workdir it starts in the image's, as docker exec does.
                     self.assertTrue(command.startswith(
-                        'cd -- "$(cat /run/thunder_seed/vmroot/workdir'
+                        "__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
                     ))
-                    argv = shlex.split(command.split("; ", 1)[1])
+                    argv = shlex.split(command.split("; ", 2)[2])
                     self.assertEqual(argv[:2], ["sh", "-c"])
                     self.assertEqual(argv[3:], ["sh", "agent", "id"])
                 self.assertEqual(sandbox._image_path("out/x"), "/out/x")
@@ -2937,6 +2937,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         InvalidRequestError, "non-empty string"
                     ):
                         await sandbox.exec("id", user=user)
+                with self.subTest(sandbox="no image"), self.assertRaisesRegex(
+                    InvalidRequestError, "container or VM sandbox"
+                ):
+                    await sandbox.exec("id", user="nobody")
             finally:
                 await client.close()
 
