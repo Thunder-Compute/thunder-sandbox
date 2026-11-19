@@ -1310,9 +1310,10 @@ fi
             except ConflictError as exc:
                 if exc.code != "sandbox_update_conflict":
                     raise
-                # Another update is pending. Pace retries
-                # below the policy endpoint's rate limit; never replay a PATCH
-                # after an ambiguous transport failure.
+                # Another update is pending. Pace retries below the policy
+                # endpoint's rate limit. A transport failure is resent by
+                # Client._request: the API accepts an identical policy again
+                # without allocating another generation.
                 await _sleep_until_next_poll(None, 5.0, exc.retry_after)
         policy = response.get("network_policy")
         if not isinstance(policy, dict) or not policy.get("internet_access"):
