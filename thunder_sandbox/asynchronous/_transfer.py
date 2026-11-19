@@ -189,12 +189,13 @@ def extract_download_archive(
     """Extract a downloaded tar stream into the empty ``destination``.
 
     The archive comes from inside the sandbox, so it is untrusted. Every member
-    must stay inside ``destination``, never pass through or replace a link the
-    archive created, and appear only once. Symlinks are kept as links whatever
-    they point at: they are only created, never followed, here. Entries are
-    owned by the local user and readable by them, as an SCP download was.
-    With ``single_root`` every member must sit under one top-level name, which
-    is returned.
+    must stay inside ``destination`` and appear only once, and a hard link must
+    name a file earlier in the archive. The sender follows symlinks (tar -h),
+    so a symlink in the archive is refused: extracted here, its target would
+    name the caller's own files, which a later reader would then follow.
+    Entries are owned by the local user and readable by them, as an SCP
+    download was. With ``single_root`` every member must sit under one
+    top-level name, which is returned.
     """
 
     links: set[tuple[str, ...]] = set()
@@ -210,7 +211,11 @@ def extract_download_archive(
             if not parts:
                 # The "." entry of a contents archive is destination itself.
                 continue
-            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+            if member.issym():
+                raise SandboxFailedError(
+                    f"download archive contains a symlink: {member.name!r}"
+                )
+            if not (member.isfile() or member.isdir() or member.islnk()):
                 # Devices, FIFOs and sockets cannot be downloaded usefully.
                 continue
             if parts in seen:
@@ -233,7 +238,7 @@ def extract_download_archive(
             roots.add(parts[0])
             if single_root and len(roots) > 1:
                 raise SandboxFailedError("download archive has more than one top-level entry")
-            if member.issym() or member.islnk():
+            if member.islnk():
                 links.add(parts)
             elif member.isfile():
                 files.add(parts)
@@ -249,15 +254,12 @@ def extract_download_archive(
     try:
         with tarfile.open(fileobj=stream, mode="r|") as archive:
             if hasattr(tarfile, "tar_filter"):
-                # Python 3.14 defaults to the "data" filter, which refuses
-                # links to absolute paths such as a virtualenv's bin/python.
-                # The checks above replace it; "tar" still refuses anything
-                # resolving outside the destination.
+                # The checks above also cover Pythons without filters.
                 archive.extractall(
                     os.fspath(destination),
                     members=members(archive),
                     numeric_owner=True,
-                    filter="tar",
+                    filter="data",
                 )
             else:
                 archive.extractall(

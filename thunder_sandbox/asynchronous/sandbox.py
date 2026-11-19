@@ -901,7 +901,13 @@ class Sandbox:
                     _remove_local_transfer_path(extracted)
                     extracted.mkdir()
 
-                await asyncio.to_thread(reset)
+                try:
+                    await asyncio.to_thread(reset)
+                except OSError as exc:
+                    # A local disk error: final, not an SSH loss to retry.
+                    raise SandboxFailedError(
+                        f"could not prepare local staging for {name}: {exc}"
+                    ) from exc
                 return await _stream_download_archive(
                     connection,
                     command,
@@ -917,7 +923,6 @@ class Sandbox:
                 stage = extracted
                 publisher = _publish_local_contents
             else:
-                # A symlink source is archived under its target's name.
                 stage = extracted / cast(str, root)
                 publisher = _publish_local_transfer
             await asyncio.to_thread(publisher, stage, target)
@@ -1924,14 +1929,16 @@ async def _stop_sandbox(
 
 
 # Archives one download source to stdout. $1 is the source, $2 and $3 are 1
-# for a recursive and a contents-only download, and $4 prefixes each tool:
-# the container's BusyBox, or empty for the guest's own. A symlink source is
-# followed, as SCP did; links below it are archived as links. Only tar and
-# readlink run as tools, and both take "--" in BusyBox as in GNU.
+# for a recursive and a contents-only download, and $4 prefixes tar: the
+# container's BusyBox, or empty for the guest's own. tar -h follows every
+# symlink where it is archived, as SCP did, so the archive holds only files and
+# directories: a link never reaches the caller's machine, where its target
+# would name the caller's own files. A dangling link or a loop fails the
+# download, as it did over SCP.
 _DOWNLOAD_ARCHIVE_SCRIPT = """source=$1 recursive=$2 contents=$3 tool=$4
-if [ -L "$source" ]; then
-    source=$($tool readlink -f -- "$source") || exit 1
-fi
+while [ "$source" != / ] && [ "${source%/}" != "$source" ]; do
+    source=${source%/}
+done
 if [ ! -e "$source" ]; then
     echo "$1: No such file or directory" >&2
     exit 2
@@ -1946,17 +1953,14 @@ if [ "$contents" = 1 ]; then
         exit 2
     fi
     cd -- "$source" || exit 2
-    exec $tool tar -c -f - .
+    exec $tool tar -c -h -f - .
 fi
-while [ "$source" != / ] && [ "${source%/}" != "$source" ]; do
-    source=${source%/}
-done
 case $source in
 */*) parent=${source%/*} name=${source##*/} ;;
 *) parent=. name=$source ;;
 esac
 cd -- "${parent:-/}" || exit 2
-exec $tool tar -c -f - -- "$name"
+exec $tool tar -c -h -f - -- "$name"
 """
 _DOWNLOAD_CHUNK_BYTES = 1 << 16
 _DOWNLOAD_STDERR_LIMIT = 4096
@@ -1967,6 +1971,10 @@ def _download_archive_command(
 ) -> str:
     flags = ("1" if recursive else "0", "1" if contents_only else "0")
     if container:
+        # docker cp reads a relative container path from /, not the image's
+        # WORKDIR, and uploads still go through docker cp: keep them agreeing.
+        if not source.startswith("/"):
+            source = "/" + source
         # As root in the container, as docker cp was: a verifier's root-only
         # output must still download. BusyBox is bind-mounted into every
         # image, so the image needs no tar of its own.

@@ -3867,23 +3867,29 @@ class DownloadArchiveExtractionTest(unittest.TestCase):
             self.assertTrue(os.access(Path(directory) / "out", os.W_OK))
             self.assertEqual(target.stat().st_uid, os.getuid())
 
-    @unittest.skipUnless(os.name == "posix", "requires symlinks")
-    def test_symlinks_are_kept_as_links_even_to_absolute_paths(self) -> None:
-        # A copied virtualenv links bin/python to an absolute interpreter.
+    def test_hard_links_extract_and_symlinks_are_refused(self) -> None:
+        # The sender follows symlinks, so a link arriving here would point at
+        # the caller's own files, which oddish-style uploaders then read.
         with tempfile.TemporaryDirectory() as directory:
             extract(
                 tar_bytes(
                     ("dir", "app", None),
-                    ("symlink", "app/python", "/usr/bin/python3"),
                     ("file", "app/data", b"x"),
                     ("hardlink", "app/data-link", "app/data"),
                 ),
                 Path(directory),
             )
-            link = Path(directory) / "app/python"
-            self.assertTrue(link.is_symlink())
-            self.assertEqual(os.readlink(link), "/usr/bin/python3")
             self.assertEqual((Path(directory) / "app/data-link").read_bytes(), b"x")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(SandboxFailedError, "symlink"):
+                extract(
+                    tar_bytes(
+                        ("dir", "app", None),
+                        ("symlink", "app/creds", "/root/.thunder/credentials"),
+                    ),
+                    Path(directory),
+                )
+            self.assertFalse((Path(directory) / "app/creds").is_symlink())
 
     def test_contents_archive_skips_its_dot_entry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3969,7 +3975,8 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
                 path = remote / f"d{index % 30}" / f"f{index}.txt"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(str(index), encoding="utf-8")
-            (remote / "venv-python").symlink_to("/usr/bin/python3")
+            (remote / "d3" / "latest.txt").symlink_to("f3.txt")
+            (remote / "linked-dir").symlink_to("d5")
             connection = self.local_connection(directory)
             sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
             destination = Path(directory) / "local"
@@ -3986,12 +3993,16 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(connection.commands), 1)
             self.assertEqual(connection.commands[0][:7], _CONTAINER_EXEC_PREFIX)
             downloaded = destination / "verifier"
+            # Links arrive as the files they point at, as over SCP.
             self.assertEqual(
-                sum(1 for path in downloaded.rglob("*") if path.is_file() and not path.is_symlink()),
-                3000,
+                [path for path in downloaded.rglob("*") if path.is_symlink()], []
+            )
+            self.assertEqual(
+                sum(1 for path in downloaded.rglob("*") if path.is_file()), 3101
             )
             self.assertEqual((downloaded / "d7/f2707.txt").read_text(), "2707")
-            self.assertEqual(os.readlink(downloaded / "venv-python"), "/usr/bin/python3")
+            self.assertEqual((downloaded / "d3/latest.txt").read_text(), "3")
+            self.assertEqual((downloaded / "linked-dir/f5.txt").read_text(), "5")
             self.assertEqual(
                 [p.name for p in destination.iterdir()], ["verifier"]
             )
@@ -4030,6 +4041,63 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(downloaded.read_bytes(), b"weights")
             await client.close()
 
+    def test_relative_container_source_is_read_from_root_as_docker_cp_did(self) -> None:
+        argv = shlex.split(
+            _download_archive_command(
+                "logs/out.txt", recursive=False, contents_only=False, container=True
+            )
+        )
+        self.assertEqual(argv[12], "/logs/out.txt")
+        guest = shlex.split(
+            _download_archive_command(
+                "logs/out.txt", recursive=False, contents_only=False, container=False
+            )
+        )
+        # On the guest a relative path stays relative to the SSH user's home.
+        self.assertEqual(guest[4], "logs/out.txt")
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_directory_symlink_source_with_trailing_slash_is_followed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=False)
+            remote = Path(directory) / "remote"
+            (remote / "run-7").mkdir(parents=True)
+            (remote / "run-7" / "metrics.json").write_text("{}", encoding="utf-8")
+            (remote / "latest").symlink_to("run-7")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            await sandbox.download(f"{remote}/latest/", destination, recursive=True)
+            downloaded = destination / "latest"
+            self.assertFalse(downloaded.is_symlink())
+            self.assertEqual((downloaded / "metrics.json").read_text(), "{}")
+            await client.close()
+
+    async def test_local_staging_errors_fail_without_ssh_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            connection = FakeSSHConnection()
+            connection.create_process = mock.AsyncMock()  # type: ignore[attr-defined]
+            reconnect = mock.AsyncMock(return_value=FakeSSHConnection())
+            sandbox._ssh_manager = SSHConnectionManager(
+                reconnect,  # type: ignore[arg-type]
+                sleep=mock.AsyncMock(),
+                jitter=lambda _start, _end: 0.0,
+            )
+            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            with mock.patch(
+                "thunder_sandbox.asynchronous.sandbox._remove_local_transfer_path",
+                side_effect=PermissionError("read-only destination"),
+            ):
+                with self.assertRaisesRegex(SandboxFailedError, "read-only destination"):
+                    await sandbox.download("/logs/out", Path(directory) / "out")
+            reconnect.assert_not_awaited()
+            connection.create_process.assert_not_awaited()
+            self.assertFalse(connection.closed)
+            await client.close()
+
     @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
     async def test_contents_download_preserves_existing_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4066,6 +4134,22 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [p.name for p in Path(directory).iterdir() if p.name.startswith(".")], []
             )
+            await client.close()
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_dangling_symlink_fails_the_download_as_over_scp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox, client = self.sandbox(directory, image=True)
+            remote = Path(directory) / "remote" / "out"
+            remote.mkdir(parents=True)
+            (remote / "ok.txt").write_text("ok", encoding="utf-8")
+            (remote / "gone").symlink_to("missing.txt")
+            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            destination = Path(directory) / "local"
+            destination.mkdir()
+            with self.assertRaisesRegex(SandboxFailedError, "gone"):
+                await sandbox.download(str(remote), destination, recursive=True)
+            self.assertEqual(list(destination.iterdir()), [])
             await client.close()
 
     async def test_download_restarts_after_a_lost_connection(self) -> None:
