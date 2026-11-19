@@ -212,27 +212,36 @@ class Client:
     ) -> Any:
         """Send one API request and return its decoded JSON.
 
-        ``timeout`` bounds each attempt, in seconds, for calls the server
-        deliberately holds open longer than the session default allows.
+        ``timeout`` bounds the whole call, in seconds, retries included, for
+        calls the server deliberately holds open longer than the session
+        default allows. Callers size it to their own deadline.
 
         A request whose connection fails is sent again, up to
         ``len(CONNECTION_RETRY_DELAYS)`` times: always when the connection
         could not be opened, and after a reset only when the request is
-        idempotent (see :func:`_idempotent`).
+        idempotent (see :func:`_idempotent`). A retry gets only the time
+        left of ``timeout`` and is not sent once none is left.
         """
         idempotent = _idempotent(method, path)
+        expires_at = None if timeout is None else time.monotonic() + timeout
+        attempt_timeout = timeout
         for delay in (*CONNECTION_RETRY_DELAYS, None):
             try:
-                payload = await self._send(method, path, body, query, timeout)
+                payload = await self._send(method, path, body, query, attempt_timeout)
                 break
             except ThunderError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                failure = ConnectionError(
+                    f"could not communicate with Thunder: {_describe(exc)}"
+                )
                 if delay is None or not _resendable(exc, idempotent):
-                    raise ConnectionError(
-                        f"could not communicate with Thunder: {_describe(exc)}"
-                    ) from exc
+                    raise failure from exc
                 await asyncio.sleep(delay)
+                if expires_at is not None:
+                    attempt_timeout = expires_at - time.monotonic()
+                    if attempt_timeout <= 0:
+                        raise failure from exc
 
         if not payload:
             return {}

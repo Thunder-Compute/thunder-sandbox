@@ -4775,6 +4775,38 @@ class AsyncClientTest(unittest.IsolatedAsyncioTestCase):
                         await client.close()
                     self.assertEqual(len(sent), sends)
 
+    async def test_connection_retries_stay_within_the_request_timeout(self) -> None:
+        # A held-open wait reset late in its window must not start another
+        # full window: retries share the caller's timeout instead.
+        now = [100.0]
+        clock = mock.Mock(monotonic=lambda: now[0])
+        timeouts: list[float] = []
+
+        def request(method: str, url: str, **kwargs: object) -> None:
+            timeouts.append(kwargs["timeout"].total)  # type: ignore[attr-defined]
+            now[0] += 40.0 if len(timeouts) == 1 else 6.0
+            raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            session = mock.Mock()
+            session.request = request
+            client._get_session = lambda: session  # type: ignore[method-assign]
+            try:
+                with (
+                    mock.patch("thunder_sandbox.asynchronous.client.time", clock),
+                    mock.patch(
+                        "thunder_sandbox.asynchronous.client.CONNECTION_RETRY_DELAYS",
+                        (0, 0),
+                    ),
+                    self.assertRaisesRegex(ConnectionError, "ClientOSError"),
+                ):
+                    await client._request("GET", "/sandboxes/sbx-1/wait", timeout=45)
+            finally:
+                await client.close()
+        # The retry gets the 5s left; the third attempt is never sent.
+        self.assertEqual(timeouts, [45, 5])
+
     def test_closed_wait_window_maps_to_its_own_error(self) -> None:
         error = _api_error(
             408, "sandbox_wait_timeout", "still starting", {"Retry-After": "0"}
