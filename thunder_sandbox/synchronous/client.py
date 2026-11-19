@@ -67,6 +67,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        vm: bool | Mapping[str, object] = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -87,6 +88,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            vm=vm,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
@@ -111,13 +113,14 @@ class Client:
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
         workspace: str | None = None,
+        vm: bool = False,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return self._bridge.run(
             self._client.resolve_image(
                 image, timeout=timeout, gated_features=gated_features, spec=spec,
-                queue=queue, workspace=workspace,
+                queue=queue, workspace=workspace, vm=vm,
             )
         )
 
@@ -130,13 +133,14 @@ class Client:
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
         workspace: str | None = None,
+        vm: bool = False,
     ) -> "ResolvedImage":
         if self._closed:
             raise ConnectionError("client is closed")
         return await self._bridge.run_async(
             self._client.resolve_image(
                 image, timeout=timeout, gated_features=gated_features, spec=spec,
-                queue=queue, workspace=workspace,
+                queue=queue, workspace=workspace, vm=vm,
             )
         )
 
@@ -154,6 +158,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        vm: bool | Mapping[str, object] = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -174,6 +179,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            vm=vm,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,

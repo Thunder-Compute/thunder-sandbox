@@ -201,3 +201,5 @@ class SandboxInfo:
     workspace_id: str = MAIN_WORKSPACE_ID
     stopped_at: datetime | None = None
     ready_at: datetime | None = None
+    # True for a sandbox that boots its image as the whole VM, with no container.
+    vm: bool = False

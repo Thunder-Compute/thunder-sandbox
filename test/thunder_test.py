@@ -75,6 +75,7 @@ from thunder_sandbox.asynchronous.sandbox import (
     _container_remote_command,
     _container_job_prepare_script,
     _pinned_host_key,
+    _remote_command,
 )
 from thunder_sandbox.image import Image, ResolvedImage, _create_canonical_build_context
 from thunder_sandbox.synchronous._bridge import AsyncBridge
@@ -1424,20 +1425,21 @@ class SynchronousClientTest(unittest.TestCase):
                 )
                 client._client.resolve_image.assert_awaited_once_with(
                     image, timeout=42, gated_features=features, spec=None, queue=True,
-                    workspace="research",
+                    workspace="research", vm=False,
                 )
                 client._client.resolve_image.reset_mock()
                 self.assertEqual(
                     asyncio.run(
                         client.resolve_image_async(
-                            image, timeout=42, gated_features=features, queue=True
+                            image, timeout=42, gated_features=features, queue=True,
+                            vm=True,
                         )
                     ),
                     expected,
                 )
                 client._client.resolve_image.assert_awaited_once_with(
                     image, timeout=42, gated_features=features, spec=None, queue=True,
-                    workspace=None,
+                    workspace=None, vm=True,
                 )
             finally:
                 client.close()
@@ -1605,6 +1607,50 @@ class AsyncImageTest(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await client.close()
+
+    async def test_vm_image_is_requested_natively_or_through_the_gated_feature(self) -> None:
+        # The vm argument has its own field. gated_features={"vm": ...} is the
+        # build's mode, and the build's other gated features are kept.
+        for kwargs, fields in (
+            ({"vm": True}, {"vm": True}),
+            ({"gated_features": {"vm": {}}}, {"mode": "vm"}),
+            ({"gated_features": {"vm": {}, "image_feature": True}}, {"mode": "vm", "gatedFeatures": {"image_feature": True}}),
+        ):
+            with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client._request = mock.AsyncMock(return_value={
+                    "id": "image-id", "state": "READY",
+                    "managed_reference": "managed.example/image@sha256:digest",
+                    "managed_digest": "sha256:digest",
+                })
+                try:
+                    await client.resolve_image(Image.from_registry("fedora:41"), **kwargs)
+                    body = client._request.await_args.kwargs["body"]
+                    self.assertEqual(
+                        {key: body[key] for key in ("vm", "mode", "gatedFeatures") if key in body},
+                        fields,
+                    )
+                finally:
+                    await client.close()
+        # Where VM sandboxes are unavailable Thunder builds the container image.
+        for mode in ("vm", None):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client._request = mock.AsyncMock(
+                    return_value={
+                        "id": "image-id",
+                        "state": "READY",
+                        "managed_reference": "managed.example/image@sha256:digest",
+                        "managed_digest": "sha256:digest",
+                        **({"mode": mode} if mode else {}),
+                    }
+                )
+                try:
+                    image = Image.from_registry("fedora:41")
+                    resolved = await client.resolve_image(image, vm=True)
+                    self.assertEqual(resolved.vm, mode == "vm")
+                finally:
+                    await client.close()
 
     async def test_dockerfile_image_is_archived_uploaded_and_polled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1810,7 +1856,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         )
                         client.resolve_image.assert_awaited_once_with(
                             image, gated_features=None, spec=spec, queue=True,
-                            workspace="main",
+                            workspace="main", vm=False,
                         )
                         body = client._request.await_args_list[0].args[2]
                         self.assertIs(body["queue"], True)
@@ -1824,6 +1870,71 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(sandbox.queued)
                     finally:
                         await client.close()
+
+    async def test_create_with_vm_builds_a_vm_image_and_starts_it_as_a_vm(self) -> None:
+        vm_config = {"imageCommand": {"cmd": []}}
+        # Where VM sandboxes are unavailable Thunder ignores vm and starts a
+        # container sandbox, which the SDK then drives through the container.
+        for vm, granted, sent in (
+            (False, False, None),
+            (True, True, {}),
+            (vm_config, True, vm_config),
+            (True, False, {}),
+        ):
+            with self.subTest(vm=vm, granted=granted), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                    "image-id", "registry.example/image@sha256:digest", "sha256:digest",
+                    vm=granted,
+                ))
+                client._request = mock.AsyncMock(side_effect=[
+                    {"id": "sbx-test"},
+                    {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": granted},
+                ])
+                try:
+                    sandbox = await client.create_sandbox(
+                        image=Image.from_registry("fedora:41"),
+                        vm=vm,
+                        gated_features={"image_feature": True},
+                    )
+                    kwargs = client.resolve_image.await_args.kwargs
+                    self.assertEqual(kwargs["gated_features"], {"image_feature": True})
+                    self.assertIs(kwargs["vm"], sent is not None)
+                    body = client._request.await_args_list[0].args[2]
+                    self.assertEqual(body.get("vm"), sent)
+                    self.assertEqual(body["gatedFeatures"], {"image_feature": True})
+                    self.assertEqual(sandbox.vm, granted)
+                    self.assertEqual(sandbox._has_container, not granted)
+                finally:
+                    await client.close()
+
+    async def test_create_with_the_gated_vm_feature_is_unchanged(self) -> None:
+        gated = {"vm": {"imageCommand": {"cmd": []}}, "image_feature": True}
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                "image-id", "registry.example/image@sha256:digest", "sha256:digest", vm=True,
+            ))
+            client._request = mock.AsyncMock(side_effect=[
+                {"id": "sbx-test"},
+                {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": True},
+            ])
+            try:
+                sandbox = await client.create_sandbox(
+                    image=Image.from_registry("fedora:41"), gated_features=gated
+                )
+                kwargs = client.resolve_image.await_args.kwargs
+                self.assertEqual((kwargs["gated_features"], kwargs["vm"]), (gated, False))
+                body = client._request.await_args_list[0].args[2]
+                self.assertEqual(body["gatedFeatures"], gated)
+                self.assertNotIn("vm", body)
+                self.assertTrue(sandbox.vm)
+            finally:
+                await client.close()
+
+    async def test_create_rejects_a_vm_that_is_neither_a_boolean_nor_a_mapping(self) -> None:
+        with self.assertRaisesRegex(InvalidRequestError, "vm must be"):
+            await AsyncSandbox.create(vm="yes", client=mock.Mock())  # type: ignore[arg-type]
 
     def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
         client = AsyncClient(config(directory))
@@ -1928,8 +2039,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 spec=None,
                 queue=False,
                 workspace=None,
+                vm=False,
             ) -> ResolvedImage:
                 self.assertIs(candidate, image)
+                self.assertFalse(vm)
                 self.assertEqual(timeout, 7200)
                 self.assertEqual(workspace, "ws-a1")
                 self.assertEqual(gated_features, {"image_feature": True})
@@ -2691,6 +2804,64 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("python train.py", submitted)
             await client.close()
 
+    async def test_vm_sandbox_runs_commands_on_the_vm_without_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client,
+                {
+                    **SANDBOX_RESPONSE,
+                    "image_id": "a" * 64,
+                    "vm": True,
+                    "ssh": {**SANDBOX_RESPONSE["ssh"], "user": "root"},
+                },
+            )
+            result = mock.Mock(
+                returncode=0,
+                stdout=JobStatus(JobState.STARTING, pid=987).to_json(),
+                stderr="",
+            )
+            connection = mock.Mock(run=mock.AsyncMock(return_value=result))
+            connection.is_closed.return_value = False
+            sandbox._ssh_manager._connection = connection
+            try:
+                process = await sandbox.exec(
+                    "python", "train.py", workdir="/workspace", user="1000:1000"
+                )
+                self.assertTrue(process.is_durable)
+                submitted = connection.run.await_args.kwargs["input"]
+                self.assertNotIn("docker", submitted)
+                self.assertNotIn("sudo", submitted)
+                self.assertIn('"container":null', submitted)
+                self.assertIn("/var/tmp/thunder-sandbox/jobs/", submitted)
+                self.assertIn("exec setpriv", submitted)
+                self.assertNotIn("/run/thunder_seed/vmroot/workdir", submitted)
+                with mock.patch.object(
+                    sandbox, "_create_process", new_callable=mock.AsyncMock
+                ) as create:
+                    await sandbox.exec("id", user="agent", pty=True)
+                    command = create.await_args.args[0]
+                    # Without a workdir it starts in the image's, as docker exec does.
+                    self.assertTrue(command.startswith(
+                        'cd -- "$(cat /run/thunder_seed/vmroot/workdir'
+                    ))
+                    argv = shlex.split(command.split("; ", 1)[1])
+                    self.assertEqual(argv[:2], ["sh", "-c"])
+                    self.assertEqual(argv[3:], ["sh", "agent", "id"])
+                self.assertEqual(sandbox._image_path("out/x"), "/out/x")
+                self.assertEqual(sandbox._image_path("/abs"), "/abs")
+            finally:
+                await client.close()
+
+    def test_direct_command_passes_env_options_before_assignments(self) -> None:
+        command = _remote_command(
+            ["sh", "-c", "true"], workdir=None, env={"SET": "a b", "GONE": None}
+        )
+        self.assertEqual(
+            shlex.split(command),
+            ["env", "-u", "GONE", "SET=a b", "sh", "-c", "true"],
+        )
+
     async def test_detached_launch_reconciles_a_lost_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
@@ -2761,14 +2932,6 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             try:
-                for pty in (False, True):
-                    with self.subTest(pty=pty), self.assertRaisesRegex(
-                        InvalidRequestError, "image-backed"
-                    ):
-                        await sandbox.exec("id", user="root", pty=pty)
-                sandbox = AsyncSandbox._from_response(
-                    client, {**SANDBOX_RESPONSE, "image_id": "a" * 64}
-                )
                 for user in ("", "root\x00bad", 0):
                     with self.subTest(user=user), self.assertRaisesRegex(
                         InvalidRequestError, "non-empty string"
