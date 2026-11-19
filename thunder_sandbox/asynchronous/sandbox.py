@@ -57,6 +57,7 @@ from ._jobs import (
     container_job_directory,
     new_job_id,
     signal_command,
+    status_command,
     submission_command,
     validate_job_id,
 )
@@ -120,6 +121,7 @@ class Sandbox:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: Image | None = None,
+        vm: bool | Mapping[str, object] = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -146,6 +148,16 @@ class Sandbox:
         ``workspace`` is a workspace name or ID. Without one, ``TNR_WORKSPACE``
         applies, and then main. The image is built or imported in that
         workspace too, and listed there.
+
+        ``vm=True`` asks for a VM sandbox: the image, built for it with
+        ``resolve_image(vm=True)``, boots as the whole VM with its own systemd,
+        and commands and transfers reach it over SSH as root with no container
+        in between. Without ``image`` it boots Thunder's default VM image.
+        ``vm={"imageCommand": {...}}`` also overrides the image's
+        ``entrypoint``, ``cmd`` and ``workdir`` and sets a ``restart`` policy.
+        Where Thunder does not offer VM sandboxes the request starts the
+        sandbox it would start without ``vm``; ``Sandbox.vm`` says which kind
+        started.
         """
         _validate_create_options(
             timeout=timeout,
@@ -157,6 +169,11 @@ class Sandbox:
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
         )
+        if not isinstance(vm, (bool, Mapping)):
+            raise InvalidRequestError("vm must be a boolean or a mapping")
+        # vm is the sandbox start's own field. gated_features={"vm": ...}
+        # asks for the same through the gated feature.
+        vm_config = dict(vm) if isinstance(vm, Mapping) else {} if vm else None
         owns_client = client is None
         resolved_client = client or Client.from_cli()
         try:
@@ -173,8 +190,9 @@ class Sandbox:
             }
             resolved_image = (
                 await resolved_client.resolve_image(
-                    image, gated_features=gated_features, spec=resource_spec,
-                    queue=queue, workspace=workspace_id,
+                    image, gated_features=gated_features,
+                    spec=resource_spec, queue=queue, workspace=workspace_id,
+                    vm=vm_config is not None,
                 )
                 if image is not None
                 else None
@@ -207,6 +225,7 @@ class Sandbox:
                     "cidr_allowlist": cidrs,
                     "domain_allowlist": domains,
                 },
+                **({"vm": vm_config} if vm_config is not None else {}),
                 **(
                     {"gatedFeatures": dict(gated_features)}
                     if gated_features is not None
@@ -326,6 +345,52 @@ class Sandbox:
         return self._info.image_id
 
     @property
+    def vm(self) -> bool:
+        """Whether the sandbox boots its image as the whole VM.
+
+        A VM sandbox has no container: commands and transfers run directly on
+        the VM over SSH. A sandbox without an image has none either.
+        """
+        return self._info.vm
+
+    @property
+    def _has_container(self) -> bool:
+        return self._info.image_id is not None and not self._info.vm
+
+    def _direct_command(
+        self,
+        args: Sequence[str],
+        *,
+        workdir: str | None,
+        env: Mapping[str, str | None] | None,
+        user: str | None,
+    ) -> str:
+        """Build a command which runs on the VM itself, as the SSH user or ``user``.
+
+        In a VM sandbox a command starts in the image's working directory, as
+        ``docker exec`` starts one in a container sandbox.
+        """
+
+        ssh = self._info.ssh
+        command = _remote_command(
+            args,
+            workdir=workdir,
+            env=env,
+            user=user,
+            privileged=ssh is None or ssh.user == "root",
+        )
+        if self._info.vm and workdir is None:
+            command = _VM_IMAGE_WORKDIR + command
+        return command
+
+    def _image_path(self, path: str) -> str:
+        """Resolve a VM sandbox's relative transfer path from /, as docker cp does."""
+
+        if self._info.vm and path and not path.startswith("/"):
+            return "/" + path
+        return path
+
+    @property
     def workspace_id(self) -> str:
         return self._info.workspace_id
 
@@ -408,13 +473,12 @@ class Sandbox:
         stderr: OutputMode = "capture",
         retain: bool = False,
     ) -> Process[str] | Process[bytes]:
-        if user is not None:
-            if not isinstance(user, str) or not user or "\x00" in user:
-                raise InvalidRequestError(
-                    "user must be a non-empty string without NUL bytes"
-                )
-            if self.image_id is None:
-                raise InvalidRequestError("user requires an image-backed sandbox")
+        if user is not None and (
+            not isinstance(user, str) or not user or "\x00" in user
+        ):
+            raise InvalidRequestError(
+                "user must be a non-empty string without NUL bytes"
+            )
         if not args:
             raise InvalidRequestError("exec requires a command")
         for text_value in (*args, *(f"{k}={v}" for k, v in (env or {}).items())):
@@ -449,8 +513,8 @@ class Sandbox:
             _container_remote_command(
                 args, workdir=workdir, env=env, pty=pty, user=user
             )
-            if self.image_id is not None
-            else _remote_command(args, workdir=workdir, env=env)
+            if self._has_container
+            else self._direct_command(args, workdir=workdir, env=env, user=user)
         )
         return await self._create_process(
             command, timeout=timeout, text=text, pty=pty
@@ -533,7 +597,7 @@ class Sandbox:
             workdir=workdir,
             user=user,
             env=env,
-            container=_CONTAINER_NAME if self.image_id is not None else None,
+            container=_CONTAINER_NAME if self._has_container else None,
             stdout=stdout,
             stderr=stderr,
             retain=retain,
@@ -542,8 +606,8 @@ class Sandbox:
             _container_remote_command(
                 args, workdir=workdir, env=env, pty=False, job_id=job_id, user=user
             )
-            if self.image_id is not None
-            else _remote_command(args, workdir=workdir, env=env)
+            if self._has_container
+            else self._direct_command(args, workdir=workdir, env=env, user=user)
         )
 
         async def submit(
@@ -634,8 +698,7 @@ class Sandbox:
     async def _read_job_status(
         self, job_id: str, *, deadline: float | None
     ) -> JobStatus:
-        paths = RemoteJobPaths(job_id)
-        command = f"cat -- {shlex.quote(str(paths.status))}"
+        command = status_command(RemoteJobPaths(job_id))
 
         result = await self._run_idempotent_command(
             command,
@@ -810,9 +873,10 @@ class Sandbox:
             raise InvalidRequestError(f"upload source does not exist: {source}")
         if source_path.is_dir() and not recursive:
             raise InvalidRequestError("uploading a directory requires recursive=True")
-        if self.image_id is not None:
+        if self._has_container:
             await self._upload_to_container(local_path, remote_path, recursive=recursive)
             return
+        remote_path = self._image_path(remote_path)
         if parsed_source.contents_only:
             await self._upload_guest_contents(source_path, remote_path)
             return
@@ -863,14 +927,15 @@ class Sandbox:
         SCP acknowledges every file and directory record before the next one
         is sent, so a tree of many small files costs several round trips per
         file. A tar stream costs one session whatever the file count. In an
-        image-backed sandbox the archive is written by the container's BusyBox
+        container sandbox the archive is written by the container's BusyBox
         straight into the SSH channel, so nothing is staged on the guest disk
-        either, which a nearly full sandbox may not have room for.
+        either, which a nearly full sandbox may not have room for. In a VM
+        sandbox, or one without an image, the VM's own tar writes it.
         """
 
         if not remote_path or "\x00" in remote_path:
             raise InvalidRequestError("download source must be a non-empty remote path")
-        parsed_source = _parse_transfer_path(remote_path, separator="/")
+        parsed_source = _parse_transfer_path(self._image_path(remote_path), separator="/")
         contents_only = parsed_source.contents_only
         source_name = parsed_source.name
         if not source_name:
@@ -892,7 +957,7 @@ class Sandbox:
             parsed_source.path,
             recursive=recursive,
             contents_only=contents_only,
-            container=self.image_id is not None,
+            container=self._has_container,
         )
         name = f"download {remote_path} from sandbox {self.id}"
         try:
@@ -1268,7 +1333,7 @@ fi
             )
         else:
             await self._wait_for_network_policy(accepted_policy, generation)
-        if self.image_id is not None:
+        if self._has_container:
             for args in (
                 ("resolvectl", "flush-caches"),
                 ("sudo", "--non-interactive", "resolvectl", "flush-caches"),
@@ -1751,6 +1816,7 @@ def _info_from_response(paths: ThunderPaths, response: dict[str, object]) -> San
         image_id=str(response["image_id"]) if response.get("image_id") else None,
         stopped_at=_datetime(response.get("stopped_at"), optional=True),
         ready_at=_datetime(response.get("ready_at"), optional=True),
+        vm=response.get("vm") is True,
     )
 
 
@@ -2117,19 +2183,93 @@ def _remote_command(
     *,
     workdir: str | None,
     env: Mapping[str, str | None] | None,
+    user: str | None = None,
+    privileged: bool = True,
 ) -> str:
     parts: list[str] = []
     if workdir is not None:
         parts.extend(("cd", shlex.quote(workdir), "&&"))
+    if user is not None:
+        if not privileged:
+            # sudo keeps the session's environment with -E, except PATH,
+            # which its secure_path replaces; pass that explicitly.
+            parts.extend(("sudo", "--non-interactive", "--preserve-env", "env", '"PATH=$PATH"'))
+        parts.extend(("sh", "-c", shlex.quote(_SWITCH_USER_SCRIPT), "sh", shlex.quote(user)))
     if env:
+        # env takes its options before any assignment: after one, "-u" would
+        # be the command to run.
         parts.append("env")
         for key, value in env.items():
             if value is None:
                 parts.extend(("-u", shlex.quote(key)))
-            else:
+        for key, value in env.items():
+            if value is not None:
                 parts.append(f"{shlex.quote(key)}={shlex.quote(value)}")
     parts.extend(shlex.quote(arg) for arg in args)
     return " ".join(parts)
+
+
+# Enters a VM sandbox's image working directory, or / when the sandbox names
+# none or the directory no longer exists.
+_VM_IMAGE_WORKDIR = (
+    'cd -- "$(cat /run/thunder_seed/vmroot/workdir 2>/dev/null || echo /)" '
+    "2>/dev/null || cd /; "
+)
+
+
+# Runs "$@" as $1, which is a user or UID with an optional ":group" or ":GID",
+# as ``docker exec --user`` takes it: a named user gets its primary group, its
+# supplementary groups and its home; an explicit group replaces the
+# supplementary groups; a UID without an account gets group 0 and HOME=/, as in
+# Docker, and an unknown user or group fails with status 1 and Docker's
+# message. setpriv execs in place, so the command keeps the caller's process
+# group and its exit status, and environment apart from HOME, USER and LOGNAME.
+_SWITCH_USER_SCRIPT = """set -e
+__thunder_spec=$1
+shift
+__thunder_user=${__thunder_spec%%:*}
+__thunder_group=
+case $__thunder_spec in
+*:*) __thunder_group=${__thunder_spec#*:} ;;
+esac
+if [ -z "$__thunder_user" ]; then
+    echo "invalid user: $__thunder_spec" >&2
+    exit 1
+fi
+if __thunder_entry=$(getent passwd "$__thunder_user"); then
+    IFS=: read -r __thunder_name _ __thunder_uid __thunder_gid _ __thunder_home _ <<__thunder_eof
+$__thunder_entry
+__thunder_eof
+    __thunder_groups=--init-groups
+else
+    case $__thunder_user in
+    *[!0-9]*)
+        echo "unable to find user $__thunder_user: no matching entries in passwd file" >&2
+        exit 1
+        ;;
+    esac
+    __thunder_name=$__thunder_user __thunder_uid=$__thunder_user __thunder_gid=0 __thunder_home=/
+    __thunder_groups=--clear-groups
+fi
+if [ -n "$__thunder_group" ]; then
+    if __thunder_entry=$(getent group "$__thunder_group"); then
+        IFS=: read -r _ _ __thunder_gid _ <<__thunder_eof
+$__thunder_entry
+__thunder_eof
+    else
+        case $__thunder_group in
+        ''|*[!0-9]*)
+            echo "unable to find group $__thunder_group: no matching entries in group file" >&2
+            exit 1
+            ;;
+        esac
+        __thunder_gid=$__thunder_group
+    fi
+    __thunder_groups=--clear-groups
+fi
+exec setpriv --reuid="$__thunder_uid" --regid="$__thunder_gid" "$__thunder_groups" -- \
+    env HOME="$__thunder_home" USER="$__thunder_name" LOGNAME="$__thunder_name" "$@"
+"""
 
 
 # Names the wrapper sets in the shell that execs the payload. Anything it sets

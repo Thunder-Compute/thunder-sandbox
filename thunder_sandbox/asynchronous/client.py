@@ -298,6 +298,7 @@ class Client:
         spec: Mapping[str, object] | None = None,
         queue: bool = False,
         workspace: str | None = None,
+        vm: bool = False,
     ) -> "ResolvedImage":
         """Build or import an image and wait until its managed image is ready.
 
@@ -312,6 +313,14 @@ class Client:
         once, so a Dockerfile or registry digest already built in another
         workspace returns the same image, ready at once. An API from before
         workspaces ignores the selector and lists images organization-wide.
+
+        ``vm=True`` asks for the image built to boot as the whole VM, with the
+        image's own systemd as PID 1, for a sandbox created with ``vm``. It is a
+        separate image from the same source's container image, and only images
+        of a supported distribution (Debian, Ubuntu, Fedora, CentOS Stream,
+        Rocky Linux, AlmaLinux, Arch Linux or openSUSE) can be built this way.
+        Where Thunder does not offer VM sandboxes it builds the container
+        image instead, and the result's ``vm`` is false.
         """
         from ..image import Image, _create_canonical_build_context
 
@@ -319,11 +328,26 @@ class Client:
             raise InvalidRequestError("image must be created with Image.from_*()")
         if not isinstance(queue, bool):
             raise InvalidRequestError("queue must be a boolean")
+        if not isinstance(vm, bool):
+            raise InvalidRequestError("vm must be a boolean")
         if timeout is not None and timeout <= 0:
             raise InvalidRequestError("image timeout must be positive or None")
         workspace_id = await self._resolve_workspace(workspace)
         scope = {} if workspace_id == MAIN_WORKSPACE_ID else {"workspace_id": workspace_id}
         deadline = None if timeout is None else time.monotonic() + timeout
+        # gatedFeatures.vm starts a sandbox from an image built in the VM mode:
+        # the build takes it as its mode, not as a build feature. The vm
+        # argument asks for the same image through its own field.
+        build_features = None if gated_features is None else dict(gated_features)
+        gated_vm = build_features is not None and "vm" in build_features
+        if build_features is not None:
+            build_features.pop("vm", None)
+        mode_fields: dict[str, object] = {
+            **({"mode": "vm"} if gated_vm else {}),
+            **({"vm": True} if vm else {}),
+        }
+        if build_features is not None and (build_features or not gated_vm):
+            mode_fields["gatedFeatures"] = build_features
 
         context = None
         try:
@@ -336,8 +360,7 @@ class Client:
                 }
                 if image._display_name is not None:
                     request_body["display_name"] = image._display_name
-                if gated_features is not None:
-                    request_body["gatedFeatures"] = dict(gated_features)
+                request_body.update(mode_fields)
                 if queue:
                     request_body["queue"] = True
                 if spec is not None:
@@ -377,8 +400,7 @@ class Client:
                     request_body["registry_host"] = image._registry_host
                     request_body["registry_username"] = image._registry_username
                     request_body["registry_password"] = image._registry_password
-                if gated_features is not None:
-                    request_body["gatedFeatures"] = dict(gated_features)
+                request_body.update(mode_fields)
                 if queue:
                     request_body["queue"] = True
                 if spec is not None:
@@ -400,9 +422,10 @@ class Client:
                         deadline=deadline,
                     )
                 del upload_key
-            return await self._wait_for_image(
+            resolved = await self._wait_for_image(
                 response, deadline=deadline, workspace_id=workspace_id
             )
+            return resolved
         finally:
             if context is not None:
                 await asyncio.to_thread(context.close)
@@ -592,6 +615,7 @@ class Client:
                     reference,
                     digest,
                     str(response.get("workspace_id") or workspace_id),
+                    vm=response.get("mode") == "vm",
                 )
             if state == "FAILED":
                 code = response.get("failure_code")
@@ -627,6 +651,7 @@ class Client:
         gpu_type: GPUType | None = None,
         gpu_count: int | None = None,
         image: "Image | None" = None,
+        vm: bool | Mapping[str, object] = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -647,6 +672,7 @@ class Client:
             gpu_type=gpu_type,
             gpu_count=gpu_count,
             image=image,
+            vm=vm,
             block_network=block_network,
             outbound_cidr_allowlist=outbound_cidr_allowlist,
             outbound_domain_allowlist=outbound_domain_allowlist,
