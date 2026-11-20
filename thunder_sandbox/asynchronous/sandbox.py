@@ -952,7 +952,9 @@ class Sandbox:
         try:
             async def transfer(connection: asyncssh.SSHClientConnection) -> None:
                 await self._reset_remote_transfer_path(connection, stage)
-                await asyncssh.scp(source, (connection, stage), recurse=recursive)
+                await asyncssh.scp(
+                    source, (connection, stage), recurse=recursive, preserve=True
+                )
 
             await self._retry_scp(
                 transfer,
@@ -1171,7 +1173,7 @@ class Sandbox:
             await self._reset_remote_transfer_path(connection, stage, directory=True)
             for child in source_directory.iterdir():
                 await asyncssh.scp(
-                    os.fspath(child), (connection, stage + "/"), recurse=True
+                    os.fspath(child), (connection, stage + "/"), recurse=True, preserve=True
                 )
 
         await self._retry_scp(transfer, name=name)
@@ -1282,6 +1284,7 @@ fi
                         raw_source,
                         (connection, stage + "/"),
                         recurse=recursive,
+                        preserve=True,
                     )
 
                 await self._retry_scp(
