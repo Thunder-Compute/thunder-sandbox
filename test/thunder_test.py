@@ -2571,7 +2571,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(value, b"resumed")
             for connection in (first, second):
                 command = connection.run.await_args.args[0]  # type: ignore[attr-defined]
-                self.assertIn("skip=8192 count=65536", command)
+                self.assertIn(f"skip=8192 count={OUTPUT_READ_BYTES}", command)
             await client.close()
 
     async def test_output_read_reports_a_missing_file(self) -> None:
