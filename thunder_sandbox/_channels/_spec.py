@@ -78,7 +78,10 @@ class Identity:
     ``user`` and ``group`` are each a name or a numeric ID. A named user gets
     its primary group and supplementary groups from the sandbox's
     ``/etc/passwd`` and ``/etc/group``; a ``group`` replaces the primary group
-    and clears the supplementary ones. Unset means root (uid 0, gid 0).
+    and clears the supplementary ones. Unset means root (uid 0, gid 0). A
+    string is looked up as a name first and, failing that, taken as a numeric
+    ID if it is all digits, as Docker does: ``"1000"`` is uid 1000 unless an
+    account is named ``1000``.
 
     Privilege follows the uid alone. Root has every capability, in a container
     sandbox as in a VM sandbox. Another user has none, but nothing sets
