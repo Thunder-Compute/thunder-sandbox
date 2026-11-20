@@ -477,7 +477,12 @@ class Sandbox:
                 "stdout, stderr, and retain durable-job options require pty=False"
             )
         channel = self._channel()
-        if workdir is not None:
+        if workdir is not None and not workdir.startswith("/"):
+            # A sandbox without an image ran commands from the SSH user's home,
+            # where a relative working directory resolved; docker exec has
+            # always refused one.
+            if self._info.vm or self._info.image_id is not None:
+                raise InvalidRequestError(f"workdir must be an absolute path, got {workdir!r}")
             workdir = await self._absolute(workdir)
         unset = tuple(key for key, value in (env or {}).items() if value is None)
         request = ExecRequest(

@@ -648,3 +648,25 @@ class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AssertionError):
             await manager.run(operation, name="op")
+
+
+class RelativeWorkdirTest(unittest.IsolatedAsyncioTestCase):
+    async def test_container_and_vm_refuse_a_relative_workdir(self) -> None:
+        from thunder_sandbox.asynchronous.sandbox import Sandbox
+
+        for changes in ({"image_id": "image", "vm": False}, {"image_id": "image", "vm": True}):
+            with self.subTest(changes=changes):
+                sandbox = Sandbox(mock.Mock(), info(**changes))
+                with self.assertRaisesRegex(InvalidRequestError, "absolute"):
+                    await sandbox.exec("pwd", workdir="tmp")
+
+    async def test_a_sandbox_without_an_image_resolves_it_from_home(self) -> None:
+        from thunder_sandbox.asynchronous.sandbox import Sandbox
+
+        sandbox = Sandbox(mock.Mock(), info(image_id=None, vm=False))
+        channel = sandbox._channel()
+        channel.home = mock.AsyncMock(return_value="/home/ubuntu")  # type: ignore[method-assign]
+        channel.exec = mock.AsyncMock(side_effect=RuntimeError("stop"))  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "stop"):
+            await sandbox.exec("pwd", workdir="tmp")
+        self.assertEqual(channel.exec.await_args.args[0].working_dir, "/home/ubuntu/tmp")
