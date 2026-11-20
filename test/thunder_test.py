@@ -1937,6 +1937,45 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(InvalidRequestError, "vm must be"):
             await AsyncSandbox.create(vm="yes", client=mock.Mock())  # type: ignore[arg-type]
 
+    async def test_create_timing_sensitive_asks_for_it_and_drives_the_sandbox_directly(self) -> None:
+        for timing_sensitive in (False, True):
+            with self.subTest(timing_sensitive=timing_sensitive), tempfile.TemporaryDirectory() as directory:
+                client = AsyncClient(config(directory))
+                client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
+                    "image-id", "registry.example/image@sha256:digest", "sha256:digest",
+                ))
+                # Thunder reports a timing-sensitive sandbox as vm: SSH lands
+                # in its container.
+                client._request = mock.AsyncMock(side_effect=[
+                    {"id": "sbx-test"},
+                    {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": timing_sensitive},
+                ])
+                try:
+                    sandbox = await client.create_sandbox(
+                        image=Image.from_registry("python:3.11-slim"),
+                        timing_sensitive=timing_sensitive,
+                    )
+                    body = client._request.await_args_list[0].args[2]
+                    if timing_sensitive:
+                        self.assertIs(body["timing_sensitive"], True)
+                    else:
+                        self.assertNotIn("timing_sensitive", body)
+                    self.assertFalse(client.resolve_image.await_args.kwargs["vm"])
+                    self.assertEqual(sandbox._has_container, not timing_sensitive)
+                finally:
+                    await client.close()
+
+    async def test_create_rejects_invalid_timing_sensitive_requests(self) -> None:
+        image = Image.from_registry("python:3.11-slim")
+        for options, message in (
+            ({"timing_sensitive": "yes", "image": image}, "must be a boolean"),
+            ({"timing_sensitive": True}, "requires an image"),
+            ({"timing_sensitive": True, "image": image, "vm": True}, "cannot be combined with vm"),
+            ({"timing_sensitive": True, "image": image, "gated_features": {"vm": {}}}, "cannot be combined with vm"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(InvalidRequestError, message):
+                await AsyncSandbox.create(client=mock.Mock(), **options)  # type: ignore[arg-type]
+
     def sandbox(self, directory: str) -> tuple[AsyncSandbox, AsyncClient]:
         client = AsyncClient(config(directory))
         prepare_key(client.config.paths)

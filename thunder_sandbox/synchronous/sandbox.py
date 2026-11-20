@@ -47,6 +47,7 @@ class Sandbox:
         gpu_count: int | None = None,
         image: Image | None = None,
         vm: bool | Mapping[str, object] = False,
+        timing_sensitive: bool = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -61,7 +62,9 @@ class Sandbox:
         defaults and, in a container sandbox, require the container to still be
         running. Image-command exit leaves the sandbox VM running until
         termination or TTL expiry. ``vm`` asks for a VM sandbox, which boots
-        the image as the whole VM; see the async ``Sandbox.create``.
+        the image as the whole VM, and ``timing_sensitive`` for one that runs
+        the image in gVisor with the node's GPUs reserved for it; see the
+        async ``Sandbox.create``.
 
         ``queue=True`` applies to image preparation and sandbox allocation.
         Without positional commands, creation returns a handle while queued;
@@ -91,6 +94,7 @@ class Sandbox:
                     gpu_count=gpu_count,
                     image=image,
                     vm=vm,
+                    timing_sensitive=timing_sensitive,
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,
@@ -121,6 +125,7 @@ class Sandbox:
         gpu_count: int | None = None,
         image: Image | None = None,
         vm: bool | Mapping[str, object] = False,
+        timing_sensitive: bool = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -145,6 +150,7 @@ class Sandbox:
                     gpu_count=gpu_count,
                     image=image,
                     vm=vm,
+                    timing_sensitive=timing_sensitive,
                     block_network=block_network,
                     outbound_cidr_allowlist=outbound_cidr_allowlist,
                     outbound_domain_allowlist=outbound_domain_allowlist,

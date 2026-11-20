@@ -122,6 +122,7 @@ class Sandbox:
         gpu_count: int | None = None,
         image: Image | None = None,
         vm: bool | Mapping[str, object] = False,
+        timing_sensitive: bool = False,
         block_network: bool = False,
         outbound_cidr_allowlist: Sequence[str] | None = None,
         outbound_domain_allowlist: Sequence[str] | None = None,
@@ -158,6 +159,14 @@ class Sandbox:
         Where Thunder does not offer VM sandboxes the request starts the
         sandbox it would start without ``vm``; ``Sandbox.vm`` says which kind
         started.
+
+        ``timing_sensitive=True`` runs the image's container in gVisor on the
+        sandbox node instead of in a Thunder VM. GPUs are the node's physical
+        GPUs, reserved for the sandbox, rather than virtualized, so GPU timing
+        matches bare metal. It needs ``image`` and cannot be combined with
+        ``vm``. Such a sandbox reports ``Sandbox.vm`` as true: commands and
+        transfers reach the container directly over SSH. The API refuses the
+        option where Thunder does not offer it.
         """
         _validate_create_options(
             timeout=timeout,
@@ -171,6 +180,12 @@ class Sandbox:
         )
         if not isinstance(vm, (bool, Mapping)):
             raise InvalidRequestError("vm must be a boolean or a mapping")
+        if not isinstance(timing_sensitive, bool):
+            raise InvalidRequestError("timing_sensitive must be a boolean")
+        if timing_sensitive and image is None:
+            raise InvalidRequestError("timing_sensitive requires an image")
+        if timing_sensitive and (vm or (gated_features or {}).get("vm")):
+            raise InvalidRequestError("timing_sensitive cannot be combined with vm")
         # vm is the sandbox start's own field. gated_features={"vm": ...}
         # asks for the same through the gated feature.
         vm_config = dict(vm) if isinstance(vm, Mapping) else {} if vm else None
@@ -226,6 +241,7 @@ class Sandbox:
                     "domain_allowlist": domains,
                 },
                 **({"vm": vm_config} if vm_config is not None else {}),
+                **({"timing_sensitive": True} if timing_sensitive else {}),
                 **(
                     {"gatedFeatures": dict(gated_features)}
                     if gated_features is not None
