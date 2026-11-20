@@ -2006,6 +2006,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             ({"timing_sensitive": "yes", "image": image}, "must be a boolean"),
             ({"timing_sensitive": True}, "requires an image"),
             ({"timing_sensitive": True, "image": image, "vm": True}, "cannot be combined with vm"),
+            # An empty mapping still asks for a VM.
+            ({"timing_sensitive": True, "image": image, "vm": {}}, "cannot be combined with vm"),
             ({"timing_sensitive": True, "image": image, "gated_features": {"vm": {}}}, "cannot be combined with vm"),
         ):
             with self.subTest(options=options), self.assertRaisesRegex(InvalidRequestError, message):
