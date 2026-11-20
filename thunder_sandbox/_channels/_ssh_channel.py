@@ -105,8 +105,10 @@ SSH_KEEPALIVE_INTERVAL_SECONDS = 15
 SSH_KEEPALIVE_COUNT_MAX = 4
 # How long staging cleanup may take before it is abandoned.
 TRANSFER_CLEANUP_GRACE_SECONDS = 5.0
-# Bytes asked for in one read of a job's captured output.
-OUTPUT_READ_BYTES = 64 * 1024
+# Bytes asked for in one read of a job's captured output. Each read is an SSH
+# round trip, so this sets throughput: 64 KiB read 256 MiB in ten minutes,
+# 4 MiB in under one. A read returns at once with whatever is there.
+OUTPUT_READ_BYTES = 4 * 1024 * 1024
 STATUS_INITIAL_DELAY_SECONDS = 0.1
 STATUS_MAX_DELAY_SECONDS = 1.0
 TERMINATION_GRACE_SECONDS = 5.0
