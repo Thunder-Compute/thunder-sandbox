@@ -188,14 +188,14 @@ message TransferOptions {
   // Create missing parent directories of the destination. Default: false;
   // a missing parent fails the transfer.
   optional bool create_parents = 3;
-  // Keep the source's modification times. Default: false for uploads, true
-  // for downloads.
+  // Keep the source's modification times. Default: true.
   optional bool preserve_times = 4;
   // The whole operation. Default: no limit.
   optional uint64 timeout_ms = 5;
 }
 
-// Uploaded files keep their source permission bits, masked by 0o022.
+// Uploaded files keep their exact source permission bits, as `docker cp`
+// keeps them, whatever the sandbox's umask.
 message UploadRequest {
   string sandbox_id = 1;
   bytes destination = 2;  // absolute

@@ -300,8 +300,8 @@ class TransferOptions:
 
 @dataclass(frozen=True)
 class UploadRequest:
-    """Uploaded files keep their source permission bits, masked by the umask of
-    the sandbox's login session (normally 0o022)."""
+    """Uploaded files keep their exact source permission bits, as ``docker cp``
+    keeps them, whatever the sandbox's umask."""
 
     local_path: Path = field(metadata=CORE)
     destination: str = field(metadata=CORE)
