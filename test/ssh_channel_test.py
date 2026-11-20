@@ -33,6 +33,7 @@ from thunder_sandbox._channels._ssh_channel import (
     _JobHandle,
 )
 from thunder_sandbox._common.exceptions import (
+    ConnectionError,
     InvalidRequestError,
     NotFoundError,
     UnsupportedFeatureError,
@@ -214,6 +215,27 @@ class JobHandleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.signals, ["TERM", "KILL"])
         self.assertEqual((status.reason, status.returncode), (ExitReason.TERMINATED, 137))
 
+    async def test_a_failed_read_resumes_at_the_same_offset(self) -> None:
+        fake = FakeJobChannel([JobStatus(JobState.SUCCEEDED, pid=7, returncode=0)],
+                              {"stdout": [b"abcdefgh"], "stderr": []})
+        reads: list[int] = []
+        original = fake._read_output
+
+        async def flaky(job_id: str, stream: str, offset: int) -> bytes:
+            reads.append(offset)
+            if offset == 4 and reads.count(4) == 1:
+                raise ConnectionError("lost")
+            return await original(job_id, stream, offset)
+
+        fake._read_output = flaky  # type: ignore[method-assign]
+        handle = _JobHandle(fake, spec(retain=True), fake.statuses[0])  # type: ignore[arg-type]
+        stream = handle.stdout()
+        self.assertEqual(await stream.__anext__(), b"abcd")
+        with self.assertRaises(ConnectionError):
+            await stream.__anext__()
+        self.assertEqual(await stream.__anext__(), b"efgh")
+        self.assertEqual(reads, [0, 4, 4])
+
     async def test_durable_jobs_have_no_stdin(self) -> None:
         fake = FakeJobChannel([JobStatus(JobState.RUNNING, pid=7)], {"stdout": [], "stderr": []})
         handle = _JobHandle(fake, spec(retain=True), fake.statuses[0])  # type: ignore[arg-type]
@@ -290,6 +312,9 @@ class ScriptedHandle:
 
     async def close_stdin(self) -> None:
         self.written.append(None)
+
+    def last_status(self) -> None:
+        return None
 
     async def wait(self) -> ExecStatus:
         return ExecStatus(EXEC_ID, ExecState.ENDED, reason=ExitReason.INTERRUPTED)
