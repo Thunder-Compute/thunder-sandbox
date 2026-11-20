@@ -184,7 +184,7 @@ class Sandbox:
             raise InvalidRequestError("timing_sensitive must be a boolean")
         if timing_sensitive and image is None:
             raise InvalidRequestError("timing_sensitive requires an image")
-        if timing_sensitive and (vm or (gated_features or {}).get("vm")):
+        if timing_sensitive and (vm or "vm" in (gated_features or {})):
             raise InvalidRequestError("timing_sensitive cannot be combined with vm")
         # vm is the sandbox start's own field. gated_features={"vm": ...}
         # asks for the same through the gated feature.
