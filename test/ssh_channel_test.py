@@ -78,6 +78,7 @@ class SupportTest(unittest.IsolatedAsyncioTestCase):
         ssh = channel()
         refused = [
             ExecRequest(EXEC_ID, "true", umask=0o077),
+            ExecRequest(EXEC_ID, "true", umask=0o022),
             ExecRequest(EXEC_ID, "true", inherit_env=False),
             ExecRequest(EXEC_ID, "true", termination=TerminationPolicy(graceful_termination_timeout_ms=1)),
         ]
@@ -92,7 +93,7 @@ class SupportTest(unittest.IsolatedAsyncioTestCase):
     async def test_accepts_its_fixed_values(self) -> None:
         ssh = channel()
         ssh._start_job = mock.AsyncMock(return_value="started")  # type: ignore[method-assign]
-        result = await ssh.exec(ExecRequest(EXEC_ID, "true", umask=0o022, inherit_env=True))
+        result = await ssh.exec(ExecRequest(EXEC_ID, "true", inherit_env=True))
         self.assertEqual(result, "started")
 
 
@@ -141,7 +142,7 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def test_command_sets_umask_then_workdir_env_and_user(self) -> None:
+    def test_command_sets_workdir_env_and_user(self) -> None:
         command = channel()._command(ExecRequest(
             EXEC_ID, "python", ("train.py", "a b"),
             working_dir="/work dir",
@@ -149,8 +150,10 @@ class CommandTest(unittest.TestCase):
             unset_env=("GONE",),
             identity=Identity(user="agent", group=1000),
         ))
-        self.assertTrue(command.startswith("umask 0022; cd '/work dir' && "))
-        argv = shlex.split(command.split("; ", 1)[1].split(" && ", 1)[1])
+        # No umask of its own: the session's (or, for a durable job, the
+        # submitting session's) applies.
+        self.assertTrue(command.startswith("cd '/work dir' && "))
+        argv = shlex.split(command.split(" && ", 1)[1])
         self.assertEqual(argv[:2], ["sh", "-c"])
         self.assertEqual(argv[3:5], ["sh", "agent:1000"])
         self.assertEqual(argv[5:], ["env", "-u", "GONE", "MODEL=x y", "python", "train.py", "a b"])
@@ -158,7 +161,7 @@ class CommandTest(unittest.TestCase):
     def test_command_without_workdir_starts_in_the_image_workdir(self) -> None:
         command = channel()._command(ExecRequest(EXEC_ID, "pwd"))
         self.assertTrue(command.startswith(
-            "umask 0022; __thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
+            "__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
         ))
         self.assertTrue(command.endswith("cd /; pwd"))
 
