@@ -236,13 +236,13 @@ class FakeJobChannel:
     async def _read_output(self, job_id: str, stream: str, offset: int) -> bytes:
         return self.output[stream][offset:offset + self.chunk]
 
-    async def _signal(self, job_id: str, signal: str, pid: int) -> JobStatus:
+    async def _signal(self, job_id: str, signal: str, pid: int, container: str | None) -> JobStatus:
         self.signals.append(signal)
         if signal == "KILL":
             self.statuses = [JobStatus(JobState.TERMINATED, pid=pid, returncode=137)]
         return self.statuses[0]
 
-    async def _cleanup(self, job_id: str) -> None:
+    async def _cleanup(self, job_id: str, container: str | None) -> None:
         self.cleaned.append(job_id)
 
     def _deadline(self) -> None:
