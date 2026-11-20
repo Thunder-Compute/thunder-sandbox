@@ -460,8 +460,8 @@ set +e
         exit 143
     fi
     # The wrapper keeps 077 for its own files; the command gets the umask of
-    # the session that submitted it, as a command run over SSH or docker exec
-    # would. A job staged by an older SDK has no umask file and keeps 077.
+    # the session that submitted it, as a command run directly over SSH would.
+    # A job staged by an older SDK has no umask file and keeps 077.
     if IFS= read -r __thunder_umask <{umask}; then
         case $__thunder_umask in
         [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) umask "$__thunder_umask" ;;
