@@ -65,16 +65,14 @@ from thunder_sandbox.asynchronous._ssh import (
     SSHConnectionManager,
     SSH_RETRY_BUDGET_SECONDS,
 )
-from thunder_sandbox.asynchronous.sandbox import (
-    WAIT_WINDOW_MAX_SECONDS,
-    _container_exec_script,
-    _download_archive_command,
-)
+from thunder_sandbox.asynchronous.sandbox import WAIT_WINDOW_MAX_SECONDS
 from thunder_sandbox.asynchronous.sandbox import Sandbox as AsyncSandbox
-from thunder_sandbox.asynchronous.sandbox import (
-    _container_session_waiter,
-    _container_remote_command,
+from thunder_sandbox.asynchronous._remote import (
+    _container_exec_script,
     _container_job_prepare_script,
+    _container_remote_command,
+    _container_session_waiter,
+    _download_archive_command,
     _pinned_host_key,
     _remote_command,
 )
@@ -2900,7 +2898,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             connection = mock.Mock(run=mock.AsyncMock(return_value=result))
             connection.is_closed.return_value = False
-            sandbox._ssh_manager._connection = connection
+            attached = mock.Mock(exit_status=None, exit_signal=None)
+            attached.stdout.read = mock.AsyncMock(return_value=b"")
+            attached.stderr.read = mock.AsyncMock(return_value=b"")
+            attached.wait_closed = mock.AsyncMock()
+            connection.create_process = mock.AsyncMock(return_value=attached)
+            sandbox._vm_channel()._manager._connection = connection
             try:
                 process = await sandbox.exec(
                     "python", "train.py", workdir="/workspace", user="1000:1000"
@@ -2912,19 +2915,20 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('"container":null', submitted)
                 self.assertIn("/var/tmp/thunder-sandbox/jobs/", submitted)
                 self.assertIn("exec setpriv", submitted)
+                self.assertIn("umask 0022; cd /workspace", submitted)
                 self.assertNotIn("/run/thunder_seed/vmroot/workdir", submitted)
-                with mock.patch.object(
-                    sandbox, "_create_process", new_callable=mock.AsyncMock
-                ) as create:
-                    await sandbox.exec("id", user="agent", pty=True)
-                    command = create.await_args.args[0]
-                    # Without a workdir it starts in the image's, as docker exec does.
-                    self.assertTrue(command.startswith(
-                        "__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
-                    ))
-                    argv = shlex.split(command.split("; ", 2)[2])
-                    self.assertEqual(argv[:2], ["sh", "-c"])
-                    self.assertEqual(argv[3:], ["sh", "agent", "id"])
+                await sandbox.exec("id", user="agent", pty=True)
+                command = connection.create_process.await_args.args[0]
+                # Without a workdir it starts in the image's, as docker exec does.
+                self.assertTrue(command.startswith(
+                    "umask 0022; __thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
+                ))
+                argv = shlex.split(command.split("; ", 3)[3])
+                self.assertEqual(argv[:2], ["sh", "-c"])
+                self.assertEqual(argv[3:], ["sh", "agent", "id"])
+                self.assertEqual(
+                    connection.create_process.await_args.kwargs["term_type"], "xterm"
+                )
                 self.assertEqual(sandbox._image_path("out/x"), "/out/x")
                 self.assertEqual(sandbox._image_path("/abs"), "/abs")
             finally:
@@ -3148,10 +3152,10 @@ else:
             (victim / "pid").write_text("unchanged")
             job.symlink_to(victim, target_is_directory=True)
             with mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.container_job_directory",
+                "thunder_sandbox.asynchronous._remote.container_job_directory",
                 return_value=PurePosixPath(str(job)),
             ), mock.patch(
-                "thunder_sandbox.asynchronous.sandbox._CONTAINER_BUSYBOX",
+                "thunder_sandbox.asynchronous._remote._CONTAINER_BUSYBOX",
                 shutil.which("env"),
             ):
                 command = _container_remote_command(
