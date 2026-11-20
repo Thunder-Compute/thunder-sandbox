@@ -75,6 +75,9 @@ class ClientConfig:
         self.paths = paths or ThunderPaths()
         cli = _read_json(self.paths.credentials)
         self.api_token = api_token or os.environ.get("TNR_API_TOKEN") or cli.get("token")
+        # A token from the CLI's state is a short-lived login token that the
+        # CLI renews in that file, so it is read again when the API refuses it.
+        self._token_from_cli = not api_token and not os.environ.get("TNR_API_TOKEN")
         self.api_url = str(
             api_url
             or os.environ.get("TNR_API_URL")
@@ -84,6 +87,19 @@ class ClientConfig:
         parsed_url = urlsplit(self.api_url)
         if parsed_url.scheme != "https" or not parsed_url.netloc:
             raise InvalidRequestError("api_url must be an absolute HTTPS URL")
+
+    def reload_cli_token(self) -> bool:
+        """Adopt the CLI's current token if it changed; report whether it did."""
+        if not self._token_from_cli:
+            return False
+        try:
+            token = _read_json(self.paths.credentials).get("token")
+        except InvalidRequestError:
+            return False
+        if not isinstance(token, str) or not token or token == self.api_token:
+            return False
+        self.api_token = token
+        return True
 
     @classmethod
     def from_cli(cls, *, root: Path | None = None) -> "ClientConfig":

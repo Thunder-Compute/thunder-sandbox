@@ -178,7 +178,6 @@ class Client:
         if self._session is None:
             self._session = aiohttp.ClientSession(
                 headers={
-                    "Authorization": f"Bearer {self.config.api_token}",
                     "Content-Type": "application/json",
                     "Thunder-Client": "PYTHON-SDK",
                     "User-Agent": USER_AGENT,
@@ -225,10 +224,24 @@ class Client:
         idempotent = _idempotent(method, path)
         expires_at = None if timeout is None else time.monotonic() + timeout
         attempt_timeout = timeout
+        renewed_token = False
         for delay in (*CONNECTION_RETRY_DELAYS, None):
             try:
                 payload = await self._send(method, path, body, query, attempt_timeout)
                 break
+            except AuthenticationError as exc:
+                # The API refused the request before acting on it, so sending
+                # it again with the CLI's renewed token is safe for any method.
+                if exc.status != 401 or renewed_token or not self.config.reload_cli_token():
+                    raise
+                renewed_token = True
+                try:
+                    payload = await self._send(method, path, body, query, attempt_timeout)
+                    break
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as retry_exc:
+                    raise ConnectionError(
+                        f"could not communicate with Thunder: {_describe(retry_exc)}"
+                    ) from retry_exc
             except ThunderError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
@@ -272,8 +285,9 @@ class Client:
         options = (
             {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout is not None else {}
         )
+        headers = {"Authorization": f"Bearer {self.config.api_token}"}
         async with session.request(
-            method, url, json=body, params=params, **options
+            method, url, json=body, params=params, headers=headers, **options
         ) as response:
             payload = await response.read()
             if response.status >= 400:
