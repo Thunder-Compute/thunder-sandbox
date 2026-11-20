@@ -121,6 +121,10 @@ class RemoteJobPaths:
         return self.directory / "launch.sh"
 
     @property
+    def umask(self) -> PurePosixPath:
+        return self.directory / "umask"
+
+    @property
     def status(self) -> PurePosixPath:
         return self.directory / "status.json"
 
@@ -376,6 +380,7 @@ def launcher_script(command: str, paths: RemoteJobPaths, spec: JobSpec) -> str:
         raise ValueError("job specification and paths must use the same ID")
     job = shlex.quote(str(paths.directory))
     status = shlex.quote(str(paths.status))
+    umask = shlex.quote(str(paths.umask))
     run_lock = shlex.quote(str(paths.run_lock))
     supervisor_pid = shlex.quote(str(paths.supervisor_pid))
     termination_request = shlex.quote(str(paths.termination_request))
@@ -454,6 +459,15 @@ set +e
     if [ -f {termination_request} ]; then
         exit 143
     fi
+    # The wrapper keeps 077 for its own files; the command gets the umask of
+    # the session that submitted it, as a command run directly over SSH would.
+    # A job staged by an older SDK has no umask file and keeps 077.
+    if IFS= read -r __thunder_umask <{umask}; then
+        case $__thunder_umask in
+        [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) umask "$__thunder_umask" ;;
+        esac
+    fi 2>/dev/null
+    unset __thunder_umask
     {command}
 ) </dev/null >{stdout} 2>{stderr} &
 payload_pid=$!
@@ -514,6 +528,7 @@ def submission_command(
     submission_lock = shlex.quote(str(paths.submission_lock))
     status = shlex.quote(str(paths.status))
     return f"""set -eu
+session_umask=$(umask)
 umask 077
 root={root}
 job={job}
@@ -526,6 +541,7 @@ mkdir -- "$stage"
 printf '%s' {encoded_spec} >"$stage/spec.json"
 printf '%s' {encoded_launcher} >"$stage/launch.sh"
 printf '%s' {prepared} >"$stage/status.json"
+printf '%s\n' "$session_umask" >"$stage/umask"
 cat -- {_BOOT_ID} >"$stage/boot_id" 2>/dev/null || :
 chmod 700 -- "$stage" "$stage/launch.sh"
 : >"$stage/stdout"
@@ -534,7 +550,7 @@ chmod 700 -- "$stage" "$stage/launch.sh"
 # A sandbox can lose power or panic at any moment, and a VM sandbox restarts
 # in place on the same disk. Without these flushes a job submitted shortly
 # before would come back with an empty specification.
-sync -- "$stage/spec.json" "$stage/launch.sh" "$stage/status.json" "$stage/boot_id" 2>/dev/null || :
+sync -- "$stage/spec.json" "$stage/launch.sh" "$stage/status.json" "$stage/umask" "$stage/boot_id" 2>/dev/null || :
 if mv -T -- "$stage" "$job" 2>/dev/null; then
     sync -- "$root" 2>/dev/null || :
 else
