@@ -138,7 +138,9 @@ class ExecutionChannel(abc.ABC):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if getattr(cls, "__abstractmethods__", None):
+        # ABCMeta records __abstractmethods__ only after this runs, so look
+        # for abstract methods directly.
+        if any(getattr(getattr(cls, name, None), "__isabstractmethod__", False) for name in dir(cls)):
             return  # An intermediate base; its concrete subclasses are checked.
         for request_type, attribute in _TABLES:
             _check_table_covers(cls, request_type, getattr(cls, attribute))

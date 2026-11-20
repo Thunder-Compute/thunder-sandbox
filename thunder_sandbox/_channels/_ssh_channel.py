@@ -1,29 +1,23 @@
-"""The SSH channel: processes and files of a VM sandbox, reached over SSH.
+"""Execution channels that reach a sandbox over SSH.
 
-A VM sandbox boots its image as the whole VM, and the SDK logs in as root.
-Commands run directly on the VM; there is no container in between.
+Each kind of sandbox reached this way has its own channel:
 
-Behaviour this channel fixes, beyond its support table:
+- ``SSHChannel``: a VM sandbox, which boots its image as the whole VM. The SDK
+  logs in as root and runs commands directly on the VM.
+- ``SSHDockerChannel``: a container sandbox. Commands and files go through
+  ``docker exec`` and ``docker cp`` into the ``thunder-sandbox`` container.
+- ``SSHHostChannel``: a sandbox with no image, which is deprecated. Commands
+  run on the guest as the SSH user, as they always have.
 
-- A command starts in the image's working directory (the sandbox's effective
-  workdir, else ``/``) unless ``working_dir`` is given.
-- Its environment is root's SSH login: ``/etc/environment`` (the image's
-  ``ENV`` overlaid with the sandbox's env), ``HOME``, ``USER``, ``LOGNAME``,
-  ``SHELL`` and the ``SSH_*`` variables. With an ``identity``, ``HOME``,
-  ``USER`` and ``LOGNAME`` become that user's.
-- A command given by bare name is looked up in that environment's ``PATH``.
-- It runs with the umask of the SSH session that starts it, 0o022 for root
-  on a VM sandbox, with or without a PTY.
-- Terminating a process without a PTY sends SIGTERM to its process group and
-  SIGKILL 5 seconds later if it is still running. A PTY process gets one
-  SIGTERM through its SSH session, with no SIGKILL.
-- Uploads land owned by root:root, with the source's exact permission bits
-  and modification times, as ``docker cp`` keeps them. Downloads keep
-  modification times.
+They share one transport: a single SSH connection, reused and reopened after
+a loss, carrying at most ``SESSION_SLOTS`` sessions at a time. A command
+without a PTY runs as a durable job whose state lives in files on the guest,
+so it outlives the connection that started it.
 """
 
 from __future__ import annotations
 
+import abc
 import asyncio
 import io
 import os
@@ -63,7 +57,10 @@ from ..asynchronous._jobs import (
     validate_job_id,
 )
 from ..asynchronous._remote import (
+    _CONTAINER_BUSYBOX,
+    _CONTAINER_NAME,
     _VM_IMAGE_WORKDIR,
+    _container_remote_command,
     _download_archive_command,
     _pinned_host_key,
     _remember_host_key,
@@ -160,48 +157,15 @@ def _timeout_seconds(timeout_ms: int) -> str:
     return f"{seconds:g}"
 
 
-class SSHChannel(ExecutionChannel):
-    """Commands and files of a VM sandbox, over one reusable SSH connection."""
+class _SSHChannelBase(ExecutionChannel):
+    """The SSH transport, durable-job protocol and transfers the channels share.
 
-    name = "ssh"
-    exec_support: ClassVar = {
-        "working_dir": SUPPORTED,
-        "inherit_env": Fixed(True),
-        "env": SUPPORTED,
-        "unset_env": SUPPORTED,
-        "identity.user": SUPPORTED,
-        "identity.group": SUPPORTED,
-        "umask": Unsupported(
-            "commands get the SSH session's umask, 0o022 for root on a VM sandbox"
-        ),
-        "stdout": SUPPORTED,
-        "stderr": SUPPORTED,
-        "pty": SUPPORTED,
-        "termination.signal": _TERMINATION_UNSUPPORTED,
-        "termination.graceful_termination_timeout_ms": _TERMINATION_UNSUPPORTED,
-        "termination.process_group": _TERMINATION_UNSUPPORTED,
-        "retention": SUPPORTED,
-    }
-    upload_support: ClassVar = {
-        "options.recursive": SUPPORTED,
-        "options.contents_only": SUPPORTED,
-        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
-        "options.create_parents": Fixed(False),
-        "options.preserve_times": Fixed(True),
-        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
-        "options.timeout_ms": SUPPORTED,
-        "owner.user": Unsupported("uploads are owned by root:root"),
-        "owner.group": Unsupported("uploads are owned by root:root"),
-    }
-    download_support: ClassVar = {
-        "options.recursive": SUPPORTED,
-        "options.contents_only": SUPPORTED,
-        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
-        "options.create_parents": Fixed(False),
-        "options.preserve_times": Fixed(True),
-        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
-        "options.timeout_ms": SUPPORTED,
-    }
+    A subclass says how a command is wrapped (``_command``), whether durable
+    jobs run in the container (``_container``), and how uploads land.
+    """
+
+    #: The container that durable jobs run in, if any.
+    _container: ClassVar[str | None] = None
 
     def __init__(self, client: "Client", info: Callable[[], SandboxInfo]) -> None:
         self._client = client
@@ -209,7 +173,10 @@ class SSHChannel(ExecutionChannel):
         self._manager = SSHConnectionManager(self._open_connection)
         self._slots = asyncio.Semaphore(SESSION_SLOTS)
 
-    # ------------------------------------------------------------ identity
+    @abc.abstractmethod
+    def _command(self, request: ExecRequest) -> str:
+        """The shell command, run in an SSH session, that runs ``request``."""
+
 
     @property
     def _sandbox_id(self) -> str:
@@ -351,23 +318,6 @@ class SSHChannel(ExecutionChannel):
 
     # ------------------------------------------------------------ commands
 
-    def _command(self, request: ExecRequest) -> str:
-        """The shell command that runs ``request`` on the VM."""
-        env: dict[str, str | None] = dict(request.env)
-        env.update(dict.fromkeys(request.unset_env))
-        command = _remote_command(
-            (request.executable, *request.args),
-            workdir=request.working_dir,
-            env=env or None,
-            user=_identity_text(request.identity),
-        )
-        if request.working_dir is None:
-            command = _VM_IMAGE_WORKDIR + command
-        # A durable job's launcher keeps 077 for its own files and gives the
-        # command the umask of the session that submitted it, as a PTY
-        # command gets its session's directly.
-        return command
-
     async def _exec(self, request: ExecRequest) -> ExecHandle:
         if request.pty:
             return await self._start_attached(request)
@@ -395,15 +345,14 @@ class SSHChannel(ExecutionChannel):
     async def _start_job(self, request: ExecRequest) -> ExecHandle:
         job_id = request.exec_id
         paths = RemoteJobPaths(job_id)
-        env: dict[str, str | None] = dict(request.env)
-        env.update(dict.fromkeys(request.unset_env))
+        env = _environment(request) or {}
         spec = JobSpec(
             job_id,
             (request.executable, *request.args),
             workdir=request.working_dir,
             user=_identity_text(request.identity),
             env=env,
-            container=None,
+            container=self._container,
             stdout=(request.stdout or OutputMode.CAPTURE).value,  # type: ignore[arg-type]
             stderr=(request.stderr or OutputMode.CAPTURE).value,  # type: ignore[arg-type]
             retain=request.retention is Retention.RETAIN,
@@ -478,8 +427,6 @@ class SSHChannel(ExecutionChannel):
             ) from exc
         if spec.job_id != job_id:
             raise SandboxFailedError(f"durable sandbox job {job_id} has a mismatched specification")
-        if spec.container is not None:
-            raise NotFoundError(f"durable sandbox job {job_id} belongs to a container")
         return spec
 
     async def _read_status(self, job_id: str, *, deadline: float | None) -> JobStatus:
@@ -521,9 +468,14 @@ class SSHChannel(ExecutionChannel):
             read, name=f"durable sandbox job {job_id} {stream} read", deadline=self._deadline()
         )
 
-    async def _signal(self, job_id: str, signal: str, pid: int) -> JobStatus:
+    async def _signal(
+        self, job_id: str, signal: str, pid: int, container: str | None = None
+    ) -> JobStatus:
         result = await self._run(
-            signal_command(RemoteJobPaths(job_id), signal=signal, pid=pid, container=None),
+            signal_command(
+                RemoteJobPaths(job_id), signal=signal, pid=pid, container=container,
+                container_busybox=_CONTAINER_BUSYBOX,
+            ),
             name=f"durable sandbox job {job_id} SIG{signal}",
             retry_exit_codes={75},
             check=False,
@@ -539,9 +491,12 @@ class SSHChannel(ExecutionChannel):
             context=f"durable sandbox job {job_id} returned invalid status after SIG{signal}",
         )
 
-    async def _cleanup(self, job_id: str) -> None:
+    async def _cleanup(self, job_id: str, container: str | None = None) -> None:
         result = await self._run(
-            cleanup_command(RemoteJobPaths(job_id), container=None),
+            cleanup_command(
+                RemoteJobPaths(job_id), container=container,
+                container_busybox=_CONTAINER_BUSYBOX,
+            ),
             name=f"durable sandbox job {job_id} cleanup",
             check=False,
         )
@@ -699,14 +654,17 @@ fi
 """
         await self._run(command, name=f"publish upload in sandbox {self._sandbox_id}")
 
-    async def _cleanup_remote_paths(self, *paths: str) -> None:
+    async def _cleanup_remote_paths(self, *paths: str, privileged: bool = False) -> None:
         deadline = time.monotonic() + TRANSFER_CLEANUP_GRACE_SECONDS
         expires = self._deadline()
         if expires is not None:
             deadline = min(deadline, expires)
+        command = "rm -rf -- " + " ".join(shlex.quote(path) for path in paths)
+        if privileged:
+            command = "sudo --non-interactive " + command
         with suppress(Exception):
             await self._run(
-                "rm -rf -- " + " ".join(shlex.quote(path) for path in paths),
+                command,
                 name=f"clean up transfer staging in sandbox {self._sandbox_id}",
                 deadline=deadline,
             )
@@ -744,7 +702,10 @@ fi
         )
         extracted = transfer_root / "archive"
         command = _download_archive_command(
-            source, recursive=options.recursive, contents_only=contents_only, container=False
+            source,
+            recursive=options.recursive,
+            contents_only=contents_only,
+            container=self._container is not None,
         )
         name = f"download {source} from sandbox {self._sandbox_id}"
         try:
@@ -775,15 +736,325 @@ fi
             await asyncio.to_thread(shutil.rmtree, transfer_root, True)
         return TransferResult(os.fspath(target))
 
+
     # ------------------------------------------------------------ network
 
     async def after_network_policy_change(self) -> None:
+        await self._flush_guest_dns()
+
+    async def _flush_guest_dns(self) -> None:
         # Best effort: a resolver without resolvectl keeps its cache.
         await self._run(
             "sudo --non-interactive resolvectl flush-caches",
             name=f"sandbox {self._sandbox_id} VM DNS cache flush",
             check=False,
         )
+
+    async def home(self) -> str:
+        """The SSH user's home directory, where relative paths used to resolve."""
+        result = await self._run(
+            'printf %s "$HOME"', name=f"sandbox {self._sandbox_id} home directory"
+        )
+        return str(result.stdout or "") or "/"
+
+
+class SSHChannel(_SSHChannelBase):
+    """Commands and files of a VM sandbox.
+
+    Fixed behaviour beyond the support table:
+
+    - A command starts in the image's working directory (the sandbox's
+      effective workdir, else ``/``) unless ``working_dir`` is given.
+    - Its environment is root's SSH login: ``/etc/environment`` (the image's
+      ``ENV`` overlaid with the sandbox's env), ``HOME``, ``USER``,
+      ``LOGNAME``, ``SHELL`` and the ``SSH_*`` variables. With an
+      ``identity``, ``HOME``, ``USER`` and ``LOGNAME`` become that user's.
+    - A command given by bare name is looked up in that environment's
+      ``PATH``.
+    - It runs with the umask of the SSH session that starts it, 0o022 for
+      root on a VM sandbox, with or without a PTY.
+    - Terminating a process without a PTY sends SIGTERM to its process group,
+      then SIGKILL 5 seconds later if it is still running. A PTY process gets
+      one SIGTERM through its SSH session.
+    - Uploads land owned by root:root, with the source's exact permission bits
+      and modification times, as ``docker cp`` keeps them. Downloads keep
+      modification times.
+    """
+
+    name = "ssh"
+    OWNER = "uploads are owned by root:root"
+    exec_support: ClassVar = {
+        "working_dir": SUPPORTED,
+        "inherit_env": Fixed(True),
+        "env": SUPPORTED,
+        "unset_env": SUPPORTED,
+        "identity.user": SUPPORTED,
+        "identity.group": SUPPORTED,
+        "umask": Unsupported(
+            "commands get the SSH session's umask, 0o022 for root on a VM sandbox"
+        ),
+        "stdout": SUPPORTED,
+        "stderr": SUPPORTED,
+        "pty": SUPPORTED,
+        "termination.signal": _TERMINATION_UNSUPPORTED,
+        "termination.graceful_termination_timeout_ms": _TERMINATION_UNSUPPORTED,
+        "termination.process_group": _TERMINATION_UNSUPPORTED,
+        "retention": SUPPORTED,
+    }
+    upload_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+        "owner.user": Unsupported(OWNER),
+        "owner.group": Unsupported(OWNER),
+    }
+    download_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+    }
+
+    def _command(self, request: ExecRequest) -> str:
+        command = _remote_command(
+            (request.executable, *request.args),
+            workdir=request.working_dir,
+            env=_environment(request),
+            user=_identity_text(request.identity),
+        )
+        if request.working_dir is None:
+            command = _VM_IMAGE_WORKDIR + command
+        # A durable job's launcher keeps 077 for its own files and gives the
+        # command the umask of the session that submitted it, as a PTY
+        # command gets its session's directly.
+        return command
+
+
+class SSHDockerChannel(_SSHChannelBase):
+    """Commands and files of a container sandbox, through its guest VM.
+
+    Fixed behaviour beyond the support table:
+
+    - A command runs through ``docker exec`` in the ``thunder-sandbox``
+      container, as root unless ``identity`` says otherwise, starting in the
+      image's ``WORKDIR`` (else ``/``) unless ``working_dir`` is given.
+    - Its environment is the container's: a default ``PATH``, ``HOSTNAME``,
+      the image's ``ENV`` and the sandbox's env, with no ``HOME`` or ``USER``
+      unless the image sets them.
+    - A command given by bare name is looked up in that ``PATH``; if the image
+      has no such program, the container's BusyBox applet runs instead.
+    - It runs with umask 0o022, with or without a PTY.
+    - Terminating a process without a PTY sends SIGTERM to its process group
+      in the container, then SIGKILL 5 seconds later if it is still running.
+      A PTY process gets one SIGTERM through its SSH session.
+    - Uploads land owned by root (0:0), with the source's exact permission
+      bits and modification times, as ``docker cp`` keeps them. Downloads
+      read as root in the container and keep modification times.
+    """
+
+    name = "ssh-docker"
+    _container = _CONTAINER_NAME
+    OWNER = "uploads are owned by root (0:0)"
+    exec_support: ClassVar = {
+        "working_dir": SUPPORTED,
+        "inherit_env": Fixed(True),
+        "env": SUPPORTED,
+        "unset_env": SUPPORTED,
+        "identity.user": SUPPORTED,
+        "identity.group": SUPPORTED,
+        "umask": Fixed(0o022),  # docker exec's
+        "stdout": SUPPORTED,
+        "stderr": SUPPORTED,
+        "pty": SUPPORTED,
+        "termination.signal": _TERMINATION_UNSUPPORTED,
+        "termination.graceful_termination_timeout_ms": _TERMINATION_UNSUPPORTED,
+        "termination.process_group": _TERMINATION_UNSUPPORTED,
+        "retention": SUPPORTED,
+    }
+    upload_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+        "owner.user": Unsupported(OWNER),
+        "owner.group": Unsupported(OWNER),
+    }
+    download_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+    }
+
+    def _command(self, request: ExecRequest) -> str:
+        return _container_remote_command(
+            (request.executable, *request.args),
+            workdir=request.working_dir,
+            env=_environment(request),
+            pty=bool(request.pty),
+            job_id=None if request.pty else request.exec_id,
+            user=_identity_text(request.identity),
+        )
+
+    async def _upload_now(self, request: UploadRequest) -> TransferResult:
+        source_path = request.local_path
+        options = request.options
+        if not source_path.exists():
+            raise InvalidRequestError(f"upload source does not exist: {source_path}")
+        if source_path.is_dir() and not options.recursive:
+            raise InvalidRequestError("uploading a directory requires recursive=True")
+        stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
+        try:
+            if options.contents_only:
+                if not source_path.is_dir():
+                    raise InvalidRequestError("a contents-only upload needs a directory source")
+
+                async def transfer_contents(connection: asyncssh.SSHClientConnection) -> None:
+                    await self._reset_remote_path(connection, stage, directory=True)
+                    for child in source_path.iterdir():
+                        await asyncssh.scp(
+                            os.fspath(child), (connection, stage + "/"), recurse=True, preserve=True
+                        )
+
+                await self._retry_scp(
+                    transfer_contents,
+                    name=f"upload directory contents to sandbox {self._sandbox_id}",
+                )
+                guest_source = stage + "/."
+            else:
+                async def transfer_path(connection: asyncssh.SSHClientConnection) -> None:
+                    await self._reset_remote_path(connection, stage, directory=True)
+                    await asyncssh.scp(
+                        os.fspath(source_path),
+                        (connection, stage + "/"),
+                        recurse=options.recursive,
+                        preserve=True,
+                    )
+
+                await self._retry_scp(
+                    transfer_path, name=f"upload {source_path.name} to sandbox {self._sandbox_id}"
+                )
+                guest_source = stage + "/" + source_path.name
+            # docker cp keeps each file's numeric owner, and the stage belongs
+            # to the SSH user (uid 1000 on the guest). In an image whose own
+            # non-root user is also uid 1000 the upload would land owned by
+            # that user: a verifier that sweeps that user's files would delete
+            # its own tests, and a root-only lockdown would not keep the user
+            # out. Hand the stage to root first, as other container backends
+            # deliver uploads. Only the stage changes hands, never files
+            # already at the destination. -h keeps a symlink in the payload
+            # from redirecting the sudo chown outside the stage.
+            await self._run_guest("sudo", "--non-interactive", "chown", "-R", "-h", "--", "0:0", stage)
+            await self._run_guest(
+                "sudo", "--non-interactive", "docker", "cp",
+                guest_source, f"{_CONTAINER_NAME}:{request.destination}",
+            )
+        except (OSError, asyncssh.Error) as exc:
+            raise SandboxFailedError(f"could not upload to sandbox container: {exc}") from exc
+        finally:
+            # The stage is root-owned once it has changed hands, which the SSH
+            # user could not remove.
+            await self._cleanup_remote_paths(stage, privileged=True)
+        return TransferResult(request.destination)
+
+    async def _run_guest(self, *args: str) -> None:
+        await self._run(
+            _remote_command(args, workdir=None, env=None),
+            name=f"sandbox {self._sandbox_id} guest command",
+        )
+
+    async def after_network_policy_change(self) -> None:
+        for args in (
+            ("resolvectl", "flush-caches"),
+            ("sudo", "--non-interactive", "resolvectl", "flush-caches"),
+        ):
+            result = await self._run(
+                _container_remote_command(args, workdir=None, env=None, pty=False),
+                name=f"sandbox {self._sandbox_id} container DNS cache flush",
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+        # Always flush the VM resolver too, even if the container lacks
+        # resolvectl or permission to flush its own cache.
+        await self._flush_guest_dns()
+
+
+class SSHHostChannel(_SSHChannelBase):
+    """Commands and files of a sandbox with no image. Deprecated.
+
+    Commands run on the guest VM as the SSH user, in its home directory, with
+    the SSH login's environment and umask, durable or not. No other user can
+    be chosen. Uploads land owned by the SSH user, with the source's exact
+    permission bits and modification times. Terminating behaves as on the
+    other channels.
+    """
+
+    name = "ssh-host"
+    OWNER = "uploads are owned by the SSH user"
+    exec_support: ClassVar = {
+        "working_dir": SUPPORTED,
+        "inherit_env": Fixed(True),
+        "env": SUPPORTED,
+        "unset_env": SUPPORTED,
+        "identity.user": Unsupported("a sandbox without an image runs commands as its SSH user"),
+        "identity.group": Unsupported("a sandbox without an image runs commands as its SSH user"),
+        "umask": Unsupported("commands get the SSH login's umask"),
+        "stdout": SUPPORTED,
+        "stderr": SUPPORTED,
+        "pty": SUPPORTED,
+        "termination.signal": _TERMINATION_UNSUPPORTED,
+        "termination.graceful_termination_timeout_ms": _TERMINATION_UNSUPPORTED,
+        "termination.process_group": _TERMINATION_UNSUPPORTED,
+        "retention": SUPPORTED,
+    }
+    upload_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+        "owner.user": Unsupported(OWNER),
+        "owner.group": Unsupported(OWNER),
+    }
+    download_support: ClassVar = {
+        "options.recursive": SUPPORTED,
+        "options.contents_only": SUPPORTED,
+        "options.on_conflict": Fixed(ConflictPolicy.MERGE),
+        "options.create_parents": Fixed(False),
+        "options.preserve_times": Fixed(True),
+        "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
+        "options.timeout_ms": SUPPORTED,
+    }
+
+    def _command(self, request: ExecRequest) -> str:
+        return _remote_command(
+            (request.executable, *request.args),
+            workdir=request.working_dir,
+            env=_environment(request),
+        )
+
+
+def _environment(request: ExecRequest) -> dict[str, str | None] | None:
+    """``env`` and ``unset_env`` as the shell builders take them: ``None`` unsets."""
+    env: dict[str, str | None] = dict(request.env)
+    env.update(dict.fromkeys(request.unset_env))
+    return env or None
 
 
 # ============================================================ handles
@@ -796,7 +1067,7 @@ class _JobHandle(ExecHandle):
     command that reconnects and resends after a loss.
     """
 
-    def __init__(self, channel: SSHChannel, spec: JobSpec, status: JobStatus) -> None:
+    def __init__(self, channel: "_SSHChannelBase", spec: JobSpec, status: JobStatus) -> None:
         self._channel = channel
         self._spec = spec
         self._status = status
@@ -889,7 +1160,9 @@ class _JobHandle(ExecHandle):
                 self._maybe_cleanup()
                 return _exec_status(self.exec_id, status)
             assert status.pid is not None
-            status = await self._accept(await self._channel._signal(self.exec_id, "TERM", status.pid))
+            status = await self._accept(await self._channel._signal(
+                self.exec_id, "TERM", status.pid, self._spec.container
+            ))
             if not status.state.terminal:
                 deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
                 delay = STATUS_INITIAL_DELAY_SECONDS
@@ -905,7 +1178,9 @@ class _JobHandle(ExecHandle):
             if not status.state.terminal:
                 assert status.pid is not None
                 status = await self._accept(
-                    await self._channel._signal(self.exec_id, "KILL", status.pid)
+                    await self._channel._signal(
+                        self.exec_id, "KILL", status.pid, self._spec.container
+                    )
                 )
                 if not status.state.terminal:
                     raise SandboxFailedError(
@@ -924,7 +1199,7 @@ class _JobHandle(ExecHandle):
         async with self._cleanup_lock:
             if self._cleaned:
                 return
-            await self._channel._cleanup(self.exec_id)
+            await self._channel._cleanup(self.exec_id, self._spec.container)
             self._cleaned = True
 
     def _maybe_cleanup(self) -> None:
@@ -1154,4 +1429,4 @@ def _consume(task: "asyncio.Future[None]") -> None:
         task.result()
 
 
-__all__ = ["SSHChannel"]
+__all__ = ["SSHChannel", "SSHDockerChannel", "SSHHostChannel"]
