@@ -403,16 +403,22 @@ class SSHChannel(ExecutionChannel):
             stderr=(request.stderr or OutputMode.CAPTURE).value,  # type: ignore[arg-type]
             retain=request.retention is Retention.RETAIN,
         )
-        script = submission_command(spec, self._command(request), paths)
+        command = self._command(request)
 
         async def submit(
             connection: asyncssh.SSHClientConnection,
         ) -> asyncssh.SSHCompletedProcess[str]:
-            # Sent over stdin: as an exec request the script would carry the
-            # command inside one shell argument, which Linux caps at 128 KiB.
-            # Resending it is safe; the job ID admits one launch.
+            # Each attempt stages under a fresh name, so a resend never collides
+            # with an earlier attempt still unwinding after its connection was
+            # lost; the job ID and its contents stay the same, and admit one
+            # launch. Sent over stdin: as an exec request the script would
+            # carry the command inside one shell argument, which Linux caps at
+            # 128 KiB.
             result = await connection.run(
-                "sh -s", input=script, check=False, encoding="utf-8"
+                "sh -s",
+                input=submission_command(spec, command, paths),
+                check=False,
+                encoding="utf-8",
             )
             if result.returncode is None or result.returncode == 75:
                 raise RetryableSSHOperationError(
@@ -445,15 +451,16 @@ class SSHChannel(ExecutionChannel):
             validate_job_id(exec_id)
         except ValueError as exc:
             raise InvalidRequestError(str(exc)) from exc
-        spec = await self._read_spec(exec_id)
+        spec = await self._read_spec(exec_id, deadline=self._deadline())
         status = await self._read_status(exec_id, deadline=self._deadline())
         return _JobHandle(self, spec, status)
 
-    async def _read_spec(self, job_id: str) -> JobSpec:
+    async def _read_spec(self, job_id: str, *, deadline: float | None) -> JobSpec:
         paths = RemoteJobPaths(job_id)
         result = await self._run(
             f"cat -- {shlex.quote(str(paths.specification))}",
             name=f"durable sandbox job {job_id} specification",
+            deadline=deadline,
             check=False,
         )
         if result.returncode != 0:
@@ -797,6 +804,9 @@ class _JobHandle(ExecHandle):
     def exec_id(self) -> str:
         return self._spec.job_id
 
+    def last_status(self) -> ExecStatus:
+        return _exec_status(self.exec_id, self._status)
+
     # ------------------------------------------------------------ status
 
     async def _refresh(self, *, deadline: float | None = None) -> JobStatus:
@@ -849,26 +859,7 @@ class _JobHandle(ExecHandle):
         if name in self._streamed:
             raise RuntimeError(f"{name} of process {self.exec_id} is already being read")
         self._streamed.add(name)
-        return self._chunks(name)
-
-    async def _chunks(self, name: str) -> AsyncIterator[bytes]:
-        offset = 0
-        while not self._eof[name]:
-            # End of file is conclusive only when the job had already ended
-            # before the read began: a job exiting during the read may flush
-            # more, which the next read collects.
-            ended = (await self._refresh()).state.terminal
-            chunk = await self._channel._read_output(self.exec_id, name, offset)
-            if chunk:
-                # The offset moves only once the whole chunk is here, so a
-                # resent read starts at the same place.
-                offset += len(chunk)
-                yield chunk
-            elif ended:
-                self._eof[name] = True
-            else:
-                await asyncio.sleep(STATUS_INITIAL_DELAY_SECONDS)
-        self._maybe_cleanup()
+        return _JobStream(self, name)
 
     async def write_stdin(self, data: bytes) -> None:
         raise _no_stdin()
@@ -881,8 +872,6 @@ class _JobHandle(ExecHandle):
     async def terminate(self) -> ExecStatus:
         async with self._termination_lock:
             status = self._status
-            if not status.state.terminal:
-                status = await self._refresh()
             while not status.state.terminal and status.pid is None:
                 await asyncio.sleep(STATUS_INITIAL_DELAY_SECONDS)
                 status = await self._refresh()
@@ -954,6 +943,43 @@ class _JobHandle(ExecHandle):
         task.add_done_callback(_consume)
 
 
+class _JobStream:
+    """One captured stream of a durable job, read by byte offset.
+
+    An iterator object rather than a generator: a read that fails leaves the
+    offset where it was, so the next ``__anext__`` retries the same bytes
+    instead of ending the stream.
+    """
+
+    def __init__(self, handle: _JobHandle, name: str) -> None:
+        self._handle = handle
+        self._name = name
+        self._offset = 0
+
+    def __aiter__(self) -> "_JobStream":
+        return self
+
+    async def __anext__(self) -> bytes:
+        handle = self._handle
+        while not handle._eof[self._name]:
+            # End of file is conclusive only when the job had already ended
+            # before the read began: a job exiting during the read may flush
+            # more, which the next read collects.
+            ended = (await handle._refresh()).state.terminal
+            chunk = await handle._channel._read_output(handle.exec_id, self._name, self._offset)
+            if chunk:
+                # The offset moves only once the whole chunk is here, so a
+                # retried read starts at the same place.
+                self._offset += len(chunk)
+                return chunk
+            if ended:
+                handle._eof[self._name] = True
+            else:
+                await asyncio.sleep(STATUS_INITIAL_DELAY_SECONDS)
+        handle._maybe_cleanup()
+        raise StopAsyncIteration
+
+
 class _AttachedHandle(ExecHandle):
     """A PTY process, attached to the SSH session that started it.
 
@@ -973,6 +999,9 @@ class _AttachedHandle(ExecHandle):
     @property
     def exec_id(self) -> str:
         return self._exec_id
+
+    def last_status(self) -> ExecStatus:
+        return self._status()
 
     def _status(self) -> ExecStatus:
         process = self._process
@@ -998,6 +1027,9 @@ class _AttachedHandle(ExecHandle):
             await asyncio.gather(*(drain.finished() for drain in self._streams.values()))
         except (OSError, asyncssh.Error) as exc:
             raise _attached_error(exc) from exc
+        for drain in self._streams.values():
+            if drain.error is not None:
+                raise drain.error
         status = self._status()
         if status.state is not ExecState.ENDED:
             raise ConnectionError("sandbox SSH process ended without reporting an exit status")
@@ -1063,6 +1095,11 @@ class _Drain:
             async with self._condition:
                 self._done = True
                 self._condition.notify_all()
+
+    @property
+    def error(self) -> BaseException | None:
+        """Why the stream ended early, if the connection was lost."""
+        return self._error
 
     async def finished(self) -> None:
         await asyncio.wait({self._task})
