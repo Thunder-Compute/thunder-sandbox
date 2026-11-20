@@ -458,3 +458,55 @@ def _paths_under(root: Path):  # type: ignore[no-untyped-def]
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
+    """One connection serves every operation, so one session's failure keeps it."""
+
+    def manager(self, *connections: object) -> tuple[SSHConnectionManager, mock.AsyncMock]:
+        opened = mock.AsyncMock(side_effect=list(connections))
+        manager = SSHConnectionManager(opened, sleep=mock.AsyncMock(), jitter=lambda _a, _b: 0.0)
+        return manager, opened
+
+    async def test_a_refused_session_keeps_the_connection(self) -> None:
+        import asyncssh
+
+        live = mock.Mock(is_closed=mock.Mock(return_value=False))
+        manager, opened = self.manager(live)
+        attempts = 0
+
+        async def operation(connection: object) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_RESOURCE_SHORTAGE, "too many sessions")
+            return "done"
+
+        self.assertEqual(await manager.run(operation, name="op"), "done")
+        self.assertEqual(opened.await_count, 1)
+        live.close.assert_not_called()
+
+    async def test_any_error_on_a_connection_that_closed_is_retried(self) -> None:
+        state = {"closed": False}
+        first = mock.Mock(is_closed=mock.Mock(side_effect=lambda: state["closed"]))
+        second = mock.Mock(is_closed=mock.Mock(return_value=False))
+        manager, opened = self.manager(first, second)
+
+        async def operation(connection: object) -> str:
+            if connection is first:
+                state["closed"] = True
+                raise AssertionError("AsyncSSH opened a session on a closed connection")
+            return "done"
+
+        self.assertEqual(await manager.run(operation, name="op"), "done")
+        self.assertEqual(opened.await_count, 2)
+
+    async def test_an_unrelated_error_on_a_live_connection_is_raised(self) -> None:
+        live = mock.Mock(is_closed=mock.Mock(return_value=False))
+        manager, _ = self.manager(live)
+
+        async def operation(connection: object) -> str:
+            raise AssertionError("a bug, not a lost connection")
+
+        with self.assertRaises(AssertionError):
+            await manager.run(operation, name="op")
