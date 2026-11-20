@@ -709,7 +709,7 @@ class _HandleProcess(Process[T]):
 
     @property
     def returncode(self) -> int | None:
-        status = self._status
+        status = self._handle.last_status() or self._status
         if status is None or status.reason is None:
             return None
         # A process whose end nothing observed reads as killed, as before.
