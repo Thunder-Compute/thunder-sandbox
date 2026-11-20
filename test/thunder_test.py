@@ -3329,7 +3329,7 @@ else:
 
             stage = "/tmp/thunder-sandbox-transfer-transfer"
             scp.assert_awaited_once_with(
-                str(source), (connection, stage + "/"), recurse=False
+                str(source), (connection, stage + "/"), recurse=False, preserve=True
             )
             self.assertEqual(
                 [call.args for call in guest.await_args_list],
