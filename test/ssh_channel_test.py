@@ -96,6 +96,50 @@ class SupportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "started")
 
 
+class UploadModeTest(unittest.IsolatedAsyncioTestCase):
+    """Uploads keep each file's exact mode and times, as docker cp does."""
+
+    def uploading_channel(self) -> tuple[SSHChannel, mock.AsyncMock]:
+        ssh = channel()
+        connection = object()
+
+        async def run_transfer(transfer, *, name):  # noqa: ANN001
+            await transfer(connection)
+
+        ssh._retry_scp = run_transfer  # type: ignore[method-assign]
+        ssh._reset_remote_path = mock.AsyncMock()  # type: ignore[method-assign]
+        ssh._upload_target = mock.AsyncMock(return_value="/dest/file")  # type: ignore[method-assign]
+        ssh._publish = mock.AsyncMock()  # type: ignore[method-assign]
+        ssh._cleanup_remote_paths = mock.AsyncMock()  # type: ignore[method-assign]
+        ssh._run = mock.AsyncMock()  # type: ignore[method-assign]
+        return ssh, mock.AsyncMock()
+
+    async def test_every_upload_scp_preserves_modes_and_times(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "src"
+            source.mkdir()
+            (source / "file").write_text("x")
+            for options in (
+                TransferOptions(),
+                TransferOptions(recursive=True),
+                TransferOptions(recursive=True, contents_only=True),
+            ):
+                ssh, scp = self.uploading_channel()
+                path = source / "file" if not options.recursive else source
+                with self.subTest(options=options), mock.patch(
+                    "thunder_sandbox._channels._ssh_channel.asyncssh.scp", scp
+                ):
+                    await ssh.upload(UploadRequest(path, "/dest", options))
+                    self.assertTrue(scp.await_args_list)
+                    for call in scp.await_args_list:
+                        self.assertIs(call.kwargs.get("preserve"), True)
+
+    async def test_upload_times_are_always_kept(self) -> None:
+        ssh = channel()
+        with self.assertRaises(UnsupportedFeatureError):
+            await ssh.upload(UploadRequest(Path("x"), "/x", TransferOptions(preserve_times=False)))
+
+
 class CommandTest(unittest.TestCase):
     def test_command_sets_umask_then_workdir_env_and_user(self) -> None:
         command = channel()._command(ExecRequest(

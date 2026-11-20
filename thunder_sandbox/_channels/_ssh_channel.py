@@ -16,9 +16,9 @@ Behaviour this channel fixes, beyond its support table:
 - Terminating a process without a PTY sends SIGTERM to its process group and
   SIGKILL 5 seconds later if it is still running. A PTY process gets one
   SIGTERM through its SSH session, with no SIGKILL.
-- Uploads land owned by root:root, with the source's permission bits masked
-  by the login umask (normally 0o022) and the time of the transfer as their
-  modification time. Downloads keep modification times.
+- Uploads land owned by root:root, with the source's exact permission bits
+  and modification times, as ``docker cp`` keeps them. Downloads keep
+  modification times.
 """
 
 from __future__ import annotations
@@ -185,7 +185,7 @@ class SSHChannel(ExecutionChannel):
         "options.contents_only": SUPPORTED,
         "options.on_conflict": Fixed(ConflictPolicy.MERGE),
         "options.create_parents": Fixed(False),
-        "options.preserve_times": Fixed(False),
+        "options.preserve_times": Fixed(True),
         "options.symlinks": Fixed(SymlinkPolicy.FOLLOW),
         "options.timeout_ms": SUPPORTED,
         "owner.user": Unsupported("uploads are owned by root:root"),
@@ -591,7 +591,10 @@ class SSHChannel(ExecutionChannel):
             async def transfer(connection: asyncssh.SSHClientConnection) -> None:
                 await self._reset_remote_path(connection, stage)
                 await asyncssh.scp(
-                    os.fspath(source_path), (connection, stage), recurse=options.recursive
+                    os.fspath(source_path),
+                    (connection, stage),
+                    recurse=options.recursive,
+                    preserve=True,
                 )
 
             await self._retry_scp(transfer, name=f"upload {source_name} to sandbox {self._sandbox_id}")
@@ -617,7 +620,9 @@ class SSHChannel(ExecutionChannel):
             async def transfer(connection: asyncssh.SSHClientConnection) -> None:
                 await self._reset_remote_path(connection, stage, directory=True)
                 for child in source_directory.iterdir():
-                    await asyncssh.scp(os.fspath(child), (connection, stage + "/"), recurse=True)
+                    await asyncssh.scp(
+                        os.fspath(child), (connection, stage + "/"), recurse=True, preserve=True
+                    )
 
             await self._retry_scp(
                 transfer, name=f"upload directory contents to sandbox {self._sandbox_id}"
