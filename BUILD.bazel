@@ -41,3 +41,21 @@ py_test(
     ],
     deps = [":thunder_client"],
 )
+
+py_test(
+    name = "ssh_channel_test",
+    srcs = [
+        "test/__init__.py",
+        "test/ssh_channel_test.py",
+    ],
+    deps = [":thunder_client"],
+)
+
+py_test(
+    name = "client_auth_test",
+    srcs = [
+        "test/__init__.py",
+        "test/client_auth_test.py",
+    ],
+    deps = [":thunder_client"],
+)
