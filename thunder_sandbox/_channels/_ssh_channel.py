@@ -12,7 +12,8 @@ Behaviour this channel fixes, beyond its support table:
   ``SHELL`` and the ``SSH_*`` variables. With an ``identity``, ``HOME``,
   ``USER`` and ``LOGNAME`` become that user's.
 - A command given by bare name is looked up in that environment's ``PATH``.
-- It runs with umask 0o022, with or without a PTY.
+- It runs with the umask of the SSH session that starts it, 0o022 for root
+  on a VM sandbox, with or without a PTY.
 - Terminating a process without a PTY sends SIGTERM to its process group and
   SIGKILL 5 seconds later if it is still running. A PTY process gets one
   SIGTERM through its SSH session, with no SIGKILL.
@@ -114,7 +115,6 @@ STATUS_MAX_DELAY_SECONDS = 1.0
 TERMINATION_GRACE_SECONDS = 5.0
 # How long one poll keeps retrying a lost status read before it gives up.
 POLL_RETRY_SECONDS = 5.0
-COMMAND_UMASK = 0o022
 # sshd serves at most MaxSessions (10 by default) sessions on one connection
 # and drops the connection when more are opened, so every operation would
 # reconnect and hit the limit again. Each session takes a slot instead.
@@ -171,7 +171,9 @@ class SSHChannel(ExecutionChannel):
         "unset_env": SUPPORTED,
         "identity.user": SUPPORTED,
         "identity.group": SUPPORTED,
-        "umask": Fixed(COMMAND_UMASK),
+        "umask": Unsupported(
+            "commands get the SSH session's umask, 0o022 for root on a VM sandbox"
+        ),
         "stdout": SUPPORTED,
         "stderr": SUPPORTED,
         "pty": SUPPORTED,
@@ -361,9 +363,10 @@ class SSHChannel(ExecutionChannel):
         )
         if request.working_dir is None:
             command = _VM_IMAGE_WORKDIR + command
-        # The job launcher keeps its own files private with umask 077; the
-        # command itself gets the usual 022 instead of inheriting that.
-        return f"umask {COMMAND_UMASK:04o}; " + command
+        # A durable job's launcher keeps 077 for its own files and gives the
+        # command the umask of the session that submitted it, as a PTY
+        # command gets its session's directly.
+        return command
 
     async def _exec(self, request: ExecRequest) -> ExecHandle:
         if request.pty:

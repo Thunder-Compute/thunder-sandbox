@@ -2915,15 +2915,16 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('"container":null', submitted)
                 self.assertIn("/var/tmp/thunder-sandbox/jobs/", submitted)
                 self.assertIn("exec setpriv", submitted)
-                self.assertIn("umask 0022; cd /workspace", submitted)
+                self.assertIn("cd /workspace", submitted)
+                self.assertNotIn("umask 0022;", submitted)
                 self.assertNotIn("/run/thunder_seed/vmroot/workdir", submitted)
                 await sandbox.exec("id", user="agent", pty=True)
                 command = connection.create_process.await_args.args[0]
                 # Without a workdir it starts in the image's, as docker exec does.
                 self.assertTrue(command.startswith(
-                    "umask 0022; __thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
+                    "__thunder_workdir=$(cat /run/thunder_seed/vmroot/workdir"
                 ))
-                argv = shlex.split(command.split("; ", 3)[3])
+                argv = shlex.split(command.split("; ", 2)[2])
                 self.assertEqual(argv[:2], ["sh", "-c"])
                 self.assertEqual(argv[3:], ["sh", "agent", "id"])
                 self.assertEqual(
