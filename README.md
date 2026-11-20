@@ -477,6 +477,24 @@ Some things differ from a container sandbox:
 - A command given by bare name is looked up in the image's `PATH`, with no BusyBox fallback.
 - The guest can `reboot` or `poweroff`, and a kernel panic does the same: the sandbox restarts in place with its disk, network and lifetime. A command that was running when it restarted ends with exit code 137, and its output from the last moments before the restart may be missing.
 
+## Timing-sensitive sandboxes
+
+A timing-sensitive sandbox runs the image's container in gVisor on the sandbox node instead of in a Thunder VM. Its GPUs are the node's physical GPUs, reserved for the sandbox and passed through, rather than virtualized, so GPU timing and behaviour match bare metal. Ask for one with `timing_sensitive`:
+
+```python
+sandbox = thunder.Sandbox.create(
+    image=thunder.Image.from_dockerfile("./agent-image"),
+    gpu_type=thunder.GPUType.A6000,
+    gpu_count=1,
+    timing_sensitive=True,
+    timeout=900,
+)
+```
+
+It needs `image` and cannot be combined with `vm`. Where Thunder does not offer timing-sensitive sandboxes, the API refuses the request.
+
+There is no VM between SSH and the container, so `sandbox.vm` is true and commands and file transfers reach the container directly over SSH as `root`, as in a VM sandbox. A command runs with the image's `ENV` and starts in the image's `WORKDIR`, and a command given by bare name is looked up in the image's `PATH`; if the image lacks a tool the SDK needs, a BusyBox-based one is found last on `PATH`. Durable and PTY commands, `user`, uploads and downloads, network policies, lifetimes and queueing work as in a container sandbox. `nvidia-smi` and the driver libraries are provided by the node.
+
 ## Configuration
 
 Configuration is resolved from the following sources:
