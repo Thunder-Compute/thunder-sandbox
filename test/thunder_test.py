@@ -354,6 +354,41 @@ class DurableJobProtocolTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.returncode, 0)
 
     @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
+    async def test_launcher_runs_the_payload_with_the_submitting_sessions_umask(
+        self,
+    ) -> None:
+        # The wrapper's 077 used to reach the command on the direct path, so a
+        # root `mkdir -p /logs/agent` left /logs unusable by any other user.
+        for recorded, expected in (("0022", "0022"), ("0002", "0002"), (None, "0077")):
+            with self.subTest(recorded=recorded), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                job_id = "9" * 32
+                paths = RemoteJobPaths(job_id, root=PurePosixPath(directory))
+                Path(paths.directory).mkdir(mode=0o700)
+                spec = JobSpec(job_id, ("sh", "-c", "umask"))
+                Path(paths.launcher).write_text(
+                    launcher_script("umask", paths, spec), encoding="utf-8"
+                )
+                Path(paths.status).write_text(
+                    JobStatus(JobState.PREPARED).to_json(), encoding="utf-8"
+                )
+                if recorded is not None:
+                    Path(paths.umask).write_text(recorded + "\n", encoding="utf-8")
+
+                process = await asyncio.create_subprocess_exec(
+                    "sh",
+                    str(paths.launcher),
+                    env=self.launcher_environment(root),
+                )
+                self.assertEqual(await process.wait(), 0)
+
+                self.assertEqual(
+                    Path(paths.stdout).read_text(encoding="utf-8").strip(), expected
+                )
+                # The wrapper's own records stay private.
+                self.assertEqual(Path(paths.status).stat().st_mode & 0o077, 0)
+
+    @unittest.skipUnless(os.name == "posix", "executes remote POSIX shell scripts locally")
     async def test_launcher_redirects_output_and_records_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
