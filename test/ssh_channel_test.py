@@ -27,6 +27,7 @@ from thunder_sandbox._channels._spec import (
     UploadRequest,
 )
 from thunder_sandbox._channels._ssh_channel import (
+    SESSION_SLOTS,
     SSHChannel,
     _AttachedHandle,
     _exec_status,
@@ -582,3 +583,84 @@ class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AssertionError):
             await manager.run(operation, name="op")
+
+
+def _pty_process() -> mock.Mock:
+    process = mock.Mock(exit_status=0, exit_signal=None)
+    process.wait_closed = mock.AsyncMock()
+    process.stdout = mock.Mock(read=mock.AsyncMock(return_value=b""))
+    process.stderr = mock.Mock(read=mock.AsyncMock(return_value=b""))
+    return process
+
+
+class AttachedStartTest(unittest.IsolatedAsyncioTestCase):
+    """A PTY open uses the shared connection the way every other session does."""
+
+    def channel(self, *connections: object) -> tuple[SSHChannel, mock.AsyncMock]:
+        ssh = channel()
+        opened = mock.AsyncMock(side_effect=list(connections))
+        ssh._manager = SSHConnectionManager(
+            opened, sleep=mock.AsyncMock(), jitter=lambda _start, _end: 0.0
+        )
+        return ssh, opened
+
+    async def test_a_refused_pty_session_keeps_the_connection_and_retries(self) -> None:
+        import asyncssh
+
+        live = mock.Mock(is_closed=mock.Mock(return_value=False))
+        process = _pty_process()
+        attempts = 0
+
+        async def create_process(*_args: object, **_kwargs: object) -> mock.Mock:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_RESOURCE_SHORTAGE, "too many sessions"
+                )
+            return process
+
+        live.create_process = create_process
+        ssh, opened = self.channel(live)
+        handle = await ssh.exec(ExecRequest(EXEC_ID, "sh", pty=True))
+        self.assertEqual(await handle.wait(), ExecStatus(
+            EXEC_ID, ExecState.ENDED, reason=ExitReason.EXITED, returncode=0
+        ))
+        self.assertEqual(attempts, 2)
+        self.assertEqual(opened.await_count, 1)
+        live.close.assert_not_called()
+        self.assertIs(ssh._manager._connection, live)
+
+    async def test_a_dropped_connection_during_pty_start_reconnects(self) -> None:
+        state = {"closed": False}
+        first = mock.Mock(is_closed=mock.Mock(side_effect=lambda: state["closed"]))
+        second = mock.Mock(is_closed=mock.Mock(return_value=False))
+        process = _pty_process()
+
+        async def lose(*_args: object, **_kwargs: object) -> None:
+            state["closed"] = True
+            raise OSError("lost after PTY request")
+
+        first.create_process = lose
+        second.create_process = mock.AsyncMock(return_value=process)
+        ssh, opened = self.channel(first, second)
+        handle = await ssh.exec(ExecRequest(EXEC_ID, "sh", pty=True))
+        self.assertEqual((await handle.wait()).returncode, 0)
+        self.assertEqual(opened.await_count, 2)
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        self.assertIs(ssh._manager._connection, second)
+
+    async def test_a_pty_open_that_fails_releases_its_slot(self) -> None:
+        live = mock.Mock(is_closed=mock.Mock(return_value=False))
+
+        async def create_process(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("a bug, not a lost connection")
+
+        live.create_process = create_process
+        ssh, _opened = self.channel(live)
+        with self.assertRaises(RuntimeError):
+            await ssh.exec(ExecRequest(EXEC_ID, "sh", pty=True))
+        for _slot in range(SESSION_SLOTS):
+            await asyncio.wait_for(ssh._slots.acquire(), timeout=1)
+        live.close.assert_not_called()

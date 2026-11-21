@@ -375,15 +375,27 @@ class SSHChannel(ExecutionChannel):
 
     async def _start_attached(self, request: ExecRequest) -> ExecHandle:
         # A PTY process holds its session, and so its slot, for its whole life.
+        # Open it through the connection manager, like every other session. A
+        # refusal is one session's failure: the shared connection stays up and
+        # the open is tried again. A dropped connection is replaced and the open
+        # is tried again. Discarding the connection on the refusal would end
+        # every other session using it.
         await self._slots.acquire()
+        command = self._command(request)
+
+        async def open_session(
+            connection: asyncssh.SSHClientConnection,
+        ) -> asyncssh.SSHClientProcess[bytes]:
+            return await connection.create_process(command, encoding=None, term_type="xterm")
+
         try:
-            connection = await self._connect()
             try:
-                process = await connection.create_process(
-                    self._command(request), encoding=None, term_type="xterm"
+                process = await self._manager.run(
+                    open_session,
+                    name=f"sandbox {self._sandbox_id} PTY session",
+                    deadline=self._deadline(),
                 )
             except (OSError, asyncssh.Error) as exc:
-                await self._manager.discard(connection)
                 raise ConnectionError(f"could not open a sandbox SSH session: {exc}") from exc
         except BaseException:
             self._slots.release()

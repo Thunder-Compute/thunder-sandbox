@@ -226,13 +226,22 @@ class Client:
         attempt_timeout = timeout
         renewed_token = False
         for delay in (*CONNECTION_RETRY_DELAYS, None):
+            # Same task until the await below, so this is the token the attempt
+            # presents. A sibling may adopt a renewed token while this one is
+            # in flight; reload_cli_token then reports no change of its own.
+            token_sent = self.config.api_token
             try:
                 payload = await self._send(method, path, body, query, attempt_timeout)
                 break
             except AuthenticationError as exc:
                 # The API refused the request before acting on it, so sending
                 # it again with the CLI's renewed token is safe for any method.
-                if exc.status != 401 or renewed_token or not self.config.reload_cli_token():
+                # Retry when the token now in place is not the one just refused,
+                # including when another request already loaded it.
+                if exc.status != 401 or renewed_token:
+                    raise
+                self.config.reload_cli_token()
+                if not self.config.api_token or self.config.api_token == token_sent:
                     raise
                 renewed_token = True
                 try:

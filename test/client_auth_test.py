@@ -43,6 +43,27 @@ class CLITokenRenewalTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sent, ["old", "new"])
             await client.close()
 
+    async def test_a_401_retries_when_another_request_already_adopted_the_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = cli_config(directory, "old")
+            client = Client(config)
+            sent: list[str] = []
+
+            async def send(*_args: object) -> bytes:
+                sent.append(config.api_token or "")
+                if config.api_token == "old":
+                    # Presented "old". A sibling then adopted the token the CLI
+                    # wrote, before this handler reloads the file.
+                    config.paths.credentials.write_text(json.dumps({"token": "new"}))
+                    config.api_token = "new"
+                    raise expired()
+                return b"{}"
+
+            client._send = send  # type: ignore[method-assign]
+            self.assertEqual(await client._request("GET", "/sandboxes"), {})
+            self.assertEqual(sent, ["old", "new"])
+            await client.close()
+
     async def test_an_unchanged_or_explicit_token_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = cli_config(directory, "same")
