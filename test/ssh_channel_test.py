@@ -30,6 +30,8 @@ from thunder_sandbox._channels._spec import (
 )
 from thunder_sandbox._channels._ssh_channel import (
     SSHChannel,
+    SSHDockerChannel,
+    SSHHostChannel,
     _AttachedHandle,
     _exec_status,
     _JobHandle,
@@ -102,8 +104,8 @@ class SupportTest(unittest.IsolatedAsyncioTestCase):
 class UploadModeTest(unittest.IsolatedAsyncioTestCase):
     """Uploads keep each file's exact mode and times, as docker cp does."""
 
-    def uploading_channel(self) -> tuple[SSHChannel, mock.AsyncMock]:
-        ssh = channel()
+    def uploading_channel(self, kind: type = SSHChannel) -> tuple[SSHChannel, mock.AsyncMock]:
+        ssh = kind(mock.Mock(), info)
         connection = object()
 
         async def run_transfer(transfer, *, name):  # noqa: ANN001
@@ -115,6 +117,7 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
         ssh._publish = mock.AsyncMock()  # type: ignore[method-assign]
         ssh._cleanup_remote_paths = mock.AsyncMock()  # type: ignore[method-assign]
         ssh._run = mock.AsyncMock()  # type: ignore[method-assign]
+        ssh._run_guest = mock.AsyncMock()  # type: ignore[attr-defined]
         return ssh, mock.AsyncMock()
 
     async def test_every_upload_scp_preserves_modes_and_times(self) -> None:
@@ -122,14 +125,19 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
             source = Path(directory) / "src"
             source.mkdir()
             (source / "file").write_text("x")
-            for options in (
-                TransferOptions(),
-                TransferOptions(recursive=True),
-                TransferOptions(recursive=True, contents_only=True),
-            ):
-                ssh, scp = self.uploading_channel()
+            cases = [
+                (kind, options)
+                for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel)
+                for options in (
+                    TransferOptions(),
+                    TransferOptions(recursive=True),
+                    TransferOptions(recursive=True, contents_only=True),
+                )
+            ]
+            for kind, options in cases:
+                ssh, scp = self.uploading_channel(kind)
                 path = source / "file" if not options.recursive else source
-                with self.subTest(options=options), mock.patch(
+                with self.subTest(kind=kind.__name__, options=options), mock.patch(
                     "thunder_sandbox._channels._ssh_channel.asyncssh.scp", scp
                 ):
                     await ssh.upload(UploadRequest(path, "/dest", options))
@@ -162,9 +170,11 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_upload_source(".."), (Path(".."), False))
 
     async def test_upload_times_are_always_kept(self) -> None:
-        ssh = channel()
-        with self.assertRaises(UnsupportedFeatureError):
-            await ssh.upload(UploadRequest(Path("x"), "/x", TransferOptions(preserve_times=False)))
+        for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel):
+            with self.subTest(kind=kind.__name__), self.assertRaises(UnsupportedFeatureError):
+                await kind(mock.Mock(), info).upload(
+                    UploadRequest(Path("x"), "/x", TransferOptions(preserve_times=False))
+                )
 
 
 class CommandTest(unittest.TestCase):
