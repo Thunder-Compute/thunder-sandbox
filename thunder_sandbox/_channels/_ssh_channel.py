@@ -916,12 +916,11 @@ class SSHDockerChannel(_SSHChannelBase):
             raise InvalidRequestError(f"upload source does not exist: {source_path}")
         if source_path.is_dir() and not options.recursive:
             raise InvalidRequestError("uploading a directory requires recursive=True")
+        if options.contents_only and not source_path.is_dir():
+            raise InvalidRequestError("a contents-only upload needs a directory source")
         stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
         try:
             if options.contents_only:
-                if not source_path.is_dir():
-                    raise InvalidRequestError("a contents-only upload needs a directory source")
-
                 async def transfer_contents(connection: asyncssh.SSHClientConnection) -> None:
                     await self._reset_remote_path(connection, stage, directory=True)
                     for child in source_path.iterdir():
