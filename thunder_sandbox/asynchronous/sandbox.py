@@ -57,7 +57,7 @@ from .._common.types import (
     SSHProxyJump,
 )
 from ..image import Image
-from ._jobs import new_job_id, validate_job_id
+from ._jobs import new_job_id
 from ._remote import _remember_host_key
 from ._transfer import parse_transfer_path as _parse_transfer_path
 from .client import Client
@@ -509,18 +509,6 @@ class Sandbox:
 
         handle = await self._channel().attach(process_id)
         return Process.from_handle(handle, timeout=None, text=text, durable=True)
-
-        try:
-            validate_job_id(process_id)
-        except ValueError as exc:
-            raise InvalidRequestError(str(exc)) from exc
-        spec = await self._read_job_spec(
-            process_id, deadline=self._ssh_deadline()
-        )
-        status = await self._read_job_status(process_id, deadline=self._ssh_deadline())
-        return self._durable_process(
-            spec, status=status, timeout=None, text=text
-        )
 
     async def upload(
         self,
