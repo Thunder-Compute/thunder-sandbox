@@ -41,6 +41,12 @@ def is_transient_ssh_error(error: BaseException) -> bool:
     return isinstance(error, (OSError, asyncssh.Error, RetryableSSHOperationError))
 
 
+def _session_failure(error: BaseException) -> bool:
+    """Whether ``error`` was one session's failure on a connection still fit for others."""
+
+    return isinstance(error, (asyncssh.ChannelOpenError, RetryableSSHOperationError))
+
+
 class JumpSSHClient(asyncssh.SSHClient):
     """Close the dedicated jump transport when its guest connection ends."""
 
@@ -135,9 +141,16 @@ class SSHConnectionManager:
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
-                if not is_transient_ssh_error(exc):
+                # Whatever failed on a connection that has just closed failed
+                # because it closed; AsyncSSH can then raise even AssertionError
+                # from a session it was still opening.
+                closed = connection is not None and connection.is_closed()
+                if not (closed or is_transient_ssh_error(exc)):
                     raise
-                if connection is not None:
+                # The connection is shared, so it is replaced only when it is
+                # broken: dropping it for one session's failure would fail
+                # every other operation in flight on it too.
+                if connection is not None and (closed or not _session_failure(exc)):
                     await self.discard(connection)
                 now = self._clock()
                 if (

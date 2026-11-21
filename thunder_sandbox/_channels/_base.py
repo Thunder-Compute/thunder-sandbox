@@ -81,7 +81,8 @@ class ExecHandle(abc.ABC):
         and every byte has been delivered. A reconnectable process's stream
         survives a lost connection with no gaps or duplicates. A stream the
         request discarded ends at once. Each handle's
-        stream can be iterated once; a second call raises ``RuntimeError``.
+        stream can be iterated once; a second call raises ``RuntimeError``. A step
+        that raises can be retried: the stream resumes where it was.
         """
 
     @abc.abstractmethod
@@ -98,6 +99,10 @@ class ExecHandle(abc.ABC):
     @abc.abstractmethod
     async def close_stdin(self) -> None:
         """Send end of file on stdin."""
+
+    def last_status(self) -> ExecStatus | None:
+        """The most recent status observed, without asking the sandbox."""
+        return None
 
     @abc.abstractmethod
     async def poll(self) -> ExecStatus:
