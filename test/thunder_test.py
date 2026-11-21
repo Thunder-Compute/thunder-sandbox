@@ -44,6 +44,8 @@ from thunder_sandbox._common.types import GPUType, SandboxStatus
 from thunder_sandbox.asynchronous.client import USER_AGENT, _api_error
 from thunder_sandbox.asynchronous.client import Client as AsyncClient
 from thunder_sandbox.asynchronous.process import Process as AsyncProcess
+from thunder_sandbox._channels._ssh_channel import OUTPUT_READ_BYTES, _AttachedHandle, _JobHandle
+from thunder_sandbox._channels._spec import ExecRequest
 from thunder_sandbox.asynchronous._jobs import (
     JOB_PROTOCOL_VERSION,
     JobSpec,
@@ -82,6 +84,69 @@ from thunder_sandbox.synchronous.client import Client
 from thunder_sandbox.synchronous.process import Process
 from thunder_sandbox.synchronous.sandbox import Sandbox
 from test.ssh_faults import FakeSSHConnection, SSHDisconnected, SSHFaults, disconnect
+
+class _ClosureChannel:
+    """The channel calls a job handle makes, answered by a test's closures."""
+
+    def __init__(self, read_status, read_output, cleanup_job, signal_job) -> None:  # type: ignore[no-untyped-def]
+        self.read_status = read_status
+        self.read_output = read_output
+        self.cleanup_job = cleanup_job
+        self.signal_job = signal_job
+
+    async def _read_status(self, job_id: str, *, deadline: float | None) -> JobStatus:
+        return await self.read_status(deadline)
+
+    async def _read_output(self, job_id: str, stream: str, offset: int) -> bytes:
+        return await self.read_output(stream, offset, OUTPUT_READ_BYTES)
+
+    async def _signal(self, job_id: str, signal: str, pid: int, container: str | None) -> JobStatus:
+        return await self.signal_job(signal, pid)
+
+    async def _cleanup(self, job_id: str, container: str | None) -> None:
+        await self.cleanup_job()
+
+    def _deadline(self) -> None:
+        return None
+
+
+def durable_process(  # type: ignore[no-untyped-def]
+    job_id, *, status, read_status, read_output, cleanup_job, signal_job, timeout, text,
+    stdout="capture", stderr="capture", retain=False,
+):
+    """A durable process whose channel calls are the given closures."""
+    spec = JobSpec(job_id, ("true",), stdout=stdout, stderr=stderr, retain=retain)
+    channel = _ClosureChannel(read_status, read_output, cleanup_job, signal_job)
+    handle = _JobHandle(channel, spec, status)  # type: ignore[arg-type]
+    return AsyncProcess.from_handle(handle, timeout=timeout, text=text, durable=True)
+
+
+def attached_process(raw, *, text: bool = True):  # type: ignore[no-untyped-def]
+    """A PTY process over an asyncssh-like process."""
+    return AsyncProcess.from_handle(
+        _AttachedHandle("0" * 32, raw), timeout=None, text=text, durable=False
+    )
+
+
+async def launch_job(  # type: ignore[no-untyped-def]
+    sandbox, args, *, workdir=None, env=None, user=None
+):
+    """Submit a durable job through the sandbox's channel: its spec and acknowledgement."""
+    from thunder_sandbox.asynchronous import sandbox as sandbox_module
+
+    env = dict(env or {})
+    request = ExecRequest(
+        sandbox_module.new_job_id(),
+        args[0],
+        tuple(args[1:]),
+        working_dir=workdir,
+        env={key: value for key, value in env.items() if value is not None},
+        unset_env=tuple(key for key, value in env.items() if value is None),
+        identity=sandbox_module._identity(user),
+    )
+    handle = await sandbox._channel()._start_job(request)
+    return handle._spec, handle._status
+
 
 SANDBOX_RESPONSE = {
     "id": "sbx-test",
@@ -735,7 +800,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
             deadlines.append(deadline)
             return next(statuses)
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "4" * 32,
             status=JobStatus(JobState.STARTING, pid=101),
             read_status=read_status,
@@ -768,7 +833,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
 
         cleanup = mock.AsyncMock()
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "5" * 32,
             status=JobStatus(JobState.SUCCEEDED, pid=202, returncode=0),
             read_status=read_status,
@@ -800,7 +865,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
             values["stdout"] = b"final output line\n"
             return JobStatus(JobState.SUCCEEDED, pid=202, returncode=0)
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "9" * 32,
             status=JobStatus(JobState.RUNNING, pid=202),
             read_status=read_status,
@@ -829,7 +894,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
             width = widths.get(offset, 3)
             return value[offset : offset + width]
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "a" * 32,
             status=JobStatus(JobState.SUCCEEDED, pid=202, returncode=0),
             read_status=mock.AsyncMock(),
@@ -848,7 +913,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
     async def test_discarded_stream_is_empty_and_does_not_touch_remote_file(self) -> None:
         read_output = mock.AsyncMock(side_effect=AssertionError("must not read"))
         cleanup = mock.AsyncMock()
-        process = AsyncProcess.durable(
+        process = durable_process(
             "b" * 32,
             status=JobStatus(JobState.SUCCEEDED, pid=202, returncode=0),
             read_status=mock.AsyncMock(),
@@ -869,7 +934,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_retain_suppresses_automatic_cleanup(self) -> None:
         cleanup = mock.AsyncMock()
-        process = AsyncProcess.durable(
+        process = durable_process(
             "c" * 32,
             status=JobStatus(JobState.SUCCEEDED, pid=202, returncode=0),
             read_status=mock.AsyncMock(),
@@ -892,7 +957,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
         async def read_status(_deadline: float | None) -> JobStatus:
             return JobStatus(JobState.RUNNING, pid=303)
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "6" * 32,
             status=JobStatus(JobState.RUNNING, pid=303),
             read_status=read_status,
@@ -914,7 +979,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
         signal = mock.AsyncMock(
             return_value=JobStatus(JobState.TERMINATED, pid=303, returncode=143)
         )
-        process = AsyncProcess.durable(
+        process = durable_process(
             "6" * 32,
             status=JobStatus(JobState.RUNNING, pid=303),
             read_status=mock.AsyncMock(),
@@ -938,7 +1003,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
                 JobStatus(JobState.TERMINATED, pid=404, returncode=137),
             ]
         )
-        process = AsyncProcess.durable(
+        process = durable_process(
             "d" * 32,
             status=JobStatus(JobState.RUNNING, pid=404),
             read_status=mock.AsyncMock(),
@@ -950,7 +1015,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch(
-            "thunder_sandbox.asynchronous.process.PROCESS_TERMINATION_GRACE_SECONDS",
+            "thunder_sandbox._channels._ssh_channel.TERMINATION_GRACE_SECONDS",
             0.0,
         ):
             await process.terminate()
@@ -965,7 +1030,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
         signal = mock.AsyncMock(
             return_value=JobStatus(JobState.TERMINATED, pid=505, returncode=143)
         )
-        process = AsyncProcess.durable(
+        process = durable_process(
             "e" * 32,
             status=JobStatus(JobState.RUNNING, pid=505),
             read_status=mock.AsyncMock(),
@@ -988,7 +1053,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
             calls += 1
             return JobStatus(JobState.RUNNING, pid=404)
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "7" * 32,
             status=JobStatus(JobState.RUNNING, pid=404),
             read_status=read_status,
@@ -1013,7 +1078,7 @@ class DurableProcessTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             return JobStatus(JobState.SUCCEEDED, pid=505, returncode=0)
 
-        process = AsyncProcess.durable(
+        process = durable_process(
             "8" * 32,
             status=JobStatus(JobState.RUNNING, pid=505),
             read_status=read_status,
@@ -2304,7 +2369,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 new=mock.AsyncMock(return_value=connection),
             ) as connect:
                 self.assertIs(
-                    await sandbox._open(sandbox.ssh, credential, None), connection
+                    await sandbox._channel()._open(sandbox.ssh, credential, None), connection
                 )
 
             self.assertEqual(
@@ -2350,13 +2415,13 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             stderr = mock.Mock()
             stderr.read = mock.AsyncMock(return_value=b"")
             process = mock.Mock(
-                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=0
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr,
+                exit_status=0, exit_signal=None
             )
             process.wait_closed = mock.AsyncMock()
             connection = mock.Mock()
             connection.create_process = mock.AsyncMock(return_value=process)
-            with mock.patch.object(
-                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            with mock.patch.object(sandbox._channel(), "_connect", new=mock.AsyncMock(return_value=connection)
             ):
                 remote = await sandbox.exec("echo", "hello", text=False, pty=True)
                 self.assertFalse(remote.is_durable)
@@ -2373,7 +2438,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             connection.create_process = mock.AsyncMock(  # type: ignore[attr-defined]
                 side_effect=SSHDisconnected("lost after PTY request")
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
 
             with self.assertRaisesRegex(ConnectionError, "open a sandbox SSH session"):
                 await sandbox.exec("interactive-command", pty=True)
@@ -2386,7 +2451,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             connect = mock.AsyncMock()
-            with mock.patch.object(sandbox, "_connect", new=connect):
+            with mock.patch.object(sandbox._channel(), "_connect", new=connect):
                 for options in (
                     {"stdout": "discard"},
                     {"stderr": "discard"},
@@ -2407,14 +2472,15 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             stderr = mock.Mock(read=mock.AsyncMock(return_value=b""))
             process = mock.Mock(
-                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=None
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr,
+                exit_status=None, exit_signal=None
             )
             process.wait_closed = mock.AsyncMock()
             connection = FakeSSHConnection()
             connection.create_process = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=process
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
 
             remote = await sandbox.exec("interactive-command", text=False, pty=True)
             with self.assertRaisesRegex(ConnectionError, "remote state is unknown"):
@@ -2429,14 +2495,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             sandbox, client = self.sandbox(directory)
             status = JobStatus(JobState.RUNNING, pid=123)
             spec = JobSpec("8" * 32, ("python", "train.py"))
-            durable = mock.Mock()
+            channel = sandbox._channel()
+            handle = _JobHandle(channel, spec, status)
             with mock.patch.object(
-                sandbox,
-                "_launch_detached_job",
-                new=mock.AsyncMock(return_value=(spec, status)),
-            ) as launch, mock.patch.object(
-                sandbox, "_durable_process", return_value=durable
-            ) as process:
+                channel, "_start_job", new=mock.AsyncMock(return_value=handle)
+            ) as launch:
                 result = await sandbox.exec(
                     "python",
                     "train.py",
@@ -2445,19 +2508,18 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     timeout=600,
                 )
 
-            self.assertIs(result, durable)
-            launch.assert_awaited_once_with(
-                ("python", "train.py"),
-                workdir="/workspace",
-                env={"MODEL": "large"},
-                user=None,
-                stdout="capture",
-                stderr="capture",
-                retain=False,
+            self.assertTrue(result.is_durable)
+            self.assertEqual(result.id, "8" * 32)
+            self.assertIs(result._handle, handle)
+            self.assertEqual(result._timeout, 600)
+            request = launch.await_args.args[0]
+            self.assertEqual(
+                (request.executable, request.args, request.working_dir, dict(request.env)),
+                ("python", ("train.py",), "/workspace", {"MODEL": "large"}),
             )
-            process.assert_called_once_with(
-                spec, status=status, timeout=600, text=True
-            )
+            self.assertIsNone(request.identity)
+            self.assertEqual((request.stdout.value, request.stderr.value), ("capture", "capture"))
+            self.assertIsNone(request.retention)
             await client.close()
 
     async def test_get_process_recovers_a_durable_job(self) -> None:
@@ -2465,10 +2527,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             sandbox, client = self.sandbox(directory)
             status = JobStatus(JobState.FAILED, pid=456, returncode=9)
             spec = JobSpec("9" * 32, ("false",), retain=True)
-            with mock.patch.object(
-                sandbox, "_read_job_status", new=mock.AsyncMock(return_value=status)
-            ) as read_status, mock.patch.object(
-                sandbox, "_read_job_spec", new=mock.AsyncMock(return_value=spec)
+            with mock.patch.object(sandbox._channel(), "_read_status", new=mock.AsyncMock(return_value=status)
+            ) as read_status, mock.patch.object(sandbox._channel(), "_read_spec", new=mock.AsyncMock(return_value=spec)
             ) as read_spec:
                 process = await sandbox.get_process("9" * 32, text=False)
 
@@ -2499,21 +2559,19 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             second.run = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=mock.Mock(returncode=0, stdout=b"resumed")
             )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
 
-            value = await sandbox._read_job_output(
-                "d" * 32, "stdout", offset=8192, size=4096
-            )
+            value = await sandbox._channel()._read_output("d" * 32, "stdout", 8192)
 
             self.assertEqual(value, b"resumed")
             for connection in (first, second):
                 command = connection.run.await_args.args[0]  # type: ignore[attr-defined]
-                self.assertIn("skip=8192 count=4096", command)
+                self.assertIn(f"skip=8192 count={OUTPUT_READ_BYTES}", command)
             await client.close()
 
     async def test_output_read_reports_a_missing_file(self) -> None:
@@ -2523,9 +2581,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             connection.run = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=mock.Mock(returncode=1, stdout=b"")
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             with self.assertRaisesRegex(SandboxFailedError, "unavailable"):
-                await sandbox._read_job_output("d" * 32, "stderr", offset=0, size=16)
+                await sandbox._channel()._read_output("d" * 32, "stderr", 0)
             await client.close()
 
     async def test_exec_rejects_an_argument_linux_cannot_accept(self) -> None:
@@ -2545,8 +2603,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             connection = FakeSSHConnection()
             connection.run = mock.AsyncMock(return_value=result)  # type: ignore[attr-defined]
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
-            await sandbox._launch_detached_job(
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
+            await launch_job(sandbox, 
                 ("echo", "x" * 125_000), workdir=None, env=None
             )
             call = connection.run.await_args  # type: ignore[attr-defined]
@@ -2558,12 +2616,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             connection = FakeSSHConnection()
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             transfer = mock.AsyncMock(
                 side_effect=asyncssh.SFTPFileIsADirectory("scp failed")
             )
             with self.assertRaisesRegex(SandboxFailedError, "scp failed"):
-                await sandbox._retry_scp(transfer, name="transfer")
+                await sandbox._channel()._retry_scp(transfer, name="transfer")
             transfer.assert_awaited_once()
             await client.close()
 
@@ -2571,7 +2629,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
             connection = FakeSSHConnection()
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=connection),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
@@ -2579,7 +2637,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             transfer = mock.AsyncMock(
                 side_effect=[asyncssh.SFTPConnectionLost("lost"), None]
             )
-            await sandbox._retry_scp(transfer, name="transfer")
+            await sandbox._channel()._retry_scp(transfer, name="transfer")
             self.assertEqual(transfer.await_count, 2)
             await client.close()
 
@@ -2645,9 +2703,11 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             async def never(*_args: object, **_kwargs: object) -> None:
                 await asyncio.Event().wait()
 
-            with mock.patch.object(sandbox, "_upload", never):
+            source = Path(directory) / "a"
+            source.write_text("a")
+            with mock.patch.object(sandbox._channel(), "_upload_now", never):
                 with self.assertRaisesRegex(SandboxTimeoutError, "did not finish"):
-                    await sandbox.upload("a", "/b", timeout=0.01)
+                    await sandbox.upload(source, "/b", timeout=0.01)
             await client.close()
 
     async def test_job_cleanup_is_idempotent_after_a_lost_acknowledgement(self) -> None:
@@ -2661,14 +2721,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             second.run = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=mock.Mock(returncode=0, stdout="", stderr="")
             )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
 
-            await sandbox._cleanup_job("e" * 32)
+            await sandbox._channel()._cleanup("e" * 32)
 
             first_command = first.run.await_args.args[0]  # type: ignore[attr-defined]
             second_command = second.run.await_args.args[0]  # type: ignore[attr-defined]
@@ -2691,14 +2751,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     returncode=0, stdout=terminated.to_json(), stderr=""
                 )
             )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
 
-            status = await sandbox._signal_job(
+            status = await sandbox._channel()._signal(
                 "f" * 32, signal="TERM", pid=4242
             )
 
@@ -2720,9 +2780,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     returncode=0, stdout=terminated.to_json(), stderr=""
                 )
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
 
-            status = await sandbox._signal_job(
+            status = await sandbox._channel()._signal(
                 "1" * 32, signal="KILL", pid=5252
             )
 
@@ -2750,9 +2810,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     returncode=0, stdout=terminated.to_json(), stderr=""
                 )
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
 
-            status = await sandbox._signal_job(
+            status = await sandbox._channel()._signal(
                 "2" * 32,
                 signal="KILL",
                 pid=6262,
@@ -2793,12 +2853,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     returncode=0, stdout=succeeded.to_json(), stderr=""
                 )
             )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
 
             process = await sandbox.get_process("a" * 32)
             self.assertEqual(await process.wait(), 0)
@@ -2818,12 +2878,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             connection = mock.Mock()
             connection.is_closed.return_value = False
             connection.run = mock.AsyncMock(return_value=result)
-            sandbox._ssh_manager._connection = connection
+            sandbox._channel()._manager._connection = connection
             with mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.new_job_id",
                 return_value="f" * 32,
             ):
-                spec, status = await sandbox._launch_detached_job(
+                spec, status = await launch_job(sandbox, 
                     ("echo", "hello"), workdir="/work dir", env={"VALUE": "a b"}
                 )
 
@@ -2851,7 +2911,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             connection = mock.Mock(run=mock.AsyncMock(return_value=result))
             connection.is_closed.return_value = False
-            sandbox._ssh_manager._connection = connection
+            sandbox._channel()._manager._connection = connection
             with mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.new_job_id",
                 return_value="1" * 32,
@@ -2903,7 +2963,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             attached.stderr.read = mock.AsyncMock(return_value=b"")
             attached.wait_closed = mock.AsyncMock()
             connection.create_process = mock.AsyncMock(return_value=attached)
-            sandbox._vm_channel()._manager._connection = connection
+            sandbox._channel()._manager._connection = connection
             try:
                 process = await sandbox.exec(
                     "python", "train.py", workdir="/workspace", user="1000:1000"
@@ -2930,8 +2990,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     connection.create_process.await_args.kwargs["term_type"], "xterm"
                 )
-                self.assertEqual(sandbox._image_path("out/x"), "/out/x")
-                self.assertEqual(sandbox._image_path("/abs"), "/abs")
+                self.assertEqual(await sandbox._absolute("out/x"), "/out/x")
+                self.assertEqual(await sandbox._absolute("/abs"), "/abs")
             finally:
                 await client.close()
 
@@ -2959,7 +3019,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
             opened = mock.AsyncMock(side_effect=[first, second])
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 opened,  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
@@ -2968,7 +3028,7 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 "thunder_sandbox.asynchronous.sandbox.new_job_id",
                 return_value="3" * 32,
             ):
-                spec, status = await sandbox._launch_detached_job(
+                spec, status = await launch_job(sandbox, 
                     ("touch", "/tmp/exactly-once"), workdir=None, env=None
                 )
 
@@ -2995,19 +3055,19 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             connection.get_server_host_key = mock.Mock(return_value="ssh-ed25519 AAAA")  # type: ignore[attr-defined]
             client._credentials.ensure = mock.AsyncMock(return_value=rejected)  # type: ignore[method-assign]
             client._credentials.renew = mock.AsyncMock(return_value=renewed)  # type: ignore[method-assign]
-            sandbox._open = mock.AsyncMock(  # type: ignore[method-assign]
+            sandbox._channel()._open = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[asyncssh.PermissionDenied("rejected"), connection]
             )
             with mock.patch(
-                "thunder_sandbox.asynchronous.sandbox._pinned_host_key",
+                "thunder_sandbox._channels._ssh_channel._pinned_host_key",
                 return_value=mock.Mock(),
             ):
-                self.assertIs(await sandbox._open_connection(), connection)
+                self.assertIs(await sandbox._channel()._open_connection(), connection)
 
             client._credentials.renew.assert_awaited_once_with(  # type: ignore[attr-defined]
                 client, rejected=rejected
             )
-            self.assertEqual(sandbox._open.await_count, 2)  # type: ignore[attr-defined]
+            self.assertEqual(sandbox._channel()._open.await_count, 2)  # type: ignore[attr-defined]
             await client.close()
 
     async def test_exec_user_validation_precedes_remote_execution(self) -> None:
@@ -3034,11 +3094,17 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 for user in ("root", "1000:1000", "agent", "name; $(touch /tmp/no)"):
+                    attached = mock.Mock(exit_status=None, exit_signal=None)
+                    attached.stdout.read = mock.AsyncMock(return_value=b"")
+                    attached.stderr.read = mock.AsyncMock(return_value=b"")
+                    attached.wait_closed = mock.AsyncMock()
+                    connection = mock.Mock()
+                    connection.create_process = mock.AsyncMock(return_value=attached)
                     with self.subTest(user=user), mock.patch.object(
-                        sandbox, "_create_process", new_callable=mock.AsyncMock
-                    ) as create:
+                        sandbox._channel(), "_connect", new=mock.AsyncMock(return_value=connection)
+                    ):
                         await sandbox.exec("id", user=user, pty=True)
-                        argv = shlex.split(create.await_args.args[0])
+                        argv = shlex.split(connection.create_process.await_args.args[0])
                         self.assertEqual(
                             argv,
                             ["sudo", "--non-interactive", "docker", "exec",
@@ -3187,13 +3253,13 @@ else:
             stdout = mock.Mock(read=mock.AsyncMock(return_value=b""))
             stderr = mock.Mock(read=mock.AsyncMock(return_value=b""))
             process = mock.Mock(
-                stdin=mock.Mock(), stdout=stdout, stderr=stderr, returncode=0
+                stdin=mock.Mock(), stdout=stdout, stderr=stderr,
+                exit_status=0, exit_signal=None
             )
             process.wait_closed = mock.AsyncMock()
             connection = mock.Mock()
             connection.create_process = mock.AsyncMock(return_value=process)
-            with mock.patch.object(
-                sandbox, "_connect", new=mock.AsyncMock(return_value=connection)
+            with mock.patch.object(sandbox._channel(), "_connect", new=mock.AsyncMock(return_value=connection)
             ):
                 remote = await sandbox.exec(
                     "echo",
@@ -3226,12 +3292,12 @@ else:
                 connection.run = mock.AsyncMock(  # type: ignore[attr-defined]
                     return_value=mock.Mock(returncode=0, stdout="", stderr="")
                 )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
             transfer_attempts = 0
 
             async def disconnected_transfer(*_args: object, **_kwargs: object) -> None:
@@ -3241,19 +3307,15 @@ else:
                     first.close()
                     raise SSHDisconnected("transfer lost")
 
-            with mock.patch.object(
-                sandbox,
-                "_resolve_remote_upload_target",
+            with mock.patch.object(sandbox._channel(), "_upload_target",
                 new=mock.AsyncMock(return_value="/workspace/model.bin"),
-            ), mock.patch.object(
-                sandbox, "_publish_remote_transfer", new=mock.AsyncMock()
-            ) as publish, mock.patch.object(
-                sandbox, "_cleanup_remote_transfer_paths", new=mock.AsyncMock()
+            ), mock.patch.object(sandbox._channel(), "_publish", new=mock.AsyncMock()
+            ) as publish, mock.patch.object(sandbox._channel(), "_cleanup_remote_paths", new=mock.AsyncMock()
             ) as cleanup, mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
                 new=mock.AsyncMock(side_effect=disconnected_transfer),
             ) as scp, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.uuid.uuid4",
+                "thunder_sandbox._channels._ssh_channel.uuid.uuid4",
                 return_value=mock.Mock(hex="retry"),
             ):
                 await sandbox.upload(source, "/workspace/model.bin")
@@ -3284,14 +3346,14 @@ else:
             second.run = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=mock.Mock(returncode=0, stdout="", stderr="")
             )
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
 
-            await sandbox._publish_remote_transfer(
+            await sandbox._channel()._publish(
                 "/workspace/.stage", "/workspace/final", "/workspace/.backup"
             )
 
@@ -3320,14 +3382,13 @@ else:
             connection.run = mock.AsyncMock(  # type: ignore[attr-defined]
                 return_value=mock.Mock(returncode=0, stdout="", stderr="")
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
-            with mock.patch.object(
-                sandbox, "_run_guest_command", new=mock.AsyncMock()
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
+            with mock.patch.object(sandbox._channel(), "_run_guest", new=mock.AsyncMock()
             ) as guest, mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
                 new=mock.AsyncMock(),
             ) as scp, mock.patch(
-                "thunder_sandbox.asynchronous.sandbox.uuid.uuid4",
+                "thunder_sandbox._channels._ssh_channel.uuid.uuid4",
                 return_value=mock.Mock(hex="transfer"),
             ):
                 await sandbox.upload(source, "/workspace/payload.txt")
@@ -3398,9 +3459,8 @@ else:
                 order.append("scp")
 
             connection.run = mock.AsyncMock(side_effect=record_run)  # type: ignore[attr-defined]
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
-            with mock.patch.object(
-                sandbox, "_run_guest_command", new=mock.AsyncMock(side_effect=record_guest)
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
+            with mock.patch.object(sandbox._channel(), "_run_guest", new=mock.AsyncMock(side_effect=record_guest)
             ) as guest, mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.asyncssh.scp",
                 new=mock.AsyncMock(side_effect=record_scp),
@@ -3676,7 +3736,7 @@ else:
         ]
         with tempfile.TemporaryDirectory() as directory:
             sandbox, client = self.sandbox(directory)
-            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
             try:
                 for (
                     name,
@@ -3759,7 +3819,7 @@ else:
                     connection.run = mock.AsyncMock(side_effect=run)
                     try:
                         with mock.patch.object(
-                            sandbox._ssh_manager, "get", new=mock.AsyncMock(return_value=connection)
+                            sandbox._channel()._manager, "get", new=mock.AsyncMock(return_value=connection)
                         ):
                             await sandbox.update_network_policy(block_network=True)
                         commands = [call.args[0] for call in connection.run.await_args_list]
@@ -3793,7 +3853,7 @@ else:
                     self.assertEqual(sandbox.info.network_policy_generation, target)
                     return mock.Mock(returncode=0)
 
-                sandbox._run_idempotent_command = mock.AsyncMock(side_effect=flush)  # type: ignore[method-assign]
+                sandbox._channel()._run = mock.AsyncMock(side_effect=flush)  # type: ignore[method-assign]
                 try:
                     with mock.patch("thunder_sandbox.asynchronous.sandbox._sleep_until_next_poll", new_callable=mock.AsyncMock) as sleep:
                         await sandbox.update_network_policy(block_network=True)
@@ -3821,14 +3881,14 @@ else:
                     return accepted
 
                 client._request = mock.AsyncMock(side_effect=request)  # type: ignore[method-assign]
-                sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+                sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
                 try:
                     await sandbox.update_network_policy(block_network=True, timeout=None)
                     client._request.assert_awaited_once()
                     self.assertEqual(sandbox.info.network_policy.internet_access, "closed")
                     self.assertIsNone(sandbox.info.desired_network_policy_generation)
                     self.assertIsNone(sandbox.info.network_policy_generation)
-                    sandbox._run_idempotent_command.assert_awaited_once()
+                    sandbox._channel()._run.assert_awaited_once()
                 finally:
                     await client.close()
 
@@ -3842,7 +3902,7 @@ else:
                 {**SANDBOX_RESPONSE, "network_policy": policy,
                  "desired_network_policy_generation": 2, "network_policy_generation": 2},
             ])
-            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
             try:
                 with mock.patch("thunder_sandbox.asynchronous.sandbox._sleep_until_next_poll", new_callable=mock.AsyncMock) as sleep:
                     await sandbox.update_network_policy(block_network=True)
@@ -3861,11 +3921,11 @@ else:
                     {**SANDBOX_RESPONSE, "status": status, "network_policy": policy,
                      "desired_network_policy_generation": desired, "network_policy_generation": 2},
                 ])
-                sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+                sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
                 try:
                     with self.assertRaises(error):
                         await sandbox.update_network_policy(block_network=True)
-                    sandbox._run_idempotent_command.assert_not_awaited()
+                    sandbox._channel()._run.assert_not_awaited()
                 finally:
                     await client.close()
 
@@ -3878,11 +3938,11 @@ else:
                 {**SANDBOX_RESPONSE, "network_policy": policy,
                  "desired_network_policy_generation": 2, "network_policy_generation": 1},
             ])
-            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
             try:
                 with self.assertRaises(SandboxTimeoutError):
                     await sandbox.update_network_policy(block_network=True, timeout=0.01)
-                sandbox._run_idempotent_command.assert_not_awaited()
+                sandbox._channel()._run.assert_not_awaited()
             finally:
                 await client.close()
 
@@ -3899,14 +3959,14 @@ else:
                 return {}
 
             client._request = mock.AsyncMock(side_effect=request)  # type: ignore[method-assign]
-            sandbox._run_idempotent_command = mock.AsyncMock()  # type: ignore[method-assign]
+            sandbox._channel()._run = mock.AsyncMock()  # type: ignore[method-assign]
             task = asyncio.create_task(sandbox.update_network_policy(block_network=True))
             try:
                 await asyncio.wait_for(entered.wait(), timeout=1)
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
-                sandbox._run_idempotent_command.assert_not_awaited()
+                sandbox._channel()._run.assert_not_awaited()
             finally:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -4227,11 +4287,10 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             (remote / "d3" / "latest.txt").symlink_to("f3.txt")
             (remote / "linked-dir").symlink_to("d5")
             connection = self.local_connection(directory)
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             destination = Path(directory) / "local"
             destination.mkdir()
-            with mock.patch.object(
-                sandbox, "_run_guest_command", new=mock.AsyncMock()
+            with mock.patch.object(sandbox._channel(), "_run_guest", new=mock.AsyncMock()
             ) as guest, mock.patch(
                 "thunder_sandbox.asynchronous.sandbox.asyncssh.scp", new=mock.AsyncMock()
             ) as scp:
@@ -4263,7 +4322,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             sandbox, client = self.sandbox(directory, image=False)
             remote = Path(directory) / "result.bin"
             remote.write_bytes(b"\x00\xffcomplete" * 10000)
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "copy.bin"
             destination.write_bytes(b"old")
             await sandbox.download(str(remote), destination)
@@ -4281,7 +4340,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             remote.mkdir()
             (remote / "checkpoint-42.bin").write_bytes(b"weights")
             (remote / "latest.bin").symlink_to("checkpoint-42.bin")
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "local"
             destination.mkdir()
             await sandbox.download(str(remote / "latest.bin"), destination)
@@ -4315,7 +4374,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             (remote / "run-7").mkdir(parents=True)
             (remote / "run-7" / "metrics.json").write_text("{}", encoding="utf-8")
             (remote / "latest").symlink_to("run-7")
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "local"
             destination.mkdir()
             await sandbox.download(f"{remote}/latest/", destination, recursive=True)
@@ -4330,14 +4389,14 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             connection = FakeSSHConnection()
             connection.create_process = mock.AsyncMock()  # type: ignore[attr-defined]
             reconnect = mock.AsyncMock(return_value=FakeSSHConnection())
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 reconnect,  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             with mock.patch(
-                "thunder_sandbox.asynchronous.sandbox._remove_local_transfer_path",
+                "thunder_sandbox._channels._ssh_channel.remove_local_transfer_path",
                 side_effect=PermissionError("read-only destination"),
             ):
                 with self.assertRaisesRegex(SandboxFailedError, "read-only destination"):
@@ -4354,7 +4413,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             remote = Path(directory) / "remote"
             remote.mkdir()
             (remote / "new.txt").write_text("new", encoding="utf-8")
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "results"
             destination.mkdir()
             (destination / "existing.txt").write_text("keep", encoding="utf-8")
@@ -4372,7 +4431,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             sandbox, client = self.sandbox(directory, image=True)
             remote = Path(directory) / "remote"
             remote.mkdir()
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "local"
             destination.write_text("old", encoding="utf-8")
             with self.assertRaisesRegex(SandboxFailedError, "No such file"):
@@ -4393,7 +4452,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             remote.mkdir(parents=True)
             (remote / "ok.txt").write_text("ok", encoding="utf-8")
             (remote / "gone").symlink_to("missing.txt")
-            sandbox._ssh_manager._connection = self.local_connection(directory)  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = self.local_connection(directory)  # type: ignore[assignment]
             destination = Path(directory) / "local"
             destination.mkdir()
             with self.assertRaisesRegex(SandboxFailedError, "gone"):
@@ -4424,12 +4483,12 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
 
             first.create_process = mock.AsyncMock(side_effect=lambda *a, **k: lose())  # type: ignore[attr-defined]
             second.create_process = mock.AsyncMock(side_effect=lambda *a, **k: finish())  # type: ignore[attr-defined]
-            sandbox._ssh_manager = SSHConnectionManager(
+            sandbox._channel()._manager = SSHConnectionManager(
                 mock.AsyncMock(return_value=second),  # type: ignore[arg-type]
                 sleep=mock.AsyncMock(),
                 jitter=lambda _start, _end: 0.0,
             )
-            sandbox._ssh_manager._connection = first  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = first  # type: ignore[assignment]
             await sandbox.download("/workspace/result.bin", destination)
             self.assertEqual(observed, [b"old-result", b"old-result"])
             self.assertEqual(destination.read_bytes(), b"complete")
@@ -4444,7 +4503,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             # that never ends: only stopping on the extractor's error finishes.
             process = ScriptedProcess([b"\x01" * 65536] * 500, then_block=True)
             connection.create_process = mock.AsyncMock(return_value=process)  # type: ignore[attr-defined]
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             destination = Path(directory) / "out"
             with self.assertRaisesRegex(SandboxFailedError, "archive is invalid"):
                 await asyncio.wait_for(
@@ -4463,7 +4522,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
                     [], exit_status=1, stderr=b"tar: out/x: Permission denied"
                 )
             )
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             with self.assertRaisesRegex(
                 SandboxFailedError, "status 1: tar: out/x: Permission denied"
             ):
@@ -4476,7 +4535,7 @@ class StreamingDownloadTest(unittest.IsolatedAsyncioTestCase):
             connection = FakeSSHConnection()
             process = ScriptedProcess([], then_block=True)
             connection.create_process = mock.AsyncMock(return_value=process)  # type: ignore[attr-defined]
-            sandbox._ssh_manager._connection = connection  # type: ignore[assignment]
+            sandbox._channel()._manager._connection = connection  # type: ignore[assignment]
             started = time.monotonic()
             with self.assertRaises(SandboxTimeoutError):
                 await sandbox.download("/logs/out", Path(directory) / "out", timeout=0.2)
@@ -4560,14 +4619,11 @@ class SynchronousSandboxTest(unittest.TestCase):
 
             class Reader:
                 def __init__(self):
-                    self.value = "output"
+                    self.value = b"output"
 
                 async def read(self, n=-1):
-                    value, self.value = self.value, ""
+                    value, self.value = self.value, b""
                     return value
-
-                async def readline(self):
-                    return ""
 
             class Writer:
                 def __init__(self):
@@ -4582,9 +4638,15 @@ class SynchronousSandboxTest(unittest.TestCase):
                 def write_eof(self):
                     pass
 
-            raw = mock.Mock(stdin=Writer(), stdout=Reader(), stderr=Reader(), returncode=0)
+            raw = mock.Mock(
+                stdin=Writer(), stdout=Reader(), stderr=Reader(), exit_status=0, exit_signal=None
+            )
             raw.wait_closed = mock.AsyncMock()
-            remote = AsyncProcess(raw)
+
+            async def make():  # type: ignore[no-untyped-def]
+                return attached_process(raw)
+
+            remote = client._bridge.run(make())
             asynchronous.exec = mock.AsyncMock(return_value=remote)  # type: ignore[method-assign]
             try:
                 process = sandbox.exec("echo", "hello")
@@ -4632,22 +4694,23 @@ class SynchronousSandboxTest(unittest.TestCase):
     def test_wait_does_not_consume_process_output(self) -> None:
         async def exercise() -> None:
             class Reader:
-                def __init__(self, value: str) -> None:
+                def __init__(self, value: bytes) -> None:
                     self.value = value
 
                 async def read(self, n=-1):
-                    value, self.value = self.value, ""
+                    value, self.value = self.value, b""
                     return value
 
             raw = mock.Mock(
                 stdin=mock.Mock(),
-                stdout=Reader("stdout"),
-                stderr=Reader("stderr"),
-                returncode=0,
+                stdout=Reader(b"stdout"),
+                stderr=Reader(b"stderr"),
+                exit_status=0,
+                exit_signal=None,
             )
             raw.wait = mock.AsyncMock()
             raw.wait_closed = mock.AsyncMock()
-            process = AsyncProcess(raw)
+            process = attached_process(raw)
 
             self.assertEqual(await process.wait(), 0)
             self.assertEqual(await process.stdout.read(), "stdout")
@@ -4662,23 +4725,25 @@ class SynchronousSandboxTest(unittest.TestCase):
             raw_stdin = mock.Mock()
             raw_stdin.drain = mock.AsyncMock()
             stdout = mock.Mock()
-            stdout.read = mock.AsyncMock(return_value="")
+            stdout.read = mock.AsyncMock(return_value=b"")
             stderr = mock.Mock()
-            stderr.read = mock.AsyncMock(return_value="")
+            stderr.read = mock.AsyncMock(return_value=b"")
             raw = mock.Mock(
                 stdin=raw_stdin,
                 stdout=stdout,
                 stderr=stderr,
-                returncode=0,
+                exit_status=0,
+                exit_signal=None,
             )
-            process = AsyncProcess(raw)
+            process = attached_process(raw)
 
             self.assertNotIsInstance(process.stdin, asyncssh.SSHWriter)
             self.assertEqual(process.stdin.write("answer\n"), 7)
             await process.stdin.drain()
             process.stdin.write_eof()
-            raw_stdin.write.assert_called_once_with("answer\n")
-            raw_stdin.drain.assert_awaited_once_with()
+            await process.stdin.drain()
+            raw_stdin.write.assert_called_once_with(b"answer\n")
+            self.assertEqual(raw_stdin.drain.await_count, 2)
             raw_stdin.write_eof.assert_called_once_with()
 
         asyncio.run(exercise())
@@ -4688,24 +4753,25 @@ class SynchronousSandboxTest(unittest.TestCase):
             expected = "x" * (3 * 1024 * 1024)
 
             class Reader:
-                def __init__(self, value: str) -> None:
+                def __init__(self, value: bytes) -> None:
                     self.value = value
 
                 async def read(self, n=-1):
                     if not self.value:
-                        return ""
+                        return b""
                     value, self.value = self.value[:65536], self.value[65536:]
                     await asyncio.sleep(0)
                     return value
 
             raw = mock.Mock(
                 stdin=mock.Mock(),
-                stdout=Reader(expected),
-                stderr=Reader(""),
-                returncode=0,
+                stdout=Reader(expected.encode()),
+                stderr=Reader(b""),
+                exit_status=0,
+                exit_signal=None,
             )
             raw.wait_closed = mock.AsyncMock()
-            process = AsyncProcess(raw)
+            process = attached_process(raw)
             self.assertEqual(await process.wait(), 0)
             self.assertEqual(await process.stdout.read(), expected)
 
@@ -5285,7 +5351,7 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
                     })
 
                 async def opens(item: AsyncSandbox) -> None:
-                    connection = await item._open_connection()
+                    connection = await item._channel()._open_connection()
                     self.assertEqual((await connection.run("x")).stdout, "ok\n")
                     connection.close()
 
@@ -5312,7 +5378,7 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
                 # which still names the sandbox's own workspace, then gives up.
                 misplaced = sandbox("sbx-ws-wrong", "ws-a1", servers["ws-b2"])
                 with self.assertRaises(asyncssh.PermissionDenied):
-                    await misplaced._open_connection()
+                    await misplaced._channel()._open_connection()
                 self.assertEqual(requested[-1], "ws-a1")
 
                 self.assertEqual(
@@ -5494,7 +5560,7 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
         await self.guest.wait_closed()
 
     async def test_commands_files_reconnect_and_close_use_same_credential(self):
-        connection = await self.sandbox._connect()
+        connection = await self.sandbox._channel()._connect()
         self.assertEqual((await connection.run("echo")).stdout, "through-jump\n")
         async with connection.start_sftp_client() as sftp:
             async with sftp.open("hello", "wb") as remote:
@@ -5502,9 +5568,9 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
             async with sftp.open("hello", "rb") as remote:
                 self.assertEqual(await remote.read(), b"file-through-jump")
         self.assertEqual(len(self.jump_connections), 1)
-        await self.sandbox._discard_connection(connection)
+        await self.sandbox._channel()._manager.discard(connection)
         await asyncio.wait_for(self.jump_connections[0].wait_closed(), 5)
-        replacement = await self.sandbox._connect()
+        replacement = await self.sandbox._channel()._connect()
         self.assertIsNot(connection, replacement)
         self.assertEqual((await replacement.run("echo")).stdout, "through-jump\n")
         await self.sandbox._close_connection()
@@ -5518,13 +5584,13 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
             host_key=wrong.export_public_key().decode().strip(),
         ))
         with self.assertRaises(asyncssh.HostKeyNotVerifiable):
-            await self.sandbox._open(ssh, self.credential, None)
+            await self.sandbox._channel()._open(ssh, self.credential, None)
         self.store.renew.assert_not_awaited()
 
     async def test_failed_inner_auth_closes_jump(self):
         wrong = asyncssh.generate_private_key("ssh-ed25519")
         with self.assertRaises(asyncssh.HostKeyNotVerifiable):
-            await self.sandbox._open(
+            await self.sandbox._channel()._open(
                 self.sandbox.ssh, self.credential, ([wrong], [], [])
             )
         await asyncio.wait_for(self.jump_connections[-1].wait_closed(), 5)
@@ -5587,7 +5653,7 @@ class ProxyJumpTests(unittest.IsolatedAsyncioTestCase):
             self.key, "old", principals=["workspace"], permit_port_forwarding=False,
         )
         self.store.ensure.return_value = mock.Mock(key=self.key, certificate=old)
-        connection = await self.sandbox._connect()
+        connection = await self.sandbox._channel()._connect()
         self.assertEqual((await connection.run("echo")).stdout, "through-jump\n")
         self.store.renew.assert_awaited_once()
         self.assertEqual(len(self.jump_connections), 2)

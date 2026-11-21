@@ -28,6 +28,8 @@ from thunder_sandbox._channels._spec import (
 )
 from thunder_sandbox._channels._ssh_channel import (
     SSHChannel,
+    SSHDockerChannel,
+    SSHHostChannel,
     _AttachedHandle,
     _exec_status,
     _JobHandle,
@@ -100,8 +102,8 @@ class SupportTest(unittest.IsolatedAsyncioTestCase):
 class UploadModeTest(unittest.IsolatedAsyncioTestCase):
     """Uploads keep each file's exact mode and times, as docker cp does."""
 
-    def uploading_channel(self) -> tuple[SSHChannel, mock.AsyncMock]:
-        ssh = channel()
+    def uploading_channel(self, kind: type = SSHChannel) -> tuple[SSHChannel, mock.AsyncMock]:
+        ssh = kind(mock.Mock(), info)
         connection = object()
 
         async def run_transfer(transfer, *, name):  # noqa: ANN001
@@ -113,6 +115,7 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
         ssh._publish = mock.AsyncMock()  # type: ignore[method-assign]
         ssh._cleanup_remote_paths = mock.AsyncMock()  # type: ignore[method-assign]
         ssh._run = mock.AsyncMock()  # type: ignore[method-assign]
+        ssh._run_guest = mock.AsyncMock()  # type: ignore[attr-defined]
         return ssh, mock.AsyncMock()
 
     async def test_every_upload_scp_preserves_modes_and_times(self) -> None:
@@ -120,14 +123,19 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
             source = Path(directory) / "src"
             source.mkdir()
             (source / "file").write_text("x")
-            for options in (
-                TransferOptions(),
-                TransferOptions(recursive=True),
-                TransferOptions(recursive=True, contents_only=True),
-            ):
-                ssh, scp = self.uploading_channel()
+            cases = [
+                (kind, options)
+                for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel)
+                for options in (
+                    TransferOptions(),
+                    TransferOptions(recursive=True),
+                    TransferOptions(recursive=True, contents_only=True),
+                )
+            ]
+            for kind, options in cases:
+                ssh, scp = self.uploading_channel(kind)
                 path = source / "file" if not options.recursive else source
-                with self.subTest(options=options), mock.patch(
+                with self.subTest(kind=kind.__name__, options=options), mock.patch(
                     "thunder_sandbox._channels._ssh_channel.asyncssh.scp", scp
                 ):
                     await ssh.upload(UploadRequest(path, "/dest", options))
@@ -136,9 +144,11 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
                         self.assertIs(call.kwargs.get("preserve"), True)
 
     async def test_upload_times_are_always_kept(self) -> None:
-        ssh = channel()
-        with self.assertRaises(UnsupportedFeatureError):
-            await ssh.upload(UploadRequest(Path("x"), "/x", TransferOptions(preserve_times=False)))
+        for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel):
+            with self.subTest(kind=kind.__name__), self.assertRaises(UnsupportedFeatureError):
+                await kind(mock.Mock(), info).upload(
+                    UploadRequest(Path("x"), "/x", TransferOptions(preserve_times=False))
+                )
 
 
 class CommandTest(unittest.TestCase):
@@ -210,13 +220,13 @@ class FakeJobChannel:
     async def _read_output(self, job_id: str, stream: str, offset: int) -> bytes:
         return self.output[stream][offset:offset + self.chunk]
 
-    async def _signal(self, job_id: str, signal: str, pid: int) -> JobStatus:
+    async def _signal(self, job_id: str, signal: str, pid: int, container: str | None) -> JobStatus:
         self.signals.append(signal)
         if signal == "KILL":
             self.statuses = [JobStatus(JobState.TERMINATED, pid=pid, returncode=137)]
         return self.statuses[0]
 
-    async def _cleanup(self, job_id: str) -> None:
+    async def _cleanup(self, job_id: str, container: str | None) -> None:
         self.cleaned.append(job_id)
 
     def _deadline(self) -> None:
@@ -582,3 +592,25 @@ class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AssertionError):
             await manager.run(operation, name="op")
+
+
+class RelativeWorkdirTest(unittest.IsolatedAsyncioTestCase):
+    async def test_container_and_vm_refuse_a_relative_workdir(self) -> None:
+        from thunder_sandbox.asynchronous.sandbox import Sandbox
+
+        for changes in ({"image_id": "image", "vm": False}, {"image_id": "image", "vm": True}):
+            with self.subTest(changes=changes):
+                sandbox = Sandbox(mock.Mock(), info(**changes))
+                with self.assertRaisesRegex(InvalidRequestError, "absolute"):
+                    await sandbox.exec("pwd", workdir="tmp")
+
+    async def test_a_sandbox_without_an_image_resolves_it_from_home(self) -> None:
+        from thunder_sandbox.asynchronous.sandbox import Sandbox
+
+        sandbox = Sandbox(mock.Mock(), info(image_id=None, vm=False))
+        channel = sandbox._channel()
+        channel.home = mock.AsyncMock(return_value="/home/ubuntu")  # type: ignore[method-assign]
+        channel.exec = mock.AsyncMock(side_effect=RuntimeError("stop"))  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "stop"):
+            await sandbox.exec("pwd", workdir="tmp")
+        self.assertEqual(channel.exec.await_args.args[0].working_dir, "/home/ubuntu/tmp")

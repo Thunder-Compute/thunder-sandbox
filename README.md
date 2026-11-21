@@ -255,7 +255,8 @@ If the connection fails, the SDK reconnects and retries. An operation which keep
 Commands and transfers on one sandbox share a single SSH connection, which carries up to nine of them at a time; more wait their turn rather than fail, so hundreds of concurrent `exec` calls are fine.
 
 Commands can set a working directory, environment variables, a timeout, or a
-pseudo-terminal:
+pseudo-terminal. In an image-backed sandbox the working directory must be an
+absolute path:
 
 ```python
 process = sandbox.exec(
