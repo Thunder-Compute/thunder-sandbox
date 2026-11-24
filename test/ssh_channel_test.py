@@ -368,6 +368,24 @@ class AttachedHandleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await handle.wait()).returncode, 5)
         self.assertEqual(b"".join([chunk async for chunk in handle.stdout()]), b"ab")
 
+    async def test_a_cancelled_read_loses_no_output(self) -> None:
+        process = self.process()
+        arrived: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def read(_size: int) -> bytes:
+            return await arrived.get()
+
+        process.stdout = mock.Mock(read=read)
+        handle = _AttachedHandle(EXEC_ID, process)
+        stdout = handle.stdout()
+        await arrived.put(b"first")
+        self.assertEqual(await anext(stdout), b"first")
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(anext(stdout), 0.01)  # nothing has arrived yet
+        for chunk in (b"second", b"third", b""):
+            await arrived.put(chunk)
+        self.assertEqual([chunk async for chunk in stdout], [b"second", b"third"])
+
     async def test_a_signal_reads_as_128_plus_its_number(self) -> None:
         process = self.process(exit_signal=("TERM", False, "", ""))
         self.assertEqual((await _AttachedHandle(EXEC_ID, process).wait()).returncode, 143)
