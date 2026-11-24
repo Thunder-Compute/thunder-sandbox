@@ -665,7 +665,9 @@ class _HandleWriter(Generic[T]):
                     await self._handle.close_stdin()
                 else:
                     await self._handle.write_stdin(cast(bytes, item))
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 self._error = exc
                 self._queue.clear()
                 return

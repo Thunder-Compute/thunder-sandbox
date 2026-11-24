@@ -545,7 +545,7 @@ class Sandbox:
                 exec_id=new_job_id(),
                 executable=args[0],
                 args=tuple(args[1:]),
-                working_dir=workdir,
+                working_dir=self._image_path(workdir) if isinstance(workdir, str) else workdir,
                 env={key: value for key, value in (env or {}).items() if value is not None},
                 unset_env=unset,
                 identity=_identity(user),

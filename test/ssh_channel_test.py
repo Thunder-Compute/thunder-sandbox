@@ -594,10 +594,6 @@ def _paths_under(root: Path):  # type: ignore[no-untyped-def]
     return init
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
     """One connection serves every operation, so one session's failure keeps it."""
 
@@ -648,3 +644,7 @@ class SharedConnectionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AssertionError):
             await manager.run(operation, name="op")
+
+
+if __name__ == "__main__":
+    unittest.main()
