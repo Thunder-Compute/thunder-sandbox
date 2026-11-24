@@ -863,8 +863,12 @@ class Sandbox:
             )
         if self.status == SandboxStatus.READY:
             return self
+        # A failed image build, among other failures, says why on the sandbox.
+        code, failure = self._info.failure_code, self._info.failure
         raise SandboxFailedError(
             f"sandbox {self.id} did not become ready (status: {self.status.value})"
+            + (f": [{code}] {failure}" if code and failure else f": {failure}" if failure else ""),
+            code=code or None,
         )
 
     async def _wait_until_built(self) -> None:
@@ -875,8 +879,21 @@ class Sandbox:
         deadline of its own.
         """
         delay = 1.0
+        failing_since: float | None = None
         while True:
-            await self.refresh()
+            try:
+                await self.refresh()
+            except (ConnectionError, RetryableError) as exc:
+                # Ride out an API blip the way the other waits do: a long
+                # build must not fail on one 502.
+                now = time.monotonic()
+                failing_since = now if failing_since is None else failing_since
+                if now - failing_since >= OUTAGE_GRACE_SECONDS:
+                    raise
+                await _sleep_until_next_poll(None, delay, exc.retry_after)
+                delay = min(5.0, delay * 2.0)
+                continue
+            failing_since = None
             if self.status != SandboxStatus.BUILDING:
                 return
             await asyncio.sleep(delay)
