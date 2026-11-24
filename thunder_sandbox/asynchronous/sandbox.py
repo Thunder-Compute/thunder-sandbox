@@ -109,6 +109,20 @@ SSH_KEEPALIVE_COUNT_MAX = 4
 PROCESS_CLEANUP_GRACE_SECONDS = 5.0
 
 
+def _upload_source(local_path: str | os.PathLike[str]) -> tuple[Path, bool]:
+    """The upload source, and whether only its contents are copied.
+
+    A source ending in ``/.`` copies a directory's contents, as with ``cp`` and
+    ``scp``, and so does ``.`` itself, as it did before channels.
+    """
+    text = os.fspath(local_path)
+    trimmed = text.rstrip(os.sep) or text
+    if trimmed == ".":
+        return Path("."), True
+    source = _parse_transfer_path(trimmed, separator=os.sep)
+    return Path(source.path), source.contents_only
+
+
 class Sandbox:
     """A native asynchronous handle to a Thunder sandbox."""
 
@@ -904,13 +918,13 @@ class Sandbox:
     ) -> None:
         """Upload a file or directory, raising after ``timeout`` seconds if given."""
         if self._info.vm:
-            source = _parse_transfer_path(os.fspath(local_path), separator=os.sep)
+            source_path, contents_only = _upload_source(local_path)
             await self._vm_channel().upload(UploadRequest(
-                local_path=Path(source.path),
+                local_path=source_path,
                 destination=self._image_path(remote_path),
                 options=TransferOptions(
                     recursive=recursive,
-                    contents_only=source.contents_only,
+                    contents_only=contents_only,
                     timeout_ms=_timeout_ms(timeout),
                 ),
             ))

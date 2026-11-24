@@ -588,8 +588,11 @@ class SSHChannel(ExecutionChannel):
             await self._upload_contents(source_path, request.destination)
             return TransferResult(request.destination)
         source_name = source_path.name
-        if not source_name:
-            raise InvalidRequestError("upload source must have a file or directory name")
+        if source_name in ("", ".."):
+            raise InvalidRequestError(
+                "upload source must name a file or directory; "
+                "upload a directory's contents with 'directory/.'"
+            )
         target = await self._upload_target(request.destination, source_name)
         transfer_id = uuid.uuid4().hex
         stage = f"{target}.thunder-transfer-{transfer_id}.stage"
