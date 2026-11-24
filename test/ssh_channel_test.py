@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from unittest import mock
 
+import asyncssh
+
 from thunder_sandbox._channels._spec import (
     DownloadRequest,
     ExecRequest,
@@ -301,6 +303,28 @@ class FakeReader:
     async def read(self, n: int) -> bytes:
         await asyncio.sleep(0)
         return self.chunks.pop(0) if self.chunks else b""
+
+
+class AttachedStartTest(unittest.IsolatedAsyncioTestCase):
+    async def start_failing_with(self, error: BaseException, *, closed: bool = False) -> mock.Mock:
+        sandbox_channel = channel()
+        connection = mock.Mock()
+        connection.is_closed.return_value = closed
+        connection.create_process = mock.AsyncMock(side_effect=error)
+        sandbox_channel._connect = mock.AsyncMock(return_value=connection)  # type: ignore[method-assign]
+        sandbox_channel._manager.discard = mock.AsyncMock()  # type: ignore[method-assign]
+        with self.assertRaises(ConnectionError):
+            await sandbox_channel.exec(ExecRequest("a" * 32, "bash", pty=True))
+        return sandbox_channel._manager.discard
+
+    async def test_a_refused_session_keeps_the_shared_connection(self) -> None:
+        refused = asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "no more sessions")
+        (await self.start_failing_with(refused)).assert_not_awaited()
+
+    async def test_a_broken_connection_is_replaced(self) -> None:
+        (await self.start_failing_with(ConnectionResetError())).assert_awaited_once()
+        refused = asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "closing")
+        (await self.start_failing_with(refused, closed=True)).assert_awaited_once()
 
 
 class AttachedHandleTest(unittest.IsolatedAsyncioTestCase):
