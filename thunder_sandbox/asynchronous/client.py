@@ -538,6 +538,94 @@ class Client:
             if context is not None:
                 await asyncio.to_thread(context.close)
 
+    async def _sandbox_build(
+        self, image: "Image"
+    ) -> "tuple[dict[str, object], _CanonicalBuildContext | None]":
+        """Describe ``image`` by its source for a sandbox start's ``build``.
+
+        A Dockerfile image's build context is archived and hashed here; the
+        caller uploads the archive if the start asks for it and then closes it.
+        """
+        from ..image import Image, _create_canonical_build_context
+
+        if not isinstance(image, Image):
+            raise InvalidRequestError("image must be created with Image.from_*()")
+        build: dict[str, object] = {}
+        if image._display_name is not None:
+            build["display_name"] = image._display_name
+        if image._source == "registry":
+            build["registry"] = {
+                "reference": image._registry_url,
+                **({"username": image._registry_username} if image._registry_username else {}),
+                **({"password": image._registry_password} if image._registry_password else {}),
+            }
+            return build, None
+        if image._context_directory is None:
+            raise InvalidRequestError("Dockerfile image has no build context")
+        context = await asyncio.to_thread(
+            _create_canonical_build_context,
+            image._context_directory,
+            self.config.paths.image_build_contexts,
+        )
+        dockerfile: dict[str, object] = {
+            "recipe_hash": context.recipe_hash,
+            "context_hash": context.context_hash,
+            "dockerfile_hash": context.dockerfile_hash,
+            "build_options_hash": context.build_options_hash,
+            "archive_bytes": context.archive_bytes,
+        }
+        if image._registry_host is not None:
+            dockerfile["registry_host"] = image._registry_host
+            dockerfile["registry_username"] = image._registry_username
+            dockerfile["registry_password"] = image._registry_password
+        build["dockerfile"] = dockerfile
+        return build, context
+
+    async def _upload_build_context(
+        self, context: "_CanonicalBuildContext", upload: Mapping[str, object]
+    ) -> None:
+        """Send the build context with the presigned request a start returned.
+
+        The request goes straight to object storage, so it carries none of this
+        client's headers or credentials. Transient failures retry until the
+        upload expires; the build fails if the archive never arrives.
+        """
+        url, method, headers, expires_at = (
+            upload.get("url"), upload.get("method"), upload.get("headers") or {}, upload.get("expires_at")
+        )
+        if not isinstance(url, str) or not url.startswith("https://") or method != "PUT" or not isinstance(headers, Mapping) or not isinstance(expires_at, str):
+            raise ConnectionError("Thunder returned an invalid build context upload")
+        try:
+            deadline = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError as error:
+            raise ConnectionError("Thunder returned an invalid build context upload") from error
+        request_headers = {str(key): str(value) for key, value in headers.items()}
+        request_headers["Content-Length"] = str(context.archive_bytes)
+        delay = 1.0
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    with context.archive_path.open("rb") as archive:
+                        async with session.put(
+                            url,
+                            data=archive,
+                            headers=request_headers,
+                            timeout=aiohttp.ClientTimeout(total=max(60.0, deadline - time.time())),
+                        ) as response:
+                            if response.status < 300:
+                                return
+                            detail = (await response.text())[:200]
+                            if response.status < 500 and response.status != 429:
+                                raise ConnectionError(
+                                    f"object storage refused the build context upload (HTTP {response.status}): {detail}"
+                                )
+                except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
+                    pass
+                if time.time() + delay >= deadline:
+                    raise SandboxTimeoutError("the build context upload did not finish before it expired")
+                await asyncio.sleep(delay)
+                delay = min(30.0, delay * 2.0)
+
     async def _start_image(
         self,
         path: str,

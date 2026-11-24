@@ -1939,12 +1939,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     client = AsyncClient(config(directory))
                     image = Image.from_registry("ubuntu:24.04")
-                    client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
-                        "image-id", "registry.example/image@sha256:digest", "sha256:digest"
-                    ))
                     spec = {"cpu_count": cpu, "memory_gib": 1, "storage_gib": 10}
                     client._request = mock.AsyncMock(side_effect=[
-                        {"id": "sbx-test"},
+                        {"id": "sbx-test", "build": {"image_id": "image-id", "state": "READY"}},
                         {**SANDBOX_RESPONSE, "status": "created", "queued": True, "spec": spec},
                         {**SANDBOX_RESPONSE, "queued": False, "spec": spec},
                     ])
@@ -1953,11 +1950,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                             image=image, queue=True, cpu=cpu, memory=1, storage=10,
                             gpu_type=gpu_type, gpu_count=gpu_count,
                         )
-                        client.resolve_image.assert_awaited_once_with(
-                            image, gated_features=None, spec=spec, queue=True,
-                            workspace="main", vm=False,
-                        )
                         body = client._request.await_args_list[0].args[2]
+                        self.assertEqual(body["build"], {"registry": {"reference": "ubuntu:24.04"}})
+                        self.assertNotIn("image_id", body)
                         self.assertIs(body["queue"], True)
                         self.assertEqual(body["spec"], spec)
                         self.assertTrue(sandbox.queued)
@@ -1982,12 +1977,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(vm=vm, granted=granted), tempfile.TemporaryDirectory() as directory:
                 client = AsyncClient(config(directory))
-                client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
-                    "image-id", "registry.example/image@sha256:digest", "sha256:digest",
-                    vm=granted,
-                ))
                 client._request = mock.AsyncMock(side_effect=[
-                    {"id": "sbx-test"},
+                    {"id": "sbx-test", "build": {"image_id": "image-id", "state": "READY"}},
                     {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": granted},
                 ])
                 try:
@@ -1996,10 +1987,8 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         vm=vm,
                         gated_features={"image_feature": True},
                     )
-                    kwargs = client.resolve_image.await_args.kwargs
-                    self.assertEqual(kwargs["gated_features"], {"image_feature": True})
-                    self.assertIs(kwargs["vm"], sent is not None)
                     body = client._request.await_args_list[0].args[2]
+                    self.assertEqual(body["build"], {"registry": {"reference": "fedora:41"}})
                     self.assertEqual(body.get("vm"), sent)
                     self.assertEqual(body["gatedFeatures"], {"image_feature": True})
                     self.assertEqual(sandbox.vm, granted)
@@ -2011,19 +2000,14 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         gated = {"vm": {"imageCommand": {"cmd": []}}, "image_feature": True}
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
-            client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
-                "image-id", "registry.example/image@sha256:digest", "sha256:digest", vm=True,
-            ))
             client._request = mock.AsyncMock(side_effect=[
-                {"id": "sbx-test"},
+                {"id": "sbx-test", "build": {"image_id": "image-id", "state": "READY"}},
                 {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": True},
             ])
             try:
                 sandbox = await client.create_sandbox(
                     image=Image.from_registry("fedora:41"), gated_features=gated
                 )
-                kwargs = client.resolve_image.await_args.kwargs
-                self.assertEqual((kwargs["gated_features"], kwargs["vm"]), (gated, False))
                 body = client._request.await_args_list[0].args[2]
                 self.assertEqual(body["gatedFeatures"], gated)
                 self.assertNotIn("vm", body)
@@ -2039,13 +2023,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
         for timing_sensitive in (False, True):
             with self.subTest(timing_sensitive=timing_sensitive), tempfile.TemporaryDirectory() as directory:
                 client = AsyncClient(config(directory))
-                client.resolve_image = mock.AsyncMock(return_value=ResolvedImage(
-                    "image-id", "registry.example/image@sha256:digest", "sha256:digest",
-                ))
                 # Thunder reports a timing-sensitive sandbox as vm: SSH lands
                 # in its container.
                 client._request = mock.AsyncMock(side_effect=[
-                    {"id": "sbx-test"},
+                    {"id": "sbx-test", "build": {"image_id": "image-id", "state": "READY"}},
                     {**SANDBOX_RESPONSE, "image_id": "image-id", "vm": timing_sensitive},
                 ])
                 try:
@@ -2058,10 +2039,42 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                         self.assertIs(body["timing_sensitive"], True)
                     else:
                         self.assertNotIn("timing_sensitive", body)
-                    self.assertFalse(client.resolve_image.await_args.kwargs["vm"])
                     self.assertEqual(sandbox._has_container, not timing_sensitive)
                 finally:
                     await client.close()
+
+    async def test_create_starts_on_a_build_uploads_its_context_and_refuses_an_old_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "context"
+            root.mkdir()
+            (root / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            upload = {"url": "https://storage.example/ctx", "method": "PUT", "headers": {}, "expires_at": "2099-01-01T00:00:00Z"}
+            client = AsyncClient(config(directory))
+            client._upload_build_context = mock.AsyncMock()
+            client._request = mock.AsyncMock(side_effect=[
+                {"id": "sbx-test", "build": {"image_id": "image-id", "state": "BUILDING", "upload": upload}},
+                {**SANDBOX_RESPONSE, "status": "building"},
+            ])
+            try:
+                sandbox = await client.create_sandbox(image=Image.from_dockerfile(root))
+                body = client._request.await_args_list[0].args[2]
+                dockerfile = body["build"]["dockerfile"]
+                self.assertEqual(set(dockerfile), {"recipe_hash", "context_hash", "dockerfile_hash", "build_options_hash", "archive_bytes"})
+                context, sent_upload = client._upload_build_context.await_args.args
+                self.assertEqual(sent_upload, upload)
+                self.assertEqual(context.archive_bytes, dockerfile["archive_bytes"])
+                self.assertFalse(context.archive_path.exists())
+                self.assertEqual(sandbox.status, SandboxStatus.BUILDING)
+                self.assertTrue(sandbox.status.live)
+
+                # An API from before builds starts the sandbox without the
+                # image; the SDK stops it rather than hand it back.
+                client._request = mock.AsyncMock(side_effect=[{"id": "sbx-old"}, {}])
+                with self.assertRaisesRegex(SandboxFailedError, "cannot start a sandbox from an image"):
+                    await client.create_sandbox(image=Image.from_registry("ubuntu:24.04"))
+                self.assertEqual(client._request.await_args_list[-1].args[:2], ("POST", "/sandboxes/sbx-old/stop"))
+            finally:
+                await client.close()
 
     async def test_create_rejects_invalid_timing_sensitive_requests(self) -> None:
         image = Image.from_registry("python:3.11-slim")

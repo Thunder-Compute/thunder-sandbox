@@ -20,6 +20,8 @@ OutputMode = Literal["capture", "discard"]
 
 class SandboxStatus(str, Enum):
     CREATED = "created"
+    # Created and holding its capacity while the image it was started on builds.
+    BUILDING = "building"
     READY = "ready"
     FINISHED = "finished"
     FAILED = "failed"
@@ -34,7 +36,7 @@ class SandboxStatus(str, Enum):
     @property
     def live(self) -> bool:
         """Whether the sandbox still exists and holds its name."""
-        return self in (SandboxStatus.CREATED, SandboxStatus.READY)
+        return self in (SandboxStatus.CREATED, SandboxStatus.BUILDING, SandboxStatus.READY)
 
     @property
     def terminal(self) -> bool:
