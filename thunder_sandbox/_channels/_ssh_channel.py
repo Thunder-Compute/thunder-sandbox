@@ -926,6 +926,11 @@ class SSHDockerChannel(_SSHChannelBase):
             raise InvalidRequestError("uploading a directory requires recursive=True")
         if options.contents_only and not source_path.is_dir():
             raise InvalidRequestError("a contents-only upload needs a directory source")
+        if not options.contents_only and source_path.name in ("", ".."):
+            raise InvalidRequestError(
+                "upload source must name a file or directory; "
+                "upload a directory's contents with 'directory/.'"
+            )
         stage = f"/tmp/thunder-sandbox-transfer-{uuid.uuid4().hex}"
         try:
             if options.contents_only:
