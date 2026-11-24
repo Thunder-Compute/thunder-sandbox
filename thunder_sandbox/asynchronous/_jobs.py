@@ -22,6 +22,8 @@ from .._common.types import OutputMode
 JOB_PROTOCOL_VERSION = 1
 JOB_ROOT = PurePosixPath("/var/tmp/thunder-sandbox/jobs")
 CONTAINER_JOB_ROOT = PurePosixPath("/tmp/thunder-sandbox/jobs")
+# The job's code when the sandbox restarted under it, as if it was killed.
+SANDBOX_RESTART_RETURNCODE = 137
 
 _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 class JobState(str, Enum):
@@ -295,6 +297,10 @@ class JobStatus:
     state: JobState
     pid: int | None = None
     returncode: int | None = None
+    # The sandbox restarted under the job, so nothing observed how it ended.
+    # Such a job also reads as FAILED with SANDBOX_RESTART_RETURNCODE, which
+    # is all an SDK from before this flag sees.
+    interrupted: bool = False
 
     def __post_init__(self) -> None:
         if self.pid is not None and self.pid <= 0:
@@ -305,18 +311,22 @@ class JobStatus:
             raise ValueError("a succeeded job must have return code zero")
         if self.state == JobState.FAILED and self.returncode == 0:
             raise ValueError("a failed job cannot have return code zero")
+        if self.interrupted and (
+            self.state != JobState.FAILED
+            or self.returncode != SANDBOX_RESTART_RETURNCODE
+        ):
+            raise ValueError("an interrupted job is recorded as failed with code 137")
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "protocol": JOB_PROTOCOL_VERSION,
-                "state": self.state.value,
-                "pid": self.pid,
-                "returncode": self.returncode,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        fields: dict[str, object] = {
+            "protocol": JOB_PROTOCOL_VERSION,
+            "state": self.state.value,
+            "pid": self.pid,
+            "returncode": self.returncode,
+        }
+        if self.interrupted:
+            fields["interrupted"] = True
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, value: str | bytes) -> "JobStatus":
@@ -333,7 +343,12 @@ class JobStatus:
                 raise TypeError
             if returncode is not None and not isinstance(returncode, int):
                 raise TypeError
-            return cls(state=state, pid=pid, returncode=returncode)
+            interrupted = raw.get("interrupted", False)
+            if not isinstance(interrupted, bool):
+                raise TypeError
+            return cls(
+                state=state, pid=pid, returncode=returncode, interrupted=interrupted
+            )
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ValueError("invalid durable-job status") from exc
 
@@ -594,8 +609,6 @@ cat -- {status}
 
 
 _BOOT_ID = "/proc/sys/kernel/random/boot_id"
-# The job's code when the sandbox restarted under it, as if it was killed.
-SANDBOX_RESTART_RETURNCODE = 137
 
 
 def _reconcile_restart(paths: RemoteJobPaths) -> str:
@@ -617,7 +630,9 @@ def _reconcile_restart(paths: RemoteJobPaths) -> str:
         _state_pattern(*(state for state in JobState if not state.terminal))
     )
     failed = shlex.quote(
-        JobStatus(JobState.FAILED, returncode=SANDBOX_RESTART_RETURNCODE).to_json()
+        JobStatus(
+            JobState.FAILED, returncode=SANDBOX_RESTART_RETURNCODE, interrupted=True
+        ).to_json()
     )
     boot_id = shlex.quote(str(paths.boot_id))
     run_lock = shlex.quote(str(paths.run_lock))

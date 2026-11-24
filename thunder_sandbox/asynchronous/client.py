@@ -178,7 +178,6 @@ class Client:
         if self._session is None:
             self._session = aiohttp.ClientSession(
                 headers={
-                    "Authorization": f"Bearer {self.config.api_token}",
                     "Content-Type": "application/json",
                     "Thunder-Client": "PYTHON-SDK",
                     "User-Agent": USER_AGENT,
@@ -225,16 +224,34 @@ class Client:
         idempotent = _idempotent(method, path)
         expires_at = None if timeout is None else time.monotonic() + timeout
         attempt_timeout = timeout
-        for delay in (*CONNECTION_RETRY_DELAYS, None):
+        delays = iter(CONNECTION_RETRY_DELAYS)
+        renewed_token = False
+        while True:
+            # _send puts this token in the header before it first awaits.
+            sent_with = self.config.api_token
             try:
                 payload = await self._send(method, path, body, query, attempt_timeout)
                 break
+            except AuthenticationError as exc:
+                # The API refused the request before acting on it, so sending
+                # it again with the CLI's renewed token is safe for any method.
+                # A concurrent request may already have read the renewed token.
+                if exc.status != 401 or renewed_token or not (
+                    self.config.api_token != sent_with or self.config.reload_cli_token()
+                ):
+                    raise
+                renewed_token = True
+                if expires_at is not None:
+                    attempt_timeout = expires_at - time.monotonic()
+                    if attempt_timeout <= 0:
+                        raise
             except ThunderError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 failure = ConnectionError(
                     f"could not communicate with Thunder: {_describe(exc)}"
                 )
+                delay = next(delays, None)
                 if delay is None or not _resendable(exc, idempotent):
                     raise failure from exc
                 await asyncio.sleep(delay)
@@ -272,8 +289,9 @@ class Client:
         options = (
             {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout is not None else {}
         )
+        headers = {"Authorization": f"Bearer {self.config.api_token}"}
         async with session.request(
-            method, url, json=body, params=params, **options
+            method, url, json=body, params=params, headers=headers, **options
         ) as response:
             payload = await response.read()
             if response.status >= 400:

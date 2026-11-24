@@ -252,6 +252,8 @@ Each argument or environment value must be under 128 KiB, the Linux limit; `exec
 
 If the connection fails, the SDK reconnects and retries. An operation which keeps failing for ten minutes raises `ConnectionError`; a durable command keeps running, and `get_process()` can recover it.
 
+Commands and transfers on one sandbox share a single SSH connection, which carries up to nine of them at a time; more wait their turn rather than fail, so hundreds of concurrent `exec` calls are fine.
+
 Commands can set a working directory, environment variables, a timeout, or a
 pseudo-terminal:
 
@@ -474,6 +476,7 @@ The image's `ENTRYPOINT` and `CMD` run once as root, from its `WORKDIR`, after t
 Some things differ from a container sandbox:
 
 - A command runs with the image's `ENV` and starts in the image's `WORKDIR`, or in `/` when the image sets none; pass `workdir` to choose. A relative transfer path is relative to `/`, as in a container sandbox.
+- A command runs with umask `022`, as in a container sandbox, so files one user creates are readable by others.
 - A command given by bare name is looked up in the image's `PATH`, with no BusyBox fallback.
 - The guest can `reboot` or `poweroff`, and a kernel panic does the same: the sandbox restarts in place with its disk, network and lifetime. A command that was running when it restarted ends with exit code 137, and its output from the last moments before the restart may be missing.
 
