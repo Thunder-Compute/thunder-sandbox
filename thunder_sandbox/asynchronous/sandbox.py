@@ -863,23 +863,34 @@ class Sandbox:
             )
         if self.status == SandboxStatus.READY:
             return self
-        raise SandboxFailedError(
+        # A failed build is only visible as this sandbox's terminal state.
+        # The API code and reason have to travel on the exception: create()
+        # stops the sandbox before the caller can read them from the handle.
+        failure = self.info.failure
+        message = (
             f"sandbox {self.id} did not become ready (status: {self.status.value})"
         )
+        if failure:
+            message = f"{message}: {failure}"
+        raise SandboxFailedError(message, code=self.info.failure_code)
 
     async def _wait_until_built(self) -> None:
         """Poll until the image this sandbox was started on has been built.
 
         Thunder bounds the build (its upload window and the build's own
         deadline) and fails the sandbox when the build fails, so this has no
-        deadline of its own.
+        deadline of its own. A connection failure or retryable API error is
+        waited out for ``OUTAGE_GRACE_SECONDS``, as the other lifecycle polls do.
         """
+        failing_since: float | None = None
         delay = 1.0
         while True:
-            await self.refresh()
-            if self.status != SandboxStatus.BUILDING:
+            ok, failing_since, retry_after = await self._refresh_while_waiting(
+                None, failing_since
+            )
+            if ok and self.status != SandboxStatus.BUILDING:
                 return
-            await asyncio.sleep(delay)
+            await _sleep_until_next_poll(None, delay, retry_after)
             delay = min(5.0, delay * 2.0)
 
     async def _wait_for_startup(self, deadline: float | None) -> bool:

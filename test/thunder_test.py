@@ -3598,9 +3598,68 @@ else:
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[{**SANDBOX_RESPONSE, "status": "failed", "ssh": None}]
             )
-            with self.assertRaisesRegex(SandboxFailedError, "status: failed"):
+            with self.assertRaisesRegex(SandboxFailedError, "status: failed") as raised:
                 await sandbox.wait_until_ready()
+            self.assertIsNone(raised.exception.code)
             await client.close()
+
+    async def test_wait_until_ready_reports_why_a_build_failed(self) -> None:
+        # The build runs on the sandbox, so its failure is this status rather
+        # than an image-API error. The code and reason still have to be on the
+        # exception create() raises before it stops the sandbox.
+        failed = {
+            **SANDBOX_RESPONSE,
+            "status": "failed",
+            "ssh": None,
+            "failure_code": "IMAGE_CANNOT_BOOT_AS_VM",
+            "failure": "Alpine cannot boot as a VM",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "status": "building", "ssh": None}
+            )
+            client._request = mock.AsyncMock(side_effect=[failed, failed])  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(SandboxFailedError) as raised:
+                    await sandbox.wait_until_ready()
+                self.assertEqual(raised.exception.code, "IMAGE_CANNOT_BOOT_AS_VM")
+                self.assertIn("Alpine cannot boot as a VM", str(raised.exception))
+                self.assertIn("status: failed", str(raised.exception))
+                self.assertEqual(
+                    [call.args for call in client._request.await_args_list],
+                    [
+                        ("GET", "/sandboxes/sbx-test"),
+                        ("GET", "/sandboxes/sbx-test/wait"),
+                    ],
+                )
+            finally:
+                await client.close()
+
+    async def test_build_wait_survives_a_retryable_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = AsyncClient(config(directory))
+            sandbox = AsyncSandbox._from_response(
+                client, {**SANDBOX_RESPONSE, "status": "building", "ssh": None}
+            )
+            client._request = mock.AsyncMock(side_effect=[  # type: ignore[method-assign]
+                ServiceUnavailableError("unavailable", status=503, retry_after=3),
+                SANDBOX_RESPONSE,
+                SANDBOX_RESPONSE,
+            ])
+            try:
+                with mock.patch(
+                    "thunder_sandbox.asynchronous.sandbox.asyncio.sleep",
+                    new=mock.AsyncMock(),
+                ) as sleep, mock.patch(
+                    "thunder_sandbox.asynchronous.sandbox.random.uniform",
+                    return_value=0,
+                ):
+                    self.assertIs(await sandbox.wait_until_ready(), sandbox)
+                sleep.assert_awaited_once_with(3)
+                self.assertEqual(sandbox.status, SandboxStatus.READY)
+            finally:
+                await client.close()
 
     async def test_terminate_stops_created_sandbox_without_waiting_for_capacity(self) -> None:
         # Older responses can omit queued, and a queued sandbox may already
