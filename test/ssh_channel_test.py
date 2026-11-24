@@ -148,9 +148,14 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_source_without_a_name_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "sub").mkdir()
-            for source in (Path("/"), Path(".."), Path(directory) / "sub" / ".."):
-                ssh, _ = self.uploading_channel()
-                with self.subTest(source=source):
+            cases = [
+                (kind, source)
+                for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel)
+                for source in (Path("/"), Path(".."), Path(directory) / "sub" / "..")
+            ]
+            for kind, source in cases:
+                ssh, _ = self.uploading_channel(kind)
+                with self.subTest(kind=kind.__name__, source=source):
                     with self.assertRaisesRegex(InvalidRequestError, "must name a file"):
                         await ssh.upload(
                             UploadRequest(source, "/dest", TransferOptions(recursive=True))
