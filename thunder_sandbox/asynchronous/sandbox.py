@@ -122,7 +122,12 @@ class Sandbox:
         workspace: str | None = None,
         client: Client | None = None,
     ) -> "Sandbox":
-        """Create a sandbox, resolving an optional image before allocation.
+        """Create a sandbox, from an optional image Thunder builds for it.
+
+        With ``image``, the sandbox starts at once and holds its capacity, with
+        status ``building``, while Thunder builds or imports the image, unless
+        the organization already has it. A Dockerfile's build context is
+        uploaded only when Thunder does not have that exact context yet.
 
         The image's initial command is attempted once. The sandbox remains
         available for commands and file transfers after it exits, including
@@ -131,8 +136,7 @@ class Sandbox:
         separate ``exec`` command after readiness; they do not override image
         defaults.
 
-        ``queue=True`` admits image builds and waits for sandbox capacity without
-        a scheduling timeout. Creation without positional commands returns a
+        ``queue=True`` waits for sandbox capacity without a scheduling timeout. Creation without positional commands returns a
         handle while queued; use ``wait_until_ready(timeout=None)`` to wait
         indefinitely. ``timeout`` remains the runtime TTL and, with positional
         commands, the readiness wait limit. CPU-only sandboxes omit GPU options
@@ -140,8 +144,7 @@ class Sandbox:
         are supported, subject to the API resource catalog.
 
         ``workspace`` is a workspace name or ID. Without one, ``TNR_WORKSPACE``
-        applies, and then main. The image is built or imported in that
-        workspace too, and listed there.
+        applies, and then main. The image is listed in that workspace too.
 
         ``vm=True`` asks for a VM sandbox: the image, built for it with
         ``resolve_image(vm=True)``, boots as the whole VM with its own systemd,
@@ -184,6 +187,8 @@ class Sandbox:
             raise InvalidRequestError("timing_sensitive cannot be combined with vm")
         owns_client = client is None
         resolved_client = client or Client.from_cli()
+        build: dict[str, object] | None = None
+        context = None
         try:
             workspace_id = await resolved_client._resolve_workspace(workspace)
             resource_spec: dict[str, object] = {
@@ -196,15 +201,10 @@ class Sandbox:
                     else {}
                 ),
             }
-            resolved_image = (
-                await resolved_client.resolve_image(
-                    image, gated_features=gated_features,
-                    spec=resource_spec, queue=queue, workspace=workspace_id,
-                    vm=vm_config is not None,
-                )
-                if image is not None
-                else None
-            )
+            # The image is named by its source; the sandbox holds its place
+            # while Thunder builds it, or starts at once from an earlier build.
+            if image is not None:
+                build, context = await resolved_client._sandbox_build(image)
             internet_access, cidrs, domains = _network_policy_request(
                 block_network,
                 outbound_cidr_allowlist,
@@ -241,13 +241,11 @@ class Sandbox:
                     else {}
                 ),
                 **({"name": name} if name is not None else {}),
-                **(
-                    {"image_id": resolved_image.id}
-                    if resolved_image is not None
-                    else {}
-                ),
+                **({"build": build} if build is not None else {}),
             }
         except BaseException:
+            if context is not None:
+                await asyncio.to_thread(context.close)
             if owns_client:
                 await resolved_client.close()
             raise
@@ -257,6 +255,20 @@ class Sandbox:
             sandbox_id = str(response.get("id", ""))
             if not sandbox_id:
                 raise SandboxFailedError("Thunder did not return a sandbox ID")
+            if build is not None:
+                started_build = response.get("build")
+                if not isinstance(started_build, dict):
+                    # An API from before builds ignores the field and starts a
+                    # sandbox without the image; it is stopped below.
+                    raise SandboxFailedError(
+                        "this Thunder API cannot start a sandbox from an image; "
+                        "update the API or use an older thunder-sandbox"
+                    )
+                upload = started_build.get("upload")
+                if upload is not None:
+                    if not isinstance(upload, dict) or context is None:
+                        raise ConnectionError("Thunder returned an invalid build context upload")
+                    await resolved_client._upload_build_context(context, upload)
             sandbox = await Sandbox.from_id(sandbox_id, client=resolved_client)
             sandbox._owns_client = owns_client
             # An API from before workspaces ignores the selector and starts the
@@ -285,6 +297,9 @@ class Sandbox:
             if owns_client:
                 await resolved_client.close()
             raise
+        finally:
+            if context is not None:
+                await asyncio.to_thread(context.close)
 
     @staticmethod
     async def from_id(
@@ -836,7 +851,11 @@ class Sandbox:
         """Wait for guest initialization, without checking application health.
 
         A short image ENTRYPOINT/CMD may already have exited when this returns.
+        A sandbox still building its image waits for the build first, which
+        Thunder bounds; ``timeout`` then applies to booting.
         """
+        if self.status == SandboxStatus.BUILDING:
+            await self._wait_until_built()
         deadline = None if timeout is None else time.monotonic() + timeout
         if not await self._wait_for_startup(deadline):
             raise SandboxTimeoutError(
@@ -847,6 +866,21 @@ class Sandbox:
         raise SandboxFailedError(
             f"sandbox {self.id} did not become ready (status: {self.status.value})"
         )
+
+    async def _wait_until_built(self) -> None:
+        """Poll until the image this sandbox was started on has been built.
+
+        Thunder bounds the build (its upload window and the build's own
+        deadline) and fails the sandbox when the build fails, so this has no
+        deadline of its own.
+        """
+        delay = 1.0
+        while True:
+            await self.refresh()
+            if self.status != SandboxStatus.BUILDING:
+                return
+            await asyncio.sleep(delay)
+            delay = min(5.0, delay * 2.0)
 
     async def _wait_for_startup(self, deadline: float | None) -> bool:
         """Read the sandbox until it has left ``created``.
@@ -887,7 +921,7 @@ class Sandbox:
                 delay = min(5.0, delay * 2.0)
             else:
                 failing_since = None
-                if self.status != SandboxStatus.CREATED:
+                if self.status not in (SandboxStatus.CREATED, SandboxStatus.BUILDING):
                     return True
                 if expired():
                     return False
@@ -936,7 +970,7 @@ class Sandbox:
             except ConflictError as exc:
                 # Queued sandboxes can stop before readiness. Only fall back
                 # to waiting if the API explicitly requires startup to finish.
-                if exc.code != "sandbox_not_ready" or self.status != SandboxStatus.CREATED:
+                if exc.code != "sandbox_not_ready" or self.status not in (SandboxStatus.CREATED, SandboxStatus.BUILDING):
                     raise
                 if not await self._wait_for_startup(deadline):
                     raise SandboxTimeoutError(
