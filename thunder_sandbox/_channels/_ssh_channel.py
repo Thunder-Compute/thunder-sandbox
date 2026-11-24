@@ -75,6 +75,7 @@ from ..asynchronous._ssh import (
     JumpSSHClient,
     RetryableSSHOperationError,
     SSHConnectionManager,
+    _session_failure,
 )
 from ..asynchronous._transfer import (
     publish_local_contents,
@@ -383,7 +384,10 @@ class SSHChannel(ExecutionChannel):
                     self._command(request), encoding=None, term_type="xterm"
                 )
             except (OSError, asyncssh.Error) as exc:
-                await self._manager.discard(connection)
+                # The connection is shared: a refused session leaves it fit for
+                # the processes and transfers already on it.
+                if connection.is_closed() or not _session_failure(exc):
+                    await self._manager.discard(connection)
                 raise ConnectionError(f"could not open a sandbox SSH session: {exc}") from exc
         except BaseException:
             self._slots.release()
