@@ -157,7 +157,9 @@ enum ExitReason {
 // - The sandbox side runs as root; what lands there is owned by root.
 
 // The client then sends the contents as TransferChunks. The destination
-// changes once the chunk with eof arrives.
+// changes once the chunk with eof arrives. A repeat with the same
+// transfer_id continues that upload; a different request under that
+// transfer_id is refused.
 message UploadRequest {
   string sandbox_id = 1;
   string transfer_id = 2;
@@ -166,7 +168,9 @@ message UploadRequest {
 }
 
 // Answered with TransferChunks from offset onward. The source is read once
-// per transfer_id, so resuming at an offset continues the same contents.
+// per transfer_id, so resuming at an offset continues the same contents. A
+// request that differs other than in offset under that transfer_id is
+// refused.
 message DownloadRequest {
   string sandbox_id = 1;
   string transfer_id = 2;
