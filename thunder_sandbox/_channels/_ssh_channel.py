@@ -25,6 +25,7 @@ Behaviour this channel fixes, beyond its support table:
 from __future__ import annotations
 
 import asyncio
+import collections
 import io
 import os
 import posixpath
@@ -1094,7 +1095,7 @@ class _Drain:
 
     def __init__(self, stream: asyncssh.SSHReader[bytes]) -> None:
         self._stream = stream
-        self._chunks: list[bytes] = []
+        self._chunks: collections.deque[bytes] = collections.deque()
         self._condition = asyncio.Condition()
         self._done = False
         self._error: BaseException | None = None
@@ -1121,18 +1122,22 @@ class _Drain:
     async def finished(self) -> None:
         await asyncio.wait({self._task})
 
-    async def chunks(self) -> AsyncIterator[bytes]:
-        while True:
-            async with self._condition:
-                await self._condition.wait_for(lambda: bool(self._chunks) or self._done)
-                pending, self._chunks = self._chunks, []
-                done, error = self._done, self._error
-            for chunk in pending:
-                yield chunk
-            if done and not pending:
-                if error is not None:
-                    raise error
-                return
+    def chunks(self) -> AsyncIterator[bytes]:
+        return self
+
+    def __aiter__(self) -> "_Drain":
+        return self
+
+    async def __anext__(self) -> bytes:
+        # The chunks stay here, not in the reader, so a read cancelled while it
+        # waits loses nothing and the next read carries on.
+        async with self._condition:
+            await self._condition.wait_for(lambda: bool(self._chunks) or self._done)
+            if self._chunks:
+                return self._chunks.popleft()
+        if self._error is not None:
+            raise self._error
+        raise StopAsyncIteration
 
 
 _SIGNAL_NUMBERS = {
