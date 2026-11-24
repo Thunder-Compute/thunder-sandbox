@@ -2173,37 +2173,12 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
 
-    async def test_create_waits_for_image_before_starting_sandbox(self) -> None:
+    async def test_create_starts_on_its_image_build(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
             image = Image.from_registry("ubuntu:24.04")
-            resolved = ResolvedImage(
-                id="a" * 64,
-                managed_reference="registry.example/image@sha256:" + "a" * 64,
-                managed_digest="sha256:" + "a" * 64,
-            )
+            image_id = "a" * 64
             events: list[str] = []
-
-            async def resolve(
-                candidate: Image,
-                *,
-                timeout: float | None = 7200,
-                gated_features=None,
-                spec=None,
-                queue=False,
-                workspace=None,
-                vm=False,
-            ) -> ResolvedImage:
-                self.assertIs(candidate, image)
-                self.assertFalse(vm)
-                self.assertEqual(timeout, 7200)
-                self.assertEqual(workspace, "ws-a1")
-                self.assertEqual(gated_features, {"image_feature": True})
-                self.assertEqual(
-                    spec, {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50}
-                )
-                events.append("image-ready")
-                return resolved
 
             async def request(
                 method: str,
@@ -2215,17 +2190,17 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 if path == "/sandboxes/start":
                     self.assertEqual(method, "POST")
                     assert isinstance(body, dict)
-                    self.assertEqual(body["image_id"], resolved.id)
+                    self.assertEqual(body["build"], {"registry": {"reference": "ubuntu:24.04"}})
+                    self.assertNotIn("image_id", body)
                     self.assertEqual(body["gatedFeatures"], {"image_feature": True})
                     self.assertEqual(body["workspace_id"], "ws-a1")
-                    return {"id": "sbx-test"}
+                    self.assertEqual(body["spec"], {"cpu_count": 4, "memory_gib": 32, "storage_gib": 50})
+                    return {"id": "sbx-test", "build": {"image_id": image_id, "state": "BUILDING"}}
                 return {
-                    **SANDBOX_RESPONSE, "image_id": resolved.id, "workspace_id": "ws-a1"
+                    **SANDBOX_RESPONSE, "status": "building", "image_id": image_id, "workspace_id": "ws-a1"
                 }
 
-            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
-                side_effect=resolve
-            )
+            client.resolve_image = mock.AsyncMock()  # type: ignore[method-assign]
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=request
             )
@@ -2234,11 +2209,10 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 workspace="ws-a1",
             )
             self.assertEqual(sandbox.id, "sbx-test")
-            self.assertEqual(sandbox.image_id, resolved.id)
-            self.assertEqual(
-                events,
-                ["image-ready", "/sandboxes/start", "/sandboxes/sbx-test"],
-            )
+            self.assertEqual(sandbox.image_id, image_id)
+            self.assertEqual(sandbox.status, SandboxStatus.BUILDING)
+            self.assertEqual(events, ["/sandboxes/start", "/sandboxes/sbx-test"])
+            client.resolve_image.assert_not_awaited()
             await client.close()
 
     async def test_create_with_image_runs_positional_args_through_exec(
@@ -2252,12 +2226,9 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                 managed_reference="registry.example/image@sha256:" + "a" * 64,
                 managed_digest="sha256:" + "a" * 64,
             )
-            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
-                return_value=resolved
-            )
             client._request = mock.AsyncMock(  # type: ignore[method-assign]
                 side_effect=[
-                    {"id": "sbx-test"},
+                    {"id": "sbx-test", "build": {"image_id": resolved.id, "state": "READY"}},
                     {**SANDBOX_RESPONSE, "image_id": resolved.id},
                 ]
             )
@@ -2329,21 +2300,32 @@ class AsyncSandboxTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(sandbox.info.resources.gpu_type, gpu_type)
                     await client.close()
 
-    async def test_create_does_not_start_sandbox_when_image_fails(self) -> None:
+    async def test_create_stops_the_sandbox_when_its_image_build_fails(self) -> None:
+        # A failed build fails the sandbox; create, waiting to run its
+        # command, raises and stops it.
         with tempfile.TemporaryDirectory() as directory:
             client = AsyncClient(config(directory))
-            client.resolve_image = mock.AsyncMock(  # type: ignore[method-assign]
-                side_effect=SandboxFailedError("docker build failed")
+            client._request = mock.AsyncMock(  # type: ignore[method-assign]
+                side_effect=[
+                    {"id": "sbx-test", "build": {"image_id": "image-id", "state": "BUILDING"}},
+                    {**SANDBOX_RESPONSE, "status": "building"},
+                    {},
+                ]
             )
-            client._request = mock.AsyncMock()  # type: ignore[method-assign]
-
-            with self.assertRaisesRegex(SandboxFailedError, "docker build failed"):
-                await AsyncSandbox.create(
-                    image=Image.from_registry("ubuntu:24.04"),
-                    client=client,
-                )
-
-            client._request.assert_not_awaited()
+            with mock.patch.object(
+                AsyncSandbox, "wait_until_ready",
+                new=mock.AsyncMock(side_effect=SandboxFailedError("docker build failed")),
+            ):
+                with self.assertRaisesRegex(SandboxFailedError, "docker build failed"):
+                    await AsyncSandbox.create(
+                        "echo", "hello",
+                        image=Image.from_registry("ubuntu:24.04"),
+                        client=client,
+                    )
+            self.assertEqual(
+                client._request.await_args_list[-1].args[:2],
+                ("POST", "/sandboxes/sbx-test/stop"),
+            )
             await client.close()
 
     async def test_create_without_image_does_not_resolve_one(self) -> None:
