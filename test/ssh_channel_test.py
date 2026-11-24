@@ -169,6 +169,21 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_upload_source("file.txt"), (Path("file.txt"), False))
         self.assertEqual(_upload_source(".."), (Path(".."), False))
 
+    async def test_a_contents_only_file_upload_is_refused_before_the_sandbox_is_touched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "file"
+            source.write_text("x")
+            options = TransferOptions(recursive=True, contents_only=True)
+            for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel):
+                ssh, _ = self.uploading_channel(kind)
+                with self.subTest(kind=kind.__name__):
+                    with self.assertRaises(InvalidRequestError):
+                        await ssh.upload(UploadRequest(source, "/dest", options))
+                    ssh._cleanup_remote_paths.assert_not_awaited()  # type: ignore[attr-defined]
+                    ssh._reset_remote_path.assert_not_awaited()  # type: ignore[attr-defined]
+
     async def test_upload_times_are_always_kept(self) -> None:
         for kind in (SSHChannel, SSHDockerChannel, SSHHostChannel):
             with self.subTest(kind=kind.__name__), self.assertRaises(UnsupportedFeatureError):
