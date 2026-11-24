@@ -32,3 +32,12 @@ py_test(
     ],
     deps = [":thunder_client"],
 )
+
+py_test(
+    name = "channels_test",
+    srcs = [
+        "test/__init__.py",
+        "test/channels_test.py",
+    ],
+    deps = [":thunder_client"],
+)
