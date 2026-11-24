@@ -137,6 +137,30 @@ class UploadModeTest(unittest.IsolatedAsyncioTestCase):
                     for call in scp.await_args_list:
                         self.assertIs(call.kwargs.get("preserve"), True)
 
+    async def test_a_source_without_a_name_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "sub").mkdir()
+            for source in (Path("/"), Path(".."), Path(directory) / "sub" / ".."):
+                ssh, _ = self.uploading_channel()
+                with self.subTest(source=source):
+                    with self.assertRaisesRegex(InvalidRequestError, "must name a file"):
+                        await ssh.upload(
+                            UploadRequest(source, "/dest", TransferOptions(recursive=True))
+                        )
+                    ssh._reset_remote_path.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_dot_uploads_the_directory_contents(self) -> None:
+        from thunder_sandbox.asynchronous.sandbox import _upload_source
+
+        sep = os.sep
+        self.assertEqual(_upload_source("."), (Path("."), True))
+        self.assertEqual(_upload_source("." + sep), (Path("."), True))
+        self.assertEqual(_upload_source(f"dir{sep}."), (Path("dir"), True))
+        self.assertEqual(_upload_source(f"dir{sep}.{sep}"), (Path("dir"), True))
+        self.assertEqual(_upload_source(f"dir{sep}"), (Path("dir"), False))
+        self.assertEqual(_upload_source("file.txt"), (Path("file.txt"), False))
+        self.assertEqual(_upload_source(".."), (Path(".."), False))
+
     async def test_upload_times_are_always_kept(self) -> None:
         ssh = channel()
         with self.assertRaises(UnsupportedFeatureError):
