@@ -606,10 +606,15 @@ class Client:
             while True:
                 try:
                     with context.archive_path.open("rb") as archive:
+                        # A file body makes aiohttp add Content-Type, and
+                        # Content-Disposition when it supplies a disposition.
+                        # Object storage accepts this PUT only for the headers
+                        # Thunder signed, plus Content-Length.
                         async with session.put(
                             url,
                             data=archive,
                             headers=request_headers,
+                            skip_auto_headers={"Content-Type", "Content-Disposition"},
                             timeout=aiohttp.ClientTimeout(total=max(60.0, deadline - time.time())),
                         ) as response:
                             if response.status < 300:
